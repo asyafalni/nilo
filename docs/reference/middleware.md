@@ -1,6 +1,6 @@
 # Middleware
 
-**nilo's built-in middleware (logging, CORS, CSRF, rate limits, per-route deadlines and body limits), and `nilo.accept` for reading an `Accept` header.**
+**nilo's built-in middleware (logging, CORS, CSRF, security headers, rate limits, per-route deadlines and body limits), and `nilo.accept` for reading an `Accept` header.**
 
 **Guide:** [Middleware and resolved values](../guide/middleware.md) · **Design:** [Middleware](../design/middleware.md), [CORS and the proxy in front](../design/cors-proxy.md), [Rate limiting](../design/rate-limiting.md), [Deadlines](../design/deadlines.md)
 
@@ -21,6 +21,9 @@ nilo.cors.reading(&origins, .{ … })                     // the list read at ru
 nilo.csrf.sameOrigin                                    // 403 a cross-site POST, PUT, PATCH, DELETE
 nilo.csrf.with(.{ .origins = &.{…} })                   // …unless it came from one of these
 nilo.csrf.reading(&origins)                             // the list, from a cors.Origins
+
+nilo.secure.api(.{})                                    // the policy headers for an API
+nilo.secure.pages(.{ .csp = "…" })                      // …and for a server with pages
 
 nilo.allowance.with(.{ .per_window = 100, .window_s = 60,   // 429 past this
                         .slots = 16 * 1024,                  // addresses remembered
@@ -67,6 +70,35 @@ nilo.maxBody(50 << 20)                                      // how much body it 
 | `nilo.csrf.reading(&o)` | the same, with `o` a `nilo.cors.Origins`, so one list can feed both `cors.reading` and this |
 
 The 403 names the origin and `csrf .origins`. There is no allocation on any path, and no per-connection cost. A route opts out with `without(nilo.csrf.sameOrigin)`, which is what a callback that another site posts to from a browser needs; a server-to-server webhook sends neither header and needs nothing.
+
+### `nilo.secure`
+
+**The response headers a browser reads as policy, as one block assembled while compiling** ([ADR 246](../adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)). The block takes one header slot on the Ctx however many lines it has, so it adds no allocation and one store per request.
+
+| | |
+|---|---|
+| `nilo.secure.api(.{ … })` | for an answer that is data. Fields are `nilo.secure.Api` |
+| `nilo.secure.pages(.{ … })` | for a server that serves its own front end. Fields are `nilo.secure.Pages` |
+
+Both take the same fields, with different defaults. `null` leaves a header out.
+
+| field | header | `api` default | `pages` default |
+|---|---|---|---|
+| (none) | `X-Content-Type-Options` | `nosniff`, always | `nosniff`, always |
+| `.csp` | `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'` | `default-src 'self'; base-uri 'self'; font-src 'self' https: data:; form-action 'self'; frame-ancestors 'self'; img-src 'self' data:; object-src 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' https: 'unsafe-inline'` |
+| `.hsts` | `Strict-Transport-Security` | `.{}`: `max-age=31536000` | the same |
+| `.frame_options` | `X-Frame-Options` | `.deny` | `.same_origin` |
+| `.referrer_policy` | `Referrer-Policy` | `.no_referrer` | `.strict_origin_when_cross_origin` |
+| `.opener_policy` | `Cross-Origin-Opener-Policy` | `null` | `.same_origin_allow_popups` |
+| `.resource_policy` | `Cross-Origin-Resource-Policy` | `null` | `.same_origin` |
+| `.embedder_policy` | `Cross-Origin-Embedder-Policy` | `null` | `null` |
+| `.permissions_policy` | `Permissions-Policy` | `null` | `null` |
+
+`nilo.secure.Hsts` is `.{ .max_age_s = 31_536_000, .include_subdomains = false, .preload = false }`. The enums are `nilo.secure.Referrer` (the eight values of the header, `_` for `-`), `Frame` (`.deny`, `.same_origin`), `Opener` (`.same_origin`, `.same_origin_allow_popups`, `.noopener_allow_popups`, `.unsafe_none`), `Resource` (`.same_origin`, `.same_site`, `.cross_origin`) and `Embedder` (`.require_corp`, `.credentialless`, `.unsafe_none`).
+
+The block adds 200 bytes to a response under `api` and 515 under `pages`, as shipped. Refused while compiling: an empty `.csp` or `.permissions_policy`, either one holding a control byte, `.preload` without `.include_subdomains` and a year, and a `max_age_s` of `0` beside either of those.
+
+**A second `nilo.secure` replaces the first**, so a group of pages can carry `pages` under an App that carries `api`. **A handler that sets one of these headers replaces that line of the block** (one arena allocation for the rest), rather than sending two: a browser enforces every `Content-Security-Policy` it gets. `Strict-Transport-Security` is sent on plain HTTP too, where a browser ignores it (RFC 6797 §8.1).
 
 ### `nilo.allowance`
 

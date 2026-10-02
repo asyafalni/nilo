@@ -99,7 +99,7 @@ The type-keyed registry resolves `*Stripe` with nothing added to it, and a targe
 
 ## What it costs
 
-Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes, a Fitting costs a program that does not import one **nothing at all**: no allocation, no per-connection memory, no throughput, zero bytes, because `nilo_http` does not name `nilo_fetch` and the linker never sees it.
+Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes, a Fitting costs a program that does not import one **nothing at all**: no allocation, no per-connection memory, no throughput, zero bytes, because nothing it compiles names `nilo_fetch` and the linker never sees it. `nilo_http` names it in one file, `http/otlp.zig`, which only the body of `app.trace` reaches ([ADR 247](./247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)); a program that does not trace compiles none of it, and the measurement is in that ADR.
 
 For a program that does import one, each axis is measured in [`bench/result/fetch.md`](../../bench/result/fetch.md) against the same call made through a plain `std.http.Client` with none of the policy round it:
 

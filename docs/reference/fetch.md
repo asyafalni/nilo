@@ -63,6 +63,10 @@ Given to `init`:
 
 Given per call: `headers`, and `timeout_ms` / `stall_ms` / `max_body` to override the settings above for one call. **A header std has its own slot for** (`host`, `authorization`, `user-agent`, `content-type`, `connection`, `accept-encoding`) **is sent once**: your copy replaces std's instead of being sent beside it ([ADR 182](../adr/182-a-header-std-owns-goes-out-once.md)).
 
+### A call under a traced request
+
+**On an App that calls `app.trace`, a call made under a `*Ctx` is a client span, and it sends `traceparent`** naming that span, plus the `tracestate` the request arrived with. The span has the method, `server.address`, `server.port`, the status, and the error's name when the call failed. A call that sets its own `traceparent` in `headers` keeps it, and no span id is sent for it. A `Run` declares no trace and sends none. An `Exchange` sends only the headers it is given, as it does for the request id ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)), so a signed `nilo_s3` request is not traced. A Scope of your own joins by declaring `traceBegin(self) ?core.trace.Outbound` and `traceEnd(self, core.trace.Outbound, core.trace.Ended) void` ([ADR 247](../adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md), [Tracing](../guide/tracing.md)).
+
 ### Responses with no body
 
 **A response that has no body by definition ends at its head.** A response to HEAD, a 1xx, a 204 and a 304 are complete at the blank line whatever `content-length` or `transfer-encoding` say, so `send` returns an empty body immediately and the connection is kept ([ADR 176](../adr/176-an-answer-with-no-body-ends-at-its-head.md)).

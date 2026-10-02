@@ -74,12 +74,7 @@ the logger — if it is on — writes the same one.
 
 ## What was rejected
 
-**`traceparent`.** W3C Trace Context is the header a tracing backend wants,
-and it carries a trace id, a parent span id and flags. nilo has no spans, so
-two of the three fields would be invented, and an invented parent span is worse
-than none — a collector would draw an edge to a node that does not exist.
-`X-Request-Id` says exactly what nilo knows. The day nilo has a span, this
-header is where the trace id goes, and nothing about that day is decided here.
+**`traceparent` instead of `X-Request-Id`.** W3C Trace Context is the header a tracing backend wants, and it carries a trace id, a parent span id and flags. When this was decided nilo had no spans, so two of the three fields would have been invented, and an invented parent span is worse than none: a collector would draw an edge to a node that does not exist. Now that `app.trace` records spans, a call sends `traceparent` beside the id ([ADR 247](247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)), through two more optional Scope declarations made the way `requestId` is here. The two answer different questions: the id lines up log lines whether or not anything traces, and it stays.
 
 **Forwarding only when the logger's `request_id` is on.** It reads as
 sensible — why send an id nobody on this side logs — and it makes the outbound

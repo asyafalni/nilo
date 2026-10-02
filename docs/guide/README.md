@@ -73,10 +73,11 @@ const nilo = @import("nilo_http");
 
 ## Shipping it
 
-26. [Testing](./testing.md): handlers as ordinary functions, and the test client for the ones that write their own answer.
-27. [OpenAPI](./openapi.md): an API document generated from the handler signatures.
-28. [Metrics](./metrics.md): how many requests, at what statuses, how long. A Prometheus page in one call, and counters of your own on it.
-29. [Deploying](./deploying.md): startup errors, panics, graceful shutdown, a health page the load balancer can trust, tuning, and what is not there yet.
+27. [Testing](./testing.md): handlers as ordinary functions, and the test client for the ones that write their own answer.
+28. [OpenAPI](./openapi.md): an API document generated from the handler signatures.
+29. [Metrics](./metrics.md): how many requests, at what statuses, how long. A Prometheus page in one call, and counters of your own on it.
+30. [Tracing](./tracing.md): every request a span, sent to any OpenTelemetry receiver in one call; a trace that continues through `nilo_fetch` into the next service, and spans of your own.
+31. [Deploying](./deploying.md): startup errors, panics, graceful shutdown, a health page the load balancer can trust, tuning, and what is not there yet.
 
 ## Other documentation
 

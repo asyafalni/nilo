@@ -27,6 +27,7 @@ const handover_mod = @import("handover.zig");
 const metrics_mod = @import("metrics.zig");
 const failurebody = @import("failurebody.zig");
 const json = @import("json.zig");
+const trace_mod = @import("trace.zig");
 
 const App = app_mod.App;
 const Ctx = ctx_mod.Ctx;
@@ -224,6 +225,50 @@ pub const Served = struct {
     linger: bool = false,
 };
 
+/// The request's span, opened before the chain and closed on every way out.
+/// Reached through `app.trace_hooks`, which only `app.trace` sets, so a
+/// program that never calls it compiles none of this, the ids and the ring
+/// included (ADR 247, ADR 017's request-path rule). The request path holds
+/// one null check on each side.
+pub fn traceBegin(c: *Ctx, tracer: *trace_mod.Tracer) void {
+    c._tracer = tracer;
+    const carried = traceHeaders(c);
+    c._trace = tracer.begin(carried.parent, carried.state);
+}
+
+pub fn traceFinish(c: *Ctx, path: []const u8) void {
+    const tracer = c._tracer orelse return;
+    tracer.finish(
+        &c._trace,
+        spanMethod(c.method),
+        if (c._route) |route| route.pattern else "",
+        path,
+        c.answered() orelse 0,
+    );
+}
+
+/// `traceparent` and `tracestate` in one walk of the request's headers,
+/// rather than one walk each.
+fn traceHeaders(c: *const Ctx) struct { parent: ?[]const u8, state: ?[]const u8 } {
+    var parent: ?[]const u8 = null;
+    var state: ?[]const u8 = null;
+    var it = http1.HeaderIterator.from(c._head);
+    while (it.next()) |h| {
+        if (h.name.len == 11 and std.ascii.eqlIgnoreCase(h.name, "traceparent")) parent = h.value;
+        if (h.name.len == 10 and std.ascii.eqlIgnoreCase(h.name, "tracestate")) state = h.value;
+    }
+    return .{ .parent = parent, .state = state };
+}
+
+/// A method's name as a span keeps it: the record outlives the request, so it
+/// is a literal, and a method nilo does not name is OpenTelemetry's `_OTHER`.
+fn spanMethod(method: http1.Method) []const u8 {
+    return switch (method) {
+        .other => "_OTHER",
+        inline else => |m| @tagName(m),
+    };
+}
+
 /// Answer one request, and hand back a socket if the handler opened one.
 ///
 /// `noinline` deliberately. Everything this touches — the `Ctx`, the
@@ -412,6 +457,13 @@ pub noinline fn serveRequest(
     // request really had is only settled here, and a second place working
     // it out again is a second place to get it wrong (ADR 079).
     defer record.finish(c.answered() orelse 0);
+
+    // The request's span, opened before the chain so a middleware's time is
+    // the request's, and kept on every way out for the reason the counting
+    // above is: the status is settled only here (ADR 247). An App that does
+    // not trace pays this one compare, and links none of it.
+    if (self.trace_hooks) |hooks| hooks.begin(&c, self.tracer.?);
+    defer if (self.trace_hooks) |hooks| hooks.finish(&c, path);
 
     // A request that matched no route still runs the middleware: a
     // logger that cannot see 404s and a CORS that cannot answer a

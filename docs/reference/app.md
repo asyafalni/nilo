@@ -50,7 +50,7 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 | `app.embedded(url_prefix, files)` | files the binary carries, as a list of `.{ .path, .bytes }` with `@embedFile` on each, served the same way a directory is ([Static files](../guide/static-files.md#embedded-files), [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)) |
 | `app.embeddedWith(url_prefix, files, options)` | the same, with the [options that are not about a disk](#static-options) |
 
-### Documents, health, metrics and compression
+### Documents, health, metrics, tracing and compression
 
 | | |
 |---|---|
@@ -59,6 +59,7 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 | `app.health(path)` | a page that says whether this process can do its job: `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server has been told to stop. It asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, where null means ready and a sentence says why not ([Deploying](../guide/deploying.md#health-checks), [ADR 154](../adr/154-a-health-route-asks-the-services.md)). Described in the document as a `200` of `{"status":…}`, and not counted among the routes that write their own answer ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
 | `app.metrics(options)` | counts every request and serves the numbers at `/metrics`, in Prometheus format ([Metrics](../guide/metrics.md), [ADR 079](../adr/079-the-route-table-is-the-registry.md)) |
 | `app.expose(name, kind, &atomic)` | publishes a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
+| `app.trace(options)` | every request a server span, a `nilo_fetch` call under it a client span carrying `traceparent`, and `c.span(name)` for the rest; sent as OTLP/HTTP protobuf to `endpoint/v1/traces` by a fiber of the server every `flush_ms` ([Tracing](../guide/tracing.md), [ADR 247](../adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)). Options that could send nothing are refused here: `error.TraceServiceEmpty`, `error.TraceEndpointNotHttp`, `error.TraceSampleOutOfRange`, `error.TraceBatchEmpty`, `error.TraceTooManyHeaders`. Once per App; a second is `error.TracingAlreadyEnabled` |
 | `app.compress(options)` | gzips every text response that is at least `min_bytes` and at most `max_bytes` long and going to a client whose `Accept-Encoding` accepts it, per request, using a compressor borrowed from a pool of one per thread. Sets `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that did not ask gets the body unchanged. Does not apply to streams, event streams or static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
 
 ### Running
@@ -73,7 +74,7 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 
 ### Which calls fail
 
-**Every call above returns an error union and needs a `try`, except these**, which return a value or nothing: `App.init`, `app.deinit`, `app.group`, `app.without`, `app.with`, `app.named`, `app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Three fail in one named way: `app.guard` with `error.GuardAlreadyDeclared`, `app.failures` with `error.FailureShapeAlreadySet`, and `app.compress` with `error.CompressionAlreadyEnabled`. `app.listen`, `app.route` and the `static` calls stop the process on the errors they can explain in one line, and their `try*` versions return the same errors instead ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
+**Every call above returns an error union and needs a `try`, except these**, which return a value or nothing: `App.init`, `app.deinit`, `app.group`, `app.without`, `app.with`, `app.named`, `app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Three fail in one named way: `app.guard` with `error.GuardAlreadyDeclared`, `app.failures` with `error.FailureShapeAlreadySet`, `app.compress` with `error.CompressionAlreadyEnabled`, and `app.trace` with `error.TracingAlreadyEnabled` beside the option errors in its row. `app.listen`, `app.route` and the `static` calls stop the process on the errors they can explain in one line, and their `try*` versions return the same errors instead ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
 
 ### `Group`
 
@@ -158,6 +159,27 @@ Requests are counted per **route**, not per path: `/users/1` and `/users/2` both
 A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never compressed, and a strong `ETag` becomes weak when the body is ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 **What it costs:** one compressor per thread, about 288 KB each, created when the middleware chains are resolved; one arena allocation for each compressed response; and tens of microseconds of gzip per body (`zig build bench-compress` has the table). Nothing per connection, and nothing on a response that is not compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+
+### `trace` options
+
+`app.trace(.{ … })`. The text is borrowed and has to outlive the App.
+
+| | Default |
+|---|---|
+| `service` | required: `service.name`, what every span is filed under |
+| `endpoint` | `"http://localhost:4318"`: the OTLP/HTTP receiver. `/v1/traces` is added |
+| `headers` | `&.{}`: sent with every export, a vendor's key mostly. At most 16 |
+| `resource` | `&.{}`: `nilo.trace.Attribute`s (`.key`, `.value`) beside `service.name`, such as `deployment.environment.name` |
+| `sample` | `1.0`: the fraction of traces that start here to record, decided from the trace id. A request that joined a trace follows the trace's decision |
+| `join` | `true`: a request with a valid `traceparent` joins that trace. `false` starts a new one for every request |
+| `flush_ms` | `1000`: how often the exporter sends what the rings hold |
+| `spans_per_thread` | `1024`, rounded up to a power of two: finished spans each thread holds before the next is dropped. A span is about 200 bytes |
+| `max_batch` | `512`: the most spans one export carries |
+| `timeout_ms` | `10000`: how long one export may take |
+
+**What a span carries.** A server span is named `METHOD /route` (the method alone when no route matched) with `http.request.method`, `http.route`, `http.response.status_code` and `url.path` (cut at 96 bytes); a 5xx is an error with `error.type`. A client span is named for its method, with `http.request.method`, `server.address`, `server.port`, `http.response.status_code`, and the error's name when the call failed; a 4xx is an error too. The resource has `service.name` and `telemetry.sdk.name = "nilo"`.
+
+**What it costs:** two clock reads, two ids from a generator per thread, one walk of the request headers and a copy into this thread's ring per request; no allocation and no lock. One ring per thread and one batch, held for the life of the App. A full ring drops new spans and counts them, and an export that fails drops its batch; a receiver that cannot be reached is logged at most once a minute. What is left when the server stops is sent on the way out ([ADR 247](../adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
 
 ## Concurrency
 

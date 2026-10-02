@@ -413,6 +413,31 @@ pub const Client = struct {
         call: Call,
         standing: Standing,
     ) Error!Response {
+        // The call's span, when the Scope traces: its context is what the
+        // `traceparent` names, so the next service's span is its child
+        // (ADR 247). Null under a `Run`, and on an App that does not trace.
+        // Ended here, at one place for each way out, rather than by a
+        // `defer` inside, which the compiler copies onto every return.
+        const begun = core.traceBeginOf(c);
+        const res = self.sendCarrying(c, method, url, body, content_type, call, standing, begun) catch |err| {
+            if (begun) |b| endTrace(c, b, method, url, 0, @errorName(err));
+            return err;
+        };
+        if (begun) |b| endTrace(c, b, method, url, @intFromEnum(res.status), null);
+        return res;
+    }
+
+    fn sendCarrying(
+        self: *Client,
+        c: anytype,
+        method: std.http.Method,
+        url: []const u8,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        call: Call,
+        standing: Standing,
+        begun: ?core.trace.Outbound,
+    ) Error!Response {
         // The one buffer this call needs, declared where a reader can see
         // what it costs. It is stack, and by
         // [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) a
@@ -435,14 +460,13 @@ pub const Client = struct {
         // allocation when both lists have something in them (ADR 061).
         const lines = try withStanding(c, standing.headers, call.headers);
 
-        // The request's id, when there is a request. One header, and for the
-        // ordinary call — no headers of its own — it lives in this array
-        // rather than in the arena (ADR 158).
-        var one: [1]std.http.Header = undefined;
-        const headers = if (self.settings.forward_request_id)
-            try withRequestId(c, lines, &one)
-        else
-            lines;
+        var traceparent: [core.trace.text_len]u8 = undefined;
+
+        // The request's id and the trace, when there is a request: up to
+        // three headers, and for the ordinary call (no headers of its own)
+        // they live in this array rather than in the arena (ADR 158).
+        var carried: [3]std.http.Header = undefined;
+        const headers = try withCarried(c, lines, &carried, self.settings.forward_request_id, begun, &traceparent);
 
         // The caller's own line wins over the value the call or the target
         // decided, and std's slot is then left out so it goes once
@@ -474,25 +498,54 @@ pub const Client = struct {
         };
     }
 
-    /// `given` plus the Scope's request id, or `given` as it was: when the
-    /// Scope has no id, or the caller already named one.
+    /// `given` plus what the call carries from the request: its id, and its
+    /// trace when the Scope traces. Each is left out when the caller already
+    /// named it, and `given` comes back as it was when nothing is added.
     ///
-    /// A call with no headers of its own costs nothing here — the one header
-    /// goes in `one`. A call that passes headers spends one bump of the
+    /// A call with no headers of its own costs nothing here: what is added
+    /// goes in `carried`. A call that passes headers spends one bump of the
     /// Scope's arena on the merge, which is the one allocation this decision
-    /// makes and the reason it is written down (ADR 158).
-    fn withRequestId(c: anytype, given: []const std.http.Header, one: *[1]std.http.Header) Error![]const std.http.Header {
+    /// makes and the reason it is written down (ADR 158, ADR 247).
+    fn withCarried(
+        c: anytype,
+        given: []const std.http.Header,
+        carried: *[3]std.http.Header,
+        forward_id: bool,
+        begun: ?core.trace.Outbound,
+        traceparent: *[core.trace.text_len]u8,
+    ) Error![]const std.http.Header {
         const S = @typeInfo(@TypeOf(c)).pointer.child;
-        const id = core.requestIdOf(S, c) orelse return given;
-        for (given) |h| if (std.ascii.eqlIgnoreCase(h.name, request_id_header)) return given;
-        if (given.len == 0) {
-            one[0] = .{ .name = request_id_header, .value = id.view() };
-            return one;
-        }
-        const merged = try c.arena().alloc(std.http.Header, given.len + 1);
+        var n: usize = 0;
+        if (forward_id) if (core.requestIdOf(S, c)) |id| {
+            if (!namesHeader(given, request_id_header)) {
+                carried[n] = .{ .name = request_id_header, .value = id.view() };
+                n += 1;
+            }
+        };
+        if (begun) |b| if (!namesHeader(given, core.trace.header)) {
+            carried[n] = .{ .name = core.trace.header, .value = b.context.format(traceparent) };
+            n += 1;
+            if (b.state.len > 0) {
+                carried[n] = .{ .name = core.trace.state_header, .value = b.state };
+                n += 1;
+            }
+        };
+        if (n == 0) return given;
+        if (given.len == 0) return carried[0..n];
+        const merged = try c.arena().alloc(std.http.Header, given.len + n);
         @memcpy(merged[0..given.len], given);
-        merged[given.len] = .{ .name = request_id_header, .value = id.view() };
+        @memcpy(merged[given.len..], carried[0..n]);
         return merged;
+    }
+
+    /// Tell a Scope that traces how the call it began a span for ended.
+    fn endTrace(c: anytype, begun: core.trace.Outbound, method: std.http.Method, url: []const u8, status: u16, failure: ?[]const u8) void {
+        core.traceEndOf(c, begun, .{
+            .method = @tagName(method),
+            .url = url,
+            .status = status,
+            .failure = failure,
+        });
     }
 
     /// `standing` under `given`, with a standing line the call names again

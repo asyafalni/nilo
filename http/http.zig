@@ -689,7 +689,18 @@ pub const cors = @import("cors.zig");
 /// A request that changes something, taken only from a page this server
 /// serves ([ADR 224](../docs/adr/224-a-request-that-changes-something-says-where-it-came-from.md)).
 pub const csrf = @import("csrf.zig");
+/// The response headers a browser reads as policy, written as one block:
+/// `try app.use(nilo.secure.api(.{}))`, or `nilo.secure.pages(.{})` for a
+/// server that serves its own front end
+/// ([ADR 246](../docs/adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)).
+pub const secure = @import("secure.zig");
 pub const metrics = @import("metrics.zig");
+
+/// Tracing: `try app.trace(.{ .service = "orders" })`, and every request is a
+/// span sent to an OpenTelemetry receiver. `nilo.trace.Options` is what it
+/// takes, and `c.span(name)` opens one of a handler's own
+/// ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
+pub const trace = @import("trace.zig");
 
 /// Gzip every answer worth gzipping, per request, for a client that asked:
 /// `try app.compress(.{})`. `nilo.compress.Options` is what it takes
@@ -1012,6 +1023,9 @@ test {
     _ = @import("logger.zig");
     _ = @import("cors.zig");
     _ = @import("csrf.zig");
+    _ = @import("secure.zig");
+    _ = @import("trace.zig");
+    _ = @import("otlp.zig");
     _ = @import("metrics.zig");
     _ = @import("compress.zig");
     _ = @import("allowance.zig");

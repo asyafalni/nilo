@@ -113,4 +113,5 @@ nav:
       - testing.md
       - openapi.md
       - metrics.md
+      - tracing.md
       - deploying.md

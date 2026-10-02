@@ -83,4 +83,5 @@ python3 bench/devloop.py --step dev-spa         # does a save the build never re
 python3 bench/s3_setup.py                       # the bucket and objects the S3 server wants
 python3 bench/compare-s3/drive.py               # nilo_s3 against Go, Rust and Bun; needs MinIO
 bash bench/compare-cache/run.sh                 # nilo_cache against go-cache; needs Go
+bash bench/compare-compress/run_all.sh          # nilo's gzip against libdeflate, zlib-ng, zstd, brotli; clones them
 ```

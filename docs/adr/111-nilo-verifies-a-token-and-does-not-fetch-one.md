@@ -88,7 +88,7 @@ The pin is two counters. A reader increments `crossing`, loads the pointer, incr
 
 ### Where it sits
 
-**A tool module, importing nothing at all.** `zig test jwt/jwt.zig` runs the whole of it with no `build.zig`, the layer's entry condition rather than a convenience. `nilo_http` does not name it, the way it does not name `nilo_cache` or `nilo_fetch`: a program that signs nobody in with Google links no RSA and no P-256, and a project that wants one writes `@import("nilo_jwt")`.
+**A tool module, importing nothing at all.** `zig test jwt/jwt.zig` runs the whole of it with no `build.zig`, the layer's entry condition rather than a convenience. `nilo_http` does not name it, the way it does not name `nilo_cache` (and names `nilo_fetch` only inside `app.trace`, [ADR 247](./247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)): a program that signs nobody in with Google links no RSA and no P-256, and a project that wants one writes `@import("nilo_jwt")`.
 
 ## What was rejected
 

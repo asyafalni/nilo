@@ -165,7 +165,7 @@ const http_core = [_][]const u8{
 /// nothing in the core names any of them back, which is why they are not in
 /// the component.
 const http_above_core = [_][]const u8{
-    "logger",    "cors",      "csrf",      "allowance", "deadline",
+    "logger",    "cors",      "csrf",      "secure",    "allowance", "deadline",
     "maxbody",   "http",      "behaviour", "live",      "profile",
     "fuzz",      "fuzz_main", "fuzz_llhttp", "test_root", "wide",
 };
@@ -2017,6 +2017,18 @@ const refusals = [_]Refusal{
         .says = "csrf was told to trust \"*\", which is every page on the web, and that is the same as not installing it.",
     },
     .{
+        .name = "secure_empty_csp",
+        .says = "secure was given an empty csp, which sends a header that allows everything.",
+    },
+    .{
+        .name = "secure_csp_with_a_newline",
+        .says = "the secure csp holds a control byte, which would end the header line early.",
+    },
+    .{
+        .name = "secure_hsts_preload_without_subdomains",
+        .says = "secure hsts asks for preload without what the preload list requires, so the request to be listed is refused.",
+    },
+    .{
         .name = "deadline_of_no_time",
         .says = "a deadline of 0 milliseconds is not a limit, it is a request that has already run out.",
     },
@@ -2651,6 +2663,7 @@ const Snippets = struct {
         // Five blocks across the three, two of them written the same day this
         // list was found to be short.
         .{ .path = "docs/guide/metrics.md" },
+        .{ .path = "docs/guide/tracing.md" },
         .{ .path = "docs/guide/middleware.md" },
         .{ .path = "docs/guide/responses.md" },
         .{ .path = "docs/guide/grpc.md" },
@@ -3234,12 +3247,36 @@ fn protoFor(
     target: std.Build.ResolvedTarget,
     mode: std.builtin.OptimizeMode,
 ) *std.Build.Module {
-    return b.createModule(.{
+    // One per mode, because `nilo_http` names it for the trace exporter
+    // (ADR 247) and a compilation that holds the server and a program's own
+    // `nilo_proto` may hold only one module rooted at `proto/proto.zig`.
+    for (proto_made[0..proto_count]) |made| {
+        if (made.mode == mode) return made.module;
+    }
+    const module = b.createModule(.{
         .root_source_file = b.path("proto/proto.zig"),
         .target = target,
         .optimize = mode,
     });
+    proto_made[proto_count] = .{ .mode = mode, .module = module };
+    proto_count += 1;
+    return module;
 }
+
+/// The modules `protoFor` and `fetchFor` already made, so a second ask in the
+/// same mode (and, for `nilo_fetch`, on the same Core) is the same module.
+/// Zig refuses a compilation in which one file belongs to two modules, and
+/// since `nilo_http` names both for tracing (ADR 247), every root that holds
+/// the server beside one of them would otherwise hold two.
+const Made = struct {
+    mode: std.builtin.OptimizeMode,
+    core: ?*std.Build.Module = null,
+    module: *std.Build.Module,
+};
+var proto_made: [8]Made = undefined;
+var proto_count: usize = 0;
+var fetch_made: [32]Made = undefined;
+var fetch_count: usize = 0;
 
 /// A copy of `nilo_fetch` for one optimize mode (ADR 061).
 ///
@@ -3255,12 +3292,18 @@ fn fetchFor(
     mode: std.builtin.OptimizeMode,
     core_mod: *std.Build.Module,
 ) *std.Build.Module {
-    return b.createModule(.{
+    for (fetch_made[0..fetch_count]) |made| {
+        if (made.mode == mode and made.core == core_mod) return made.module;
+    }
+    const module = b.createModule(.{
         .root_source_file = b.path("fetch/fetch.zig"),
         .target = target,
         .optimize = mode,
         .imports = &.{.{ .name = "nilo_core", .module = core_mod }},
     });
+    fetch_made[fetch_count] = .{ .mode = mode, .core = core_mod, .module = module };
+    fetch_count += 1;
+    return module;
 }
 
 /// A copy of `nilo_job` for one optimize mode (ADR 160).
@@ -3367,6 +3410,8 @@ fn httpFor(
         .imports = &.{
             .{ .name = "zio", .module = engine.module("zio") },
             .{ .name = "nilo_core", .module = core_mod },
+            .{ .name = "nilo_proto", .module = protoFor(b, target, mode) },
+            .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, core_mod) },
             .{ .name = "nilo_pw", .module = pwFor(b, target, mode) },
         },
     });
@@ -3480,10 +3525,10 @@ const Layering = struct {
         // `sql/deadline.zig` is a test root of its own rather than a file
         // inside `nilo_sql`, so it reaches the module the way a caller does
         // — and the build hands it the same instance, so there is no second
-        // copy of the module for a type to disagree about. `fetch` reached
-        // the same place by importing `fetch.zig` as a file, which the line
-        // below already allows; a module whose deps are two drivers and a
-        // generated options file cannot be rebuilt that cheaply.
+        // copy of the module for a type to disagree about. `fetch/deadline.zig`
+        // does the same since the server names `nilo_fetch` (ADR 247); its
+        // other roots still import `fetch.zig` as a file, which the line
+        // below already allows.
         if (std.mem.startsWith(u8, named, "nilo_") and
             std.mem.eql(u8, named["nilo_".len..], layer.root)) return true;
         // A file rather than a module. `..` is how one would reach out of
@@ -4640,30 +4685,35 @@ pub fn build(b: *std.Build) void {
     });
 
     // The sixth tool module: protobuf from plain structs (ADR 245). It
-    // imports nothing at all, which `zig build layering` checks, and
-    // `nilo_http` does not name it: a gRPC method is an ordinary route (ADR
-    // 220) and the codec for its message is the caller's choice to import. A
-    // program that speaks no protobuf links none of it.
+    // imports nothing at all, which `zig build layering` checks. A gRPC
+    // method is an ordinary route (ADR 220) and the codec for its message is
+    // the caller's choice to import. `nilo_http` names it in one file,
+    // `http/otlp.zig`, reached only from inside `app.trace` (ADR 247), so a
+    // program that neither speaks protobuf nor traces links none of it.
     const nilo_proto = b.addModule("nilo_proto", .{
         .root_source_file = b.path("proto/proto.zig"),
         .target = target,
         .optimize = optimize,
     });
+    proto_made[proto_count] = .{ .mode = optimize, .module = nilo_proto };
+    proto_count += 1;
 
     // The first Fitting: it borrows the loop and owns no destination
-    // (ADR 061). `nilo_http` does **not** name it — a program that calls
-    // nobody else's API links no HTTP client, no TLS and no certificate
-    // bundle, which is the same property ADR 037 bought for the database and
-    // ADR 044 for password hashing. A project that wants one imports it.
-    // Registered rather than bound: nothing inside this repository imports it,
-    // and that is the point of the module rather than an omission. A dependent
-    // writes `@import("nilo_fetch")`; `nilo_http` never does.
+    // (ADR 061). A program that calls nobody else's API links no HTTP client,
+    // no TLS and no certificate bundle, which is the same property ADR 037
+    // bought for the database and ADR 044 for password hashing. A project
+    // that wants one writes `@import("nilo_fetch")`. `nilo_http` names it in
+    // one file, `http/otlp.zig`, reached only from inside `app.trace` (ADR
+    // 247), and lazy analysis keeps it out of every program that does not
+    // trace; `bench/result/size.md` has the measurement.
     const nilo_fetch = b.addModule("nilo_fetch", .{
         .root_source_file = b.path("fetch/fetch.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "nilo_core", .module = nilo_core }},
     });
+    fetch_made[fetch_count] = .{ .mode = optimize, .core = nilo_core, .module = nilo_fetch };
+    fetch_count += 1;
 
     // The second Fitting: a queue, and a schedule (ADR 160, ADR 161).
     // Registered rather than bound, like `nilo_fetch`: `nilo_http` never
@@ -4716,6 +4766,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zio", .module = zio.module("zio") },
             .{ .name = "nilo_core", .module = nilo_core },
+            .{ .name = "nilo_proto", .module = nilo_proto },
+            .{ .name = "nilo_fetch", .module = nilo_fetch },
             .{ .name = "nilo_pw", .module = nilo_pw },
         },
     });
@@ -5129,6 +5181,10 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "nilo_core", .module = mode_core },
                 .{ .name = "nilo_http", .module = httpFor(b, target, mode, mode_core) },
+                // By name rather than as `fetch.zig`, and the instance the
+                // server holds: `nilo_http` names `nilo_fetch` for the trace
+                // exporter (ADR 247), and a file may belong to one module.
+                .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, mode_core) },
             },
         });
         const tests = b.addTest(.{ .root_module = root, .use_llvm = testBackend(target, mode) });
@@ -5460,6 +5516,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zio", .module = bench_engine.module("zio") },
             .{ .name = "nilo_core", .module = bench_core },
+            .{ .name = "nilo_proto", .module = protoFor(b, target, .ReleaseFast) },
+            .{ .name = "nilo_fetch", .module = fetchFor(b, target, .ReleaseFast, bench_core) },
         },
     });
     wireTls(b, bench_http, target, .ReleaseFast, want_tls, want_grpc);
@@ -5721,6 +5779,26 @@ pub fn build(b: *std.Build) void {
         size_s3_step.dependOn(&b.addInstallArtifact(exe_size, .{}).step);
     }
 
+    // The same axis for tracing (ADR 247): `s3_none` with `app.trace` added,
+    // so the difference against `nilo-size-s3_none` is what a program that
+    // traces pays, and `s3_none` itself, built before and after, is what one
+    // that does not pays. `ls -l zig-out/bin/nilo-size-*` is the measurement.
+    const size_trace_step = b.step(
+        "size-trace",
+        "Build the program whose stripped size, against size-s3's control, prices app.trace",
+    );
+    {
+        const module = b.createModule(.{
+            .root_source_file = b.path("bench/size/trace_on.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        });
+        const exe_size = b.addExecutable(.{ .name = "nilo-size-trace_on", .root_module = module });
+        size_trace_step.dependOn(&b.addInstallArtifact(exe_size, .{}).step);
+    }
+
     // What a Fitting costs, against a `std.http.Client` doing the same call
     // with none of the policy round it (ADR 061). Installed rather than run,
     // for the reason above — and the number it exists for is memory per idle
@@ -5905,6 +5983,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zio", .module = engine.module("zio") },
                 .{ .name = "nilo_core", .module = core_mod },
+                .{ .name = "nilo_proto", .module = protoFor(b, target, mode) },
+                .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, core_mod) },
             },
         });
         wireTls(b, framework, target, mode, want_tls, want_grpc);
@@ -6050,6 +6130,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zio", .module = engine.module("zio") },
                 .{ .name = "nilo_core", .module = core_mod },
+                .{ .name = "nilo_proto", .module = protoFor(b, target, mode) },
+                .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, core_mod) },
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });
@@ -6067,6 +6149,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zio", .module = engine.module("zio") },
                 .{ .name = "nilo_core", .module = core_mod },
+                .{ .name = "nilo_proto", .module = protoFor(b, target, mode) },
+                .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, core_mod) },
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });

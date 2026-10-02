@@ -428,6 +428,65 @@ pub fn repeats(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "vary");
 }
 
+/// The headers a browser reads as policy rather than as a description of the
+/// answer, which `nilo.secure` writes as one block ([ADR 246](../docs/adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)).
+///
+/// `Ctx.setHeader` asks this before it compares names, so a handler that sets
+/// one of these on a route behind `nilo.secure` replaces the block's line
+/// rather than sending the header twice. Two `Content-Security-Policy` lines
+/// are not a mistake a browser forgives: it enforces both, so the page gets
+/// the intersection, which is stricter than either and is what nobody wrote.
+/// A switch on the length first, because this runs on every header set while
+/// a block is present and nearly every name is none of these.
+pub fn isPolicyHeader(name: []const u8) bool {
+    const candidates: []const []const u8 = switch (name.len) {
+        15 => &.{ "x-frame-options", "referrer-policy" },
+        18 => &.{"permissions-policy"},
+        22 => &.{"x-content-type-options"},
+        23 => &.{"content-security-policy"},
+        25 => &.{"strict-transport-security"},
+        26 => &.{"cross-origin-opener-policy"},
+        28 => &.{ "cross-origin-resource-policy", "cross-origin-embedder-policy" },
+        35 => &.{"content-security-policy-report-only"},
+        else => return false,
+    };
+    for (candidates) |c| {
+        if (std.ascii.eqlIgnoreCase(name, c)) return true;
+    }
+    return false;
+}
+
+/// A block of header lines, `Name: value\r\n` each, with the line for `name`
+/// taken out: what a handler setting one of `nilo.secure`'s headers itself
+/// leaves of the block. The block is returned as it is when it has no such
+/// line, and nothing is allocated; otherwise one allocation of the rest.
+pub fn withoutLine(gpa: std.mem.Allocator, block: []const u8, name: []const u8) ![]const u8 {
+    var at: usize = 0;
+    while (at < block.len) {
+        const end = (std.mem.indexOfPos(u8, block, at, "\r\n") orelse block.len - 2) + 2;
+        const line = block[at..end];
+        if (line.len > name.len and line[name.len] == ':' and
+            std.ascii.eqlIgnoreCase(line[0..name.len], name))
+        {
+            const rest = try gpa.alloc(u8, block.len - line.len);
+            @memcpy(rest[0..at], block[0..at]);
+            @memcpy(rest[at..], block[end..]);
+            return rest;
+        }
+        at = end;
+    }
+    return block;
+}
+
+/// One entry of a response's extra headers, written. An entry with no name
+/// is a block of whole lines `nilo.secure` assembled while compiling, and
+/// goes out as it is; `headerNameOk` refuses an empty name, so nothing else
+/// can be one ([ADR 246](../docs/adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)).
+fn writeExtra(out: *std.Io.Writer, h: Header) !void {
+    if (h.name.len == 0) return out.writeAll(h.value);
+    try out.print("{s}: {s}\r\n", .{ h.name, h.value });
+}
+
 /// Whether a name can be written as a header field name at all — RFC 9110
 /// §5.1's `token`, which is the same grammar a cookie name has.
 ///
@@ -1410,7 +1469,7 @@ pub fn writeStreamHead(
     if (length) |n| try out.print("Content-Length: {d}\r\n", .{n});
     if (chunked) try out.writeAll("Transfer-Encoding: chunked\r\n");
     try connection.write(out);
-    for (extra) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
+    for (extra) |h| try writeExtra(out, h);
     try out.writeAll("\r\n");
 }
 
@@ -1523,7 +1582,7 @@ fn writeHead(
         try out.print("Content-Length: {d}\r\n", .{body_len});
     }
     try connection.write(out);
-    for (extra) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
+    for (extra) |h| try writeExtra(out, h);
     try out.writeAll("\r\n");
 }
 

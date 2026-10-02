@@ -63,3 +63,4 @@ A topic with only one decision has no page; the ADR is the page.
 - build-dependencies: [ADR 066](../adr/066-a-lazy-dependency-is-a-request.md)
 - metrics: [ADR 079](../adr/079-the-route-table-is-the-registry.md)
 - grpc: [ADR 220](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md)
+- tracing: [ADR 247](../adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)

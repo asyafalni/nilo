@@ -149,6 +149,30 @@ try app.use(nilo.csrf.with(.{ .origins = &.{"https://app.example.com"} }));
 
 When that address comes from the environment, `nilo.csrf.reading(&origins)` takes the same `nilo.cors.Origins` your `cors.reading` does, so one variable filled before `listen()` serves both. A route that really does accept posts from anywhere opts out with `app.without(nilo.csrf.sameOrigin).post(…)`.
 
+## Security headers
+
+<!-- compiles: body -->
+```zig
+try app.use(nilo.secure.api(.{}));
+```
+
+**One line sends the headers a browser reads as policy: `nosniff`, a Content-Security-Policy, HSTS, `X-Frame-Options` and a `Referrer-Policy`.** There are two presets, one for each kind of server. `api` is for a server that answers with JSON: it tells the browser not to render, frame or run anything in the answer. `pages` is for a server that also serves its own front end: scripts, styles, fonts and images load from your own origin, and nothing frames the page but your own. See [`nilo.secure`](../reference/middleware.md#nilosecure) for every header and its value.
+
+A page that loads something from elsewhere names it in its own CSP:
+
+<!-- compiles: body -->
+```zig
+try app.use(nilo.secure.pages(.{
+    .csp = "default-src 'self'; img-src 'self' https://cdn.example.com; connect-src 'self' https://api.example.com",
+}));
+```
+
+Every header is a field, and `null` turns one off: `.hsts = null` on a server that is only ever reached over plain HTTP inside a cluster. The values with a fixed set of choices are enums, so `.referrer_policy = .same_origin` is checked by the compiler and a typo does not compile. The whole block is put together while compiling, so it costs one store per request and no allocation.
+
+**A server with both an API and pages uses both presets.** Install `api` on the App and `pages` on the group that serves the front end; the group's replaces the App's on its routes. A handler that sets one of these headers itself, such as a `Content-Security-Policy` for one page, replaces that one line, and the rest of the block still goes out.
+
+**HSTS is sent on plain HTTP too, and a browser ignores it there.** Behind a platform that terminates TLS for you (Fly, Render, Cloud Run, a load balancer), it is the only place the header comes from. One thing to know: if you serve `https://localhost` in development, the browser remembers HSTS for `localhost` on every port, so use `.hsts = null` in that build.
+
 ## Rate limiting
 
 <!-- compiles: body -->

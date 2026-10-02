@@ -138,6 +138,20 @@ pub fn resolveChains(self: *App) !void {
     }
     try sizeMetrics(self);
     try sizeCompressors(self);
+    if (self.trace_hooks) |hooks| try hooks.size(self);
+}
+
+/// Give `trace()` its rings, one per executor thread, for the reason the
+/// compressors are sized here: the thread count is `listen()`'s to say
+/// (ADR 247). Kept when already that many. Called through
+/// `app.trace_hooks`, so a program that does not trace links none of it.
+pub fn sizeTracer(self: *App) anyerror!void {
+    const tracer = self.tracer orelse return;
+    const count: usize = if (self.compress_slots > 0)
+        self.compress_slots
+    else
+        bulkhead.threadCount(bulkhead.Options{});
+    try tracer.size(count);
 }
 
 /// Give `compress()` its pool, here rather than at `compress()`, because

@@ -165,6 +165,9 @@ fn writeLine(
                 try w.writeAll(" req=");
                 try writeEscaped(w, c.requestId().view());
             }
+            // On an App that traces, the id a trace view searches by, so a
+            // line leads to its trace and back (ADR 247).
+            try c.writeTraceId(w, " trace=", "");
         },
         // Every value a path could smuggle a delimiter through goes out
         // through the one escaper the response bodies use (`json.zig`).
@@ -182,6 +185,9 @@ fn writeLine(
                 try w.writeAll(",\"request_id\":");
                 try json_mod.writeString(w, c.requestId().view());
             }
+            // OpenTelemetry's own name for the field, which a log pipeline
+            // that already speaks it joins to the trace without a mapping.
+            try c.writeTraceId(w, ",\"trace_id\":\"", "\"");
             try w.writeByte('}');
         },
     }
@@ -244,6 +250,7 @@ fn requestThatWas(
     c._path = path;
     c._lifetime = lifetime;
     c._request_id = if (id) |text| str_mod.Str.fromRequest(text, lifetime) else null;
+    c._tracer = null;
     return c;
 }
 
@@ -275,6 +282,28 @@ test "a json line carries the same four things, and the id when asked" {
         "{\"method\":\"GET\",\"path\":\"/users/7\",\"status\":500,\"us\":59," ++
             "\"error\":\"OutOfMemory\",\"request_id\":\"abc123\"}",
         lineFor(.{ .format = .json, .request_id = true }, &buf, &c, 500, 59, "OutOfMemory"),
+    );
+}
+
+test "on an App that traces, a line carries the trace id in both formats" {
+    var lifetime: str_mod.Lifetime = .{};
+    var c = requestThatWas(&lifetime, "/users/7", null);
+    var tracer = try @import("trace.zig").Tracer.init(testing.allocator, .{ .service = "orders" });
+    defer tracer.deinit();
+    c._tracer = &tracer;
+    c._trace.context = str_mod.trace.Context.parse(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ).?;
+    var buf: [max_line]u8 = undefined;
+
+    try testing.expectEqualStrings(
+        "GET /users/7 200 59µs trace=4bf92f3577b34da6a3ce929d0e0e4736",
+        lineFor(.{}, &buf, &c, 200, 59, null),
+    );
+    try testing.expectEqualStrings(
+        "{\"method\":\"GET\",\"path\":\"/users/7\",\"status\":200,\"us\":59," ++
+            "\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\"}",
+        lineFor(.{ .format = .json }, &buf, &c, 200, 59, null),
     );
 }
 

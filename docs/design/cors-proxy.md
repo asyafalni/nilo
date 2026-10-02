@@ -1,6 +1,6 @@
 # CORS and the proxy in front
 
-**Browsers and proxies each read a header on the server's behalf, and nilo answers each exactly as its protocol defines: CORS echoes back the one origin that matched, a proxy's `X-Forwarded-For` is trusted by which machine sent it, and CSRF is checked against the browser's own `Sec-Fetch-Site` and `Origin` headers, with no token.**
+**Browsers and proxies each read a header on the server's behalf, and nilo answers each exactly as its protocol defines: CORS echoes back the one origin that matched, a proxy's `X-Forwarded-For` is trusted by which machine sent it, CSRF is checked against the browser's own `Sec-Fetch-Site` and `Origin` headers, with no token, and the headers a browser reads as policy go out as one block written while compiling.**
 
 **Guide:** [The ones that come with it](../guide/middleware.md#built-in-logger-and-cors), [Who the client is](../guide/deploying.md#client-ip-address-behind-a-proxy) · **Reference:** [Middleware](../reference/middleware.md), [`listen` options](../reference/app.md#listen-options)
 
@@ -49,6 +49,9 @@ All three answer the same kind of question: which of several possible answers is
 16. **`Sec-Fetch-Site: same-site` is rejected unless its `Origin` is in the list**, because that is exactly what `SameSite=Lax` lets through: a page on a sibling subdomain posting with the session cookie. When the browser says `cross-site`, an `Origin` that matches the `Host` does not override it. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
 17. **A request with neither header is allowed**, because it does not come from a browser and carries nobody else's cookie. Comparing against the `Host` (ignoring the scheme) is only the fallback for a browser that sends `Origin` but no `Sec-Fetch-Site`. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
 18. **CSRF is opt-in, and when its trusted list is read at run time it is the same list as CORS**: `csrf.reading(&origins)` takes the same `cors.Origins`. `csrf.with` rejects `"*"`, an empty entry and an entry with a path while compiling. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
+19. **The headers a browser reads as policy are written by one middleware as one block, in one of two presets**: `nilo.secure.api` for an answer that is data, `nilo.secure.pages` for a server that serves its own front end. Each header is a field, sent or `null`; a value with a closed set is an enum, and `nosniff` has no field because it is never wrong. [ADR 246](../adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)
+20. **The block is assembled while compiling and takes one header slot on the Ctx however many lines it has**, so it adds no allocation beside CORS. A second `nilo.secure` on a group replaces the block; a handler that sets one of its headers replaces that line, because two `Content-Security-Policy` lines are enforced together. [ADR 246](../adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)
+21. **`Strict-Transport-Security` goes out on plain HTTP too**, which a browser ignores there (RFC 6797 §8.1), because behind a platform that terminates TLS and adds nothing it is the only place the header comes from. [ADR 246](../adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)
 
 ## Decisions
 
@@ -58,6 +61,7 @@ All three answer the same kind of question: which of several possible answers is
 | [088](../adr/088-an-origin-is-a-fact-about-the-deployment.md) | `cors.reading`, a list read at run time for the one setting that differs by deployment |
 | [102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md) | `trusted_proxies`: trust by address instead of by hop count |
 | [224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md) | `csrf`: a request that changes something is checked against `Sec-Fetch-Site` and `Origin`, and why not a token |
+| [246](../adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md) | `secure`: the policy headers as one block in two presets, and why not one header a slot |
 
 Related topics: the header caching rule that makes `Vary: Origin` necessary even when nothing matched is [ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md). A `Middleware` is a bare function pointer, which is why `cors.reading` needs a variable the caller owns instead of a Service; that is decided in [ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md). A repeated `Host` or a smuggled request is rejected for the same reason `trusted_proxies` rejects a forged hop: [ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md).
 

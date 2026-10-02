@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const str_mod = @import("str.zig");
+const trace = @import("trace.zig");
 
 const Str = str_mod.Str;
 const Lifetime = str_mod.Lifetime;
@@ -341,7 +342,7 @@ pub const AnyScope = struct {
     _scope: *anyopaque,
     _table: *const Table,
 
-    /// The six calls a Scope makes across a function pointer. `arena` and
+    /// The eight calls a Scope makes across a function pointer. `arena` and
     /// `str` are what `check` above asks of every Scope; `entropyInto` is the
     /// third because minting a key is what a reaction does that a query does
     /// not, and it is spelled `Into` rather than `entropy` because a function
@@ -355,6 +356,9 @@ pub const AnyScope = struct {
     /// who is acting reaches the far side of the pointer (ADR 144). `serial`
     /// is the sixth, so that `sql.problem` asked through an erased Scope can
     /// still tell this request's failure from the last one's (ADR 117).
+    /// `traceBegin` and `traceEnd` are the seventh and eighth, so a reaction
+    /// that dials out is part of the trace of the request that fired it
+    /// ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
     pub const Table = struct {
         arena: *const fn (*anyopaque) std.mem.Allocator,
         str: *const fn (*anyopaque, []const u8) Str,
@@ -362,6 +366,8 @@ pub const AnyScope = struct {
         requestId: *const fn (*anyopaque) ?Str,
         resolved: *const fn (*anyopaque, []const u8) ?*const anyopaque,
         serial: *const fn (*anyopaque) ?u64,
+        traceBegin: *const fn (*anyopaque) ?trace.Outbound,
+        traceEnd: *const fn (*anyopaque, trace.Outbound, trace.Ended) void,
     };
 
     /// Erase `scope`, which is a `*Ctx` or a `*Run`.
@@ -396,6 +402,8 @@ pub const AnyScope = struct {
                 .requestId = takeRequestId,
                 .resolved = takeResolved,
                 .serial = takeSerial,
+                .traceBegin = takeTraceBegin,
+                .traceEnd = takeTraceEnd,
             };
             fn takeArena(p: *anyopaque) std.mem.Allocator {
                 return S.arena(@ptrCast(@alignCast(p)));
@@ -421,6 +429,14 @@ pub const AnyScope = struct {
             fn takeSerial(p: *anyopaque) ?u64 {
                 return serialOf(@as(*S, @ptrCast(@alignCast(p))));
             }
+            // A reaction a request fired, dialling out, is part of that
+            // request's trace; one under a `Run` begins nothing (ADR 247).
+            fn takeTraceBegin(p: *anyopaque) ?trace.Outbound {
+                return traceBeginOf(@as(*S, @ptrCast(@alignCast(p))));
+            }
+            fn takeTraceEnd(p: *anyopaque, begun: trace.Outbound, ended: trace.Ended) void {
+                traceEndOf(@as(*S, @ptrCast(@alignCast(p))), begun, ended);
+            }
         };
         return .{ ._scope = @ptrCast(@constCast(scope)), ._table = &erased.table };
     }
@@ -437,6 +453,16 @@ pub const AnyScope = struct {
     /// made from something that is not a request (ADR 158).
     pub fn requestId(self: *AnyScope) ?Str {
         return self._table.requestId(self._scope);
+    }
+
+    /// The call span the Scope behind this one begins, or null when it does
+    /// not trace (ADR 247).
+    pub fn traceBegin(self: *AnyScope) ?trace.Outbound {
+        return self._table.traceBegin(self._scope);
+    }
+
+    pub fn traceEnd(self: *AnyScope, begun: trace.Outbound, ended: trace.Ended) void {
+        self._table.traceEnd(self._scope, begun, ended);
     }
 
     /// The serial of the Scope behind this one, or null when it keeps none.
@@ -524,6 +550,31 @@ pub fn serialOf(scope: anytype) ?u64 {
     };
     if (comptime !@hasDecl(S, "serial")) return null;
     return scope.serial();
+}
+
+/// The call span a Scope begins for a call about to leave, or null: for a
+/// Scope that does not trace, which is a `Run`, and for a request whose trace
+/// is off. What `nilo_fetch` asks before a call, so its `traceparent` names
+/// the call's own span ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
+pub fn traceBeginOf(scope: anytype) ?trace.Outbound {
+    const S = switch (@typeInfo(@TypeOf(scope))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(scope),
+    };
+    if (comptime !@hasDecl(S, "traceBegin")) return null;
+    return scope.traceBegin();
+}
+
+/// Tell the Scope a call it began a span for has ended. A Scope that does not
+/// trace never began one, so `nilo_fetch` only calls this with what
+/// `traceBeginOf` handed it.
+pub fn traceEndOf(scope: anytype, begun: trace.Outbound, ended: trace.Ended) void {
+    const S = switch (@typeInfo(@TypeOf(scope))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(scope),
+    };
+    if (comptime !@hasDecl(S, "traceEnd")) return;
+    scope.traceEnd(begun, ended);
 }
 
 /// Two `@typeName` results naming the same type.

@@ -8,7 +8,7 @@ Read the guide to learn what something is for, and this reference for its exact 
 
 ## Modules
 
-Eleven modules ship, and a project links only the ones it imports ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
+Twelve modules ship, and a project links only the ones it imports ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 | Module | What it is | Page |
 |---|---|---|
@@ -63,13 +63,14 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [Middleware](./app.md#middleware)
   - [Routes](./app.md#routes)
   - [Static files](./app.md#static-files)
-  - [Documents, health, metrics and compression](./app.md#documents-health-metrics-and-compression)
+  - [Documents, health, metrics, tracing and compression](./app.md#documents-health-metrics-tracing-and-compression)
   - [Running](./app.md#running)
   - [Which calls fail](./app.md#which-calls-fail)
   - [`Group`](./app.md#group)
   - [`listen` options](./app.md#listen-options)
   - [`metrics` options](./app.md#metrics-options)
   - [`compress` options](./app.md#compress-options)
+  - [`trace` options](./app.md#trace-options)
 - [Concurrency](./app.md#concurrency)
 - [Static options](./app.md#static-options)
 - [OpenAPI options](./app.md#openapi-options)
@@ -121,6 +122,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [A stream with a `.length`](./ctx.md#a-stream-with-a-length)
   - [`c.url`](./ctx.md#curl)
   - [`c.sendFile`](./ctx.md#csendfile)
+  - [Tracing](./ctx.md#tracing)
 - [`Cookie`](./ctx.md#cookie)
 - [`Session(T)`](./ctx.md#sessiont)
   - [The cookie name](./ctx.md#the-cookie-name)
@@ -157,11 +159,12 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [A client that comes back](./streaming.md#a-client-that-comes-back)
 - [`Rooms`](./streaming.md#rooms)
 
-**[Middleware](./middleware.md)**: nilo's built-in middleware (logging, CORS, CSRF, rate limits, per-route deadlines and body limits), and `nilo.accept` for reading an `Accept` header.
+**[Middleware](./middleware.md)**: nilo's built-in middleware (logging, CORS, CSRF, security headers, rate limits, per-route deadlines and body limits), and `nilo.accept` for reading an `Accept` header.
 
 - [Built-in middleware](./middleware.md#built-in-middleware)
   - [`nilo.cors`](./middleware.md#nilocors)
   - [`nilo.csrf`](./middleware.md#nilocsrf)
+  - [`nilo.secure`](./middleware.md#nilosecure)
   - [`nilo.allowance`](./middleware.md#niloallowance)
     - [`allowance.keyed`](./middleware.md#allowancekeyed)
   - [`nilo.deadline`](./middleware.md#nilodeadline)
@@ -278,6 +281,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [`fetch.Client` calls](./fetch.md#fetchclient-calls)
   - [`Client.Settings`](./fetch.md#clientsettings)
   - [`Client.Call`](./fetch.md#clientcall)
+  - [A call under a traced request](./fetch.md#a-call-under-a-traced-request)
   - [Responses with no body](./fetch.md#responses-with-no-body)
   - [Errors](./fetch.md#errors)
   - [Compression](./fetch.md#compression)

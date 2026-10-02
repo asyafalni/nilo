@@ -858,6 +858,85 @@ test "a call made under a request carries the request's id, and one under a Run 
     }.run);
 }
 
+/// A Scope that traces: the two declarations a `*Ctx` on an App with
+/// `app.trace` has, without `http/` in this file (ADR 247).
+const Traced = struct {
+    run: *core.Run,
+    begun: usize = 0,
+    ended: ?core.trace.Ended = null,
+    ended_with: ?core.trace.Outbound = null,
+
+    const context: core.trace.Context = .{ .trace_id = .{0xab} ** 16, .span_id = .{0xcd} ** 8, .sampled = true };
+
+    pub fn arena(self: *Traced) std.mem.Allocator {
+        return self.run.arena();
+    }
+    pub fn str(self: *Traced, bytes: []const u8) core.Str {
+        return self.run.str(bytes);
+    }
+    pub fn traceBegin(self: *Traced) ?core.trace.Outbound {
+        self.begun += 1;
+        return .{ .context = context, .parent = .{1} ** 8, .started_us = 0, .started_mono_us = 0, .state = "vendor=7" };
+    }
+    pub fn traceEnd(self: *Traced, begun: core.trace.Outbound, ended: core.trace.Ended) void {
+        self.ended_with = begun;
+        self.ended = ended;
+    }
+};
+
+test "a call made under a Scope that traces carries traceparent, and the Scope hears how it ended" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            var traced: Traced = .{ .run = &scope };
+            var buf: [64]u8 = undefined;
+
+            canned.seen_len = 0;
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+            const res = try client.get(&traced, try canned.url(&buf), .{});
+            served.await(io) catch {};
+
+            const seen = canned.seen[0..canned.seen_len];
+            try testing.expect(std.mem.indexOf(u8, seen, "traceparent: 00-abababababababababababababababab-cdcdcdcdcdcdcdcd-01") != null);
+            try testing.expect(std.mem.indexOf(u8, seen, "tracestate: vendor=7") != null);
+            try testing.expectEqual(@as(usize, 1), traced.begun);
+            const ended = traced.ended.?;
+            try testing.expectEqualStrings("GET", ended.method);
+            try testing.expect(std.mem.startsWith(u8, ended.url, "http://127.0.0.1:"));
+            try testing.expectEqual(@intFromEnum(res.status), ended.status);
+            try testing.expect(ended.failure == null);
+        }
+    }.run);
+}
+
+test "a traced call that cannot connect still ends its span, naming the error" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var client = try started(io, .{});
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            var traced: Traced = .{ .run = &scope };
+
+            // Port 1 on loopback: nothing listens, and the refusal is
+            // immediate.
+            _ = client.get(&traced, "http://127.0.0.1:1/", .{}) catch {};
+            const ended = traced.ended.?;
+            try testing.expectEqual(@as(u16, 0), ended.status);
+            try testing.expect(ended.failure != null);
+            try testing.expectEqualStrings("http://127.0.0.1:1/", ended.url);
+        }
+    }.run);
+}
+
 test "a caller's own X-Request-Id wins, and the setting turns the header off" {
     try withIo(struct {
         fn run(io: std.Io) !void {

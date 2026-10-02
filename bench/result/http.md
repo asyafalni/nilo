@@ -2259,8 +2259,8 @@ program with two `noinline` wrappers, one assigning `try
 Compress.init(...)` into a heap slot and one `catch`-ing it, built
 `-OReleaseFast -femit-asm`: both prologues reserve **99,048 and 99,032
 bytes** (`sub rsp, 99048`), which is the 96 KB `buffered_tokens` built as a
-temporary from its `.empty` constant and copied in; the 128 KB hash table
-is splatted in place. The same wrapper doing the assignment field by field
+temporary from its `.empty` constant and copied in; the hash table's
+64 KB `head` is splatted in place and its 64 KB `chain` left undefined. The same wrapper doing the assignment field by field
 (`compress.reset`) reserves **40 bytes**, and the deepest frames under a
 `writeAll` + `finish` are `Compress.huffman.build` at 4,936 bytes and the
 `sort.block` instantiation under it at 4,888. This is the number that
@@ -2280,7 +2280,8 @@ timed bodies after 100 warm ones, `std.json` bodies of the arena's three
 | 50 | 8,178 | 1,483 B, 50.6 µs | 1,225 B, 58.4 µs | 1,218 B, 63.7 µs |
 
 `reset` alone, timed the same way in the scratch program, is **6.0–6.4 µs**,
-nearly all of it the 128 KB `lookup.head` clear, so the three levels differ
+nearly all of it the 64 KB `lookup.head` clear (32,768 two-byte entries;
+this line said 128 KB until a later run counted them), so the three levels differ
 by less than that table's reader expects: the fixed cost is a sixth of a
 4 KB body. The clear is not optional. `matchAndAddHash` subtracts a head
 entry's distance from the current index with no bounds check, so a stale
@@ -3117,6 +3118,73 @@ After the fix the arena holds the body and about 4 KB of head and answer, whatev
 **The decision it moved.** `Options.max_bytes` defaults to 1 MiB (1,048,576): about 6.6 ms on `.default` here, a thirty-eighth of the watchdog's figure, which leaves room for a machine five or six times slower before gzip alone reaches it. 4 MiB (27 ms here) was the alternative: it fits a slow machine too, but a body that big is a download rather than an API answer, and a download is better compressed ahead of time. Zero takes the limit off. A body over it goes out uncompressed and without `Vary`, since the same body is sent to every client (ADR 211).
 
 **Can it be pushed further.** The 150 MB/s is the standard library's deflate at level 6, and 6 us of a small body is the hash table's reset, neither of which this changes. A compressor that yielded between blocks would remove the cap's reason, and costs a compressor held across a park, which ADR 211 refuses. The figures are from one machine; a slower core moves the cap's headroom, not its shape.
+
+## What tracing and security headers cost a program that does not use them
+
+**What was run.** Every example and `zig build size-s3 size-trace`, stripped `ReleaseFast`, `-Dtarget=x86_64-linux-gnu`, built at `5454e48` (from `git archive HEAD` into a scratch directory) and with the change that adds `nilo.secure` and `app.trace`. Then `bench/mem.py --port 8787 --path / --steps 1000,2000,5000,10000` against `examples/hello` from each tree, interleaved over two rounds, and the same against `nilo-size-s3_none` and `nilo-size-trace_on` on `/avatars/1`. `nm --size-sort` over unstripped builds of `hello` and `outbound` said where the bytes were.
+
+**Machine and commit.** A 2-core KVM guest, Intel Xeon Platinum 8255C at 2.5 GHz, Zig 0.16.0, over loopback. Sizes and RSS do not depend on how busy the machine is.
+
+| program | before | first build | shipped |
+|---|---|---|---|
+| `example-hello` | 1,008,784 | 1,020,816 (+12,032) | 1,009,216 (**+432**) |
+| `example-rest` | 1,211,384 | 1,223,448 (+12,064) | 1,211,768 (**+384**) |
+| `example-outbound` | 1,732,872 | 1,748,728 (+15,856) | 1,735,896 (**+3,024**) |
+| `nilo-size-s3_none` | 1,131,384 | 1,142,840 (+11,456) | 1,131,384 (**+0**) |
+| `nilo-size-trace_on` | | | 1,821,608 (+690,224 over `s3_none`) |
+
+| idle connections | `hello` before | `hello` after | `s3_none` | `trace_on` |
+|---|---|---|---|---|
+| 1,000 | 5,247 B | 5,247 B | 7,295 B | 8,286 B |
+| 10,000 | 5,190 B | 5,190 B | 7,238 B | 7,342 B |
+| marginal, 5,000 to 10,000 | | | 7,232 B | 7,233 B |
+
+**What it showed.** The first build called the tracer behind a runtime null check, and the linker kept all of it: `Tracer.begin` and `finish`, the generator per thread (1,640 bytes), the header walk, sizing the rings in `listen`, freeing them in `deinit`, the logger's trace field, and in `outbound` the URL parse and `traceparent` formatting. The security headers' line matching in `putHeader` was 1,156 more. Moved behind pointers that only `app.trace`, `Tracer.init` and `Ctx.putPolicy` set, it went: what is left is the null checks, two indirect calls and `writeExtra`. The 96 bytes the Ctx gained (88 for the trace state, 8 for the policy pointer) crossed no page on `hello`: measured again on the shipped build, 5,190 to 5,191 bytes a connection on both sides. With tracing on, the marginal figure is the same as without, and the 1.6 MB difference is fixed: rings filling, the batch and the exporter's client.
+
+**The decision it moved.** The shape of both features: every piece of code that only a traced or policy-carrying request runs is reached through a pointer the opt-in call sets, never through a call guarded by a runtime check (ADR 246, ADR 247). ADR 017's running total gets one row, +432 and +384.
+
+**Can it be pushed further.** `outbound`'s +3,024 is `withCarried`'s trace branch and the `traceparent` formatting on every `nilo_fetch` call under a `Ctx`. It could move behind the tracer's pointer as well, by having the tracer write the header text into the `Outbound`, and nobody has measured whether that is worth a field on a core type. The fetch frame's growth under ADR 062 was not measured against `bench-fetch-server`.
+
+## Which deflate is fastest, and whether brotli or zstd would beat it
+
+**What was run.** `bench/compare-compress/run_all.sh`: the bodies the arena's `json-comp` profile asks for (built from HttpArena's `dataset.json` at (25,4), (40,8) and (50,6)), `bench-compress`'s own bodies, and three large ones, each compressed by `std.flate` at levels 1, 6 and 9 through a copy of `Pool.gzip` and `reset`, and by libdeflate 1.26, zlib-ng, zstd and brotli at a sweep of levels. Every output was decompressed by its reference decoder and checked. The C libraries were built with `zig cc -O3 -DNDEBUG` for `x86_64_v3+aes+pclmul`, the CPU nilo's HttpArena image targets. The `std.flate` side gives byte-identical output to `zig build bench-compress` on `5454e48` (748, 1,041 and 1,225 bytes).
+
+**Machine and commit.** A KVM guest with 2 cores, Intel Xeon Platinum 8255C at 2.5 GHz, Zig 0.16.0, at `5454e48`. **The machine was busy**, with load average 4 to 6 from a test suite running beside it, so the figures are thread CPU time (`CLOCK_THREAD_CPUTIME_ID`, which leaves out time spent waiting for a core), pinned with `taskset -c 1`. Codecs were interleaved, over two independent runs of seven repetitions each; the medians of the two runs agree to 2% (at most 11%). A first run on wall-clock time spread 50% to 200% and was thrown away. The guest has no PMU, so instruction counts could not be taken. This core is about 4.6 times slower than the 9700X above (`std.flate` level 6 on a 4 KB body: 171 µs against 37.5 µs), so **the ratios carry to another machine and the microseconds do not**.
+
+Median CPU a body on the arena's bodies, and the ratio to today's default:
+
+| codec | arena-25 (4,190 B) | arena-40 (6,707 B) | arena-50 (8,397 B) | × `std.flate` 6 |
+|---|---|---|---|---|
+| `std.flate` 1 | 1,096 B, 172 µs | 1,542 B, 208 µs | 1,866 B, 230 µs | 0.87 |
+| **`std.flate` 6** (today) | **946 B, 191 µs** | **1,299 B, 239 µs** | **1,521 B, 277 µs** | **1.00** |
+| libdeflate 1 | 1,012 B, 30 µs | 1,421 B, 42 µs | 1,708 B, 51 µs | 0.17 |
+| **libdeflate 6** | **937 B, 62 µs** | **1,270 B, 97 µs** | **1,478 B, 122 µs** | **0.40** |
+| zlib-ng 6 | 947 B, 60 µs | 1,301 B, 94 µs | 1,519 B, 117 µs | 0.38 |
+| zstd 1 | 960 B, 25 µs | 1,332 B, 33 µs | 1,585 B, 39 µs | 0.14 |
+| brotli 1 | 1,084 B, 45 µs | 1,554 B, 54 µs | 1,876 B, 82 µs | 0.25 |
+| brotli 5 | 846 B, 205 µs | 1,170 B, 275 µs | 1,375 B, 323 µs | 1.14 |
+| brotli 11 | 716 B, 10.8 ms | 994 B, 16.7 ms | 1,179 B, 21.9 ms | ~70 |
+
+On 1 MB, `std.flate` 6 is 106,428 bytes in 21.8 ms, libdeflate 6 is 80,635 in 10.7 ms, and zstd 3 is 69,164 in 2.6 ms.
+
+| | memory a compressor | stripped `ReleaseFast` size, static musl probe |
+|---|---|---|
+| `std.flate` (today's pool slot) | 295,640 B | +24.6 KB, already in every nilo binary |
+| libdeflate, levels 2 to 9 | 668,295 B, one allocation, reusable | **+64.5 KB**, no libc needed |
+| zstd | grows to the largest body, 74 KB to 1.3 MB | +386 KB, and std has no encoder |
+| brotli | cannot be reset or pooled: 1.44 MB allocated a 4 KB body | +913 KB |
+
+**What it showed.**
+
+- **libdeflate at level 6 is 2.5 times faster than `std.flate` at level 6 on the arena's bodies, and 2% smaller.** On 1 MB it is twice as fast and 24% smaller. Its output is gzip, so nothing about `Accept-Encoding` changes.
+- **brotli is the smallest and never the fastest worth having.** At level 5 it is 10% smaller than `std.flate` 6 and 14% slower. It cannot be pooled, so every body allocates 1.4 MB, which is ADR 017's allocation axis spent on the request path.
+- **zstd is the fastest at every size.** HttpArena's validator accepts only `gzip` and `br`, about 83% of browsers send it, and Zig 0.16's std decodes it and does not encode it.
+- **22% of `std.flate`'s time on an arena body is a memset nobody needs**: `toks.* = .empty` in `writeBlock` (`Compress.zig` lines 987 and 1055) rebuilds the 96 KB token buffer from its constant after every block. A scratch copy assigning the fields one by one gave byte-identical output 18% to 44% faster, about 50 µs a body here. That is a one-line change to the standard library, not to nilo.
+- Two lines above were wrong and are corrected: the reset clears the hash table's 64 KB `head` (32,768 two-byte entries), not 128 KB.
+
+**The decision it moved.** Nothing shipped. brotli and zstd are refused on these numbers ([`docs/decided.md`](../../docs/decided.md)). libdeflate behind a build flag, the way `-Dtls` brings tls.zig (ADR 212), is the candidate, and its open questions are on [`docs/roadmap.md`](../../docs/roadmap.md). Under HttpArena's score, `rps × (min_bytes / my_bytes)²`, with compression about 0.78 of a `json-comp` request's CPU (230 µs a request on the board against 49 µs for `json-tls`), libdeflate 6 scores about 1.95 times today's entry and brotli 5 about 1.10. That model has not been checked against the board.
+
+**Can it be pushed further.** Yes, three ways. Run it again on a quiet machine and on a Zen 5, since the ratios have been measured only on this one. Measure the RSS libdeflate actually touches on a small body, which is bounded by the 668 KB above and not yet known. And the memset fix goes upstream to Zig, which every nilo build would get for nothing.
 
 ## What a route deadline's write clamp costs
 

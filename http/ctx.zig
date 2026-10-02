@@ -40,6 +40,7 @@ const watchdog = @import("watchdog.zig");
 const authorization_mod = @import("authorization.zig");
 const verified_mod = @import("verified.zig");
 const versioned_mod = @import("versioned.zig");
+const trace_mod = @import("trace.zig");
 
 /// What `Ctx._session_fallbacks` points at when there are no fallbacks, which is
 /// every App that never rotated and every Ctx a test builds by hand.
@@ -159,6 +160,16 @@ pub const Ctx = struct {
     /// and therefore on the fiber's stack — not on the connection, whose
     /// 4,669 idle bytes are an invariant rather than a budget (ADR 017).
     _request_id_buf: [16]u8 = undefined,
+    /// The App's tracer, when `app.trace` was called. Null on a request of an
+    /// App that does not trace (ADR 247).
+    _tracer: ?*trace_mod.Tracer = null,
+    /// Where this request is in its trace. Set when `_tracer` is, and read
+    /// only then.
+    _trace: trace_mod.Active = undefined,
+    /// Set by `putPolicy`, so that `putHeader` reaches the code that edits a
+    /// policy block only on a request that has one, and a program with no
+    /// `nilo.secure` does not link it (ADR 246).
+    _policy_edit: ?*const fn (std.mem.Allocator, []const u8, []const u8) error{OutOfMemory}![]const u8 = null,
     /// What this request may do, from `listen()`. Defaults when App was
     /// never listened on, which is what a test gets.
     _limits: Limits = .{},
@@ -660,6 +671,60 @@ pub const Ctx = struct {
         const named_proxies = self._limits.trusted_proxies;
         if (named_proxies.len > 0) return self._peer.local or proxies_mod.holds(named_proxies, self._peer.address());
         return self._limits.trusted_hops > 0;
+    }
+
+    /// A span of this request's trace, a child of whatever span is current,
+    /// and current itself until it ends
+    /// ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
+    ///
+    /// ```zig
+    /// var span = c.span("charge card");
+    /// defer span.end();
+    /// errdefer |err| span.fail(err);
+    /// ```
+    ///
+    /// `name` is comptime, because a span name has to be one of a few (it is
+    /// what a trace view groups by) and one that has to be known while
+    /// compiling cannot carry an id or an email. A call through `nilo_fetch`
+    /// while the span is open is its child. On an App that does not trace, or
+    /// a request whose trace is not recorded, the span records nothing and
+    /// `end` is a compare.
+    pub fn span(self: *Ctx, comptime name: []const u8) trace_mod.Span {
+        const tracer = self._tracer orelse return .none(&self._trace);
+        if (!self._trace.context.sampled) return .none(&self._trace);
+        return .open(tracer, &self._trace, name);
+    }
+
+    /// This request's trace id, as the 32 hex characters a trace view
+    /// searches by, or null on an App that does not trace. For a log line or
+    /// an error page that wants to say where to look.
+    pub fn traceId(self: *const Ctx) ?[32]u8 {
+        if (self._tracer == null) return null;
+        var out: [32]u8 = undefined;
+        str_mod.trace.writeHex(&self._trace.context.trace_id, &out);
+        return out;
+    }
+
+    /// The framework's own: the trace id between `before` and `after`, or
+    /// nothing on an App that does not trace. What the logger writes, through
+    /// the tracer's pointer so that a program with a logger and no tracing
+    /// links none of it (ADR 247).
+    pub fn writeTraceId(self: *const Ctx, w: *std.Io.Writer, before: []const u8, after: []const u8) std.Io.Writer.Error!void {
+        const tracer = self._tracer orelse return;
+        return tracer.write_id(&self._trace, w, before, after);
+    }
+
+    /// The Scope half of a traced call: `nilo_fetch` asks this before a call
+    /// leaves, and sends the context as `traceparent` (ADR 247).
+    pub fn traceBegin(self: *Ctx) ?str_mod.trace.Outbound {
+        const tracer = self._tracer orelse return null;
+        return tracer.begin_call(&self._trace);
+    }
+
+    /// The other half: the call ended, and its span is kept if the trace is.
+    pub fn traceEnd(self: *Ctx, begun: str_mod.trace.Outbound, ended: str_mod.trace.Ended) void {
+        const tracer = self._tracer orelse return;
+        tracer.end_call(tracer, begun, ended);
     }
 
     /// This request's id — the one thing that ties a log line, a response,
@@ -1608,6 +1673,15 @@ pub const Ctx = struct {
         // legitimately carry more than one of (`http1.repeats`).
         if (!http1.repeats(entry.name)) {
             for (self.extraHeadersMutable()) |*h| {
+                // `nilo.secure`'s block, which may hold a line for this name:
+                // the header being set replaces that line, as it would a
+                // header set on its own (ADR 246). Through the pointer
+                // `putPolicy` left, so an App with no `nilo.secure` links none
+                // of the matching.
+                if (h.name.len == 0) {
+                    if (self._policy_edit) |edit| h.value = try edit(self._arena, h.value, entry.name);
+                    continue;
+                }
                 if (std.ascii.eqlIgnoreCase(h.name, entry.name)) {
                     h.* = entry; // last one wins, rather than sending both
                     return;
@@ -1627,6 +1701,39 @@ pub const Ctx = struct {
             }
         }
 
+        return self.appendHeader(entry);
+    }
+
+    /// `nilo.secure`'s headers: a block of whole lines assembled while
+    /// compiling, kept as one entry with no name and written as it is
+    /// ([ADR 246](../docs/adr/246-the-headers-a-browser-reads-as-policy-are-one-block.md)).
+    /// One slot of the seven held on the Ctx however many lines the block has,
+    /// so a policy of seven headers does not push CORS and gzip into the
+    /// arena. A second block replaces the first, which is how a group
+    /// installs a policy of its own over the App's.
+    ///
+    /// The framework's own: `block` is checked line by line while compiling,
+    /// which is the only reason it may skip `checkHeader`.
+    pub fn putPolicy(self: *Ctx, block: []const u8) !void {
+        self._policy_edit = &policyWithout;
+        for (self.extraHeadersMutable()) |*h| {
+            if (h.name.len == 0) {
+                h.value = block;
+                return;
+            }
+        }
+        return self.appendHeader(.{ .name = "", .value = block });
+    }
+
+    /// `block` without its line for `name`, when `name` is one of the headers
+    /// a block holds; `block` itself otherwise. What `putHeader` calls when a
+    /// handler sets a header the policy already sent.
+    fn policyWithout(gpa: std.mem.Allocator, block: []const u8, name: []const u8) error{OutOfMemory}![]const u8 {
+        if (!http1.isPolicyHeader(name)) return block;
+        return http1.withoutLine(gpa, block, name);
+    }
+
+    fn appendHeader(self: *Ctx, entry: http1.Header) !void {
         if (self._extra_spill.items.len > 0) {
             return self._extra_spill.append(self._arena, entry);
         }

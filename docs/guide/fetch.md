@@ -241,6 +241,8 @@ A name with no matching field, a tuple for a named segment, a struct for a posit
 | `read_buffer_size` | 8 KiB | the buffer each connection reads the socket through, so how much one read brings in. std's own default, passed through; one per connection, on the heap |
 | `forward_request_id` | true | a call made under a `*Ctx` carries the request's id as `X-Request-Id`, so the service you called can log the same id you did. Under a `nilo.Run` there is no request and nothing is sent; a call that sets its own `X-Request-Id` keeps it ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)) |
 
+**On an App that traces, a call made under a `*Ctx` also sends `traceparent`**, so the service you called continues the same trace, and the call shows up as a span of its own under the request's ([Tracing](./tracing.md)).
+
 **`max_in_flight` is not optional in practice.** `std.http.Client`'s pool limits *idle* connections and does not limit connections in use at all, so without it the limit on live connections is however many handlers happen to be running, and an HTTPS connection holds 59,151 bytes of TLS and socket buffers. Five hundred concurrent handlers would be 29.6 MB nobody asked for, and five hundred handshakes. Thirty-two times that is the most this client will ever hold.
 
 **`timeout_ms` limits the whole call, not each read**, because a server sending one byte a second satisfies any per-read limit and never finishes. The server's own [deadlines](./deploying.md#deadlines) follow the same reasoning from the other side.

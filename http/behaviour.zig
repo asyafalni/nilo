@@ -39,6 +39,8 @@ const bound_mod = @import("bound.zig");
 const redirect_mod = @import("redirect.zig");
 const cors = @import("cors.zig");
 const csrf = @import("csrf.zig");
+const secure = @import("secure.zig");
+const trace_mod = @import("trace.zig");
 const allowance = @import("allowance.zig");
 const patch_mod = @import("patch.zig");
 
@@ -3466,6 +3468,123 @@ test "csrf lets through this server's own page, a link from anywhere, and curl" 
     }
 }
 
+fn ownPolicy(c: *Ctx) anyerror!void {
+    try c.setHeader("Content-Security-Policy", "default-src 'self'");
+    try c.sendText(200, "page");
+}
+
+test "nilo.secure writes its policy on an answer and on a failure, once each" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(secure.api(.{}));
+    try app.get("/x", plainOk);
+    try app.get("/gone", alwaysFails);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = h.send(&app, "GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, ok.response, "\r\nX-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ok.response, "\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ok.response, "\r\nReferrer-Policy: no-referrer\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, ok.response, "\r\n\r\nhandler"));
+
+    // A refusal is an answer a browser renders too, and a JSON error page
+    // that could be sniffed as HTML is the case nosniff exists for.
+    const failed = h.send(&app, "GET /gone HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, failed.response, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, failed.response, "X-Content-Type-Options: nosniff\r\n"));
+}
+
+test "a handler's own Content-Security-Policy replaces the one nilo.secure wrote" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(secure.pages(.{}));
+    try app.get("/page", ownPolicy);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    // Two CSP lines would be enforced together, and the page would get the
+    // intersection of the two, which is the policy nobody wrote.
+    const page = h.send(&app, "GET /page HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, page.response, "Content-Security-Policy:"));
+    try testing.expect(std.mem.indexOf(u8, page.response, "Content-Security-Policy: default-src 'self'\r\n") != null);
+    // The rest of the block is still there.
+    try testing.expect(std.mem.indexOf(u8, page.response, "X-Frame-Options: SAMEORIGIN\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, page.response, "Cross-Origin-Resource-Policy: same-origin\r\n") != null);
+}
+
+test "a group's nilo.secure replaces the App's rather than adding to it" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(secure.api(.{}));
+    const site = app.group("/app");
+    try site.use(secure.pages(.{}));
+    try site.get("/home", plainOk);
+    try app.get("/api/thing", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const inside = h.send(&app, "GET /app/home HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, inside.response, "Content-Security-Policy:"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, inside.response, "X-Content-Type-Options:"));
+    try testing.expect(std.mem.indexOf(u8, inside.response, "X-Frame-Options: SAMEORIGIN\r\n") != null);
+
+    const outside = h.send(&app, "GET /api/thing HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, outside.response, "X-Frame-Options: DENY\r\n") != null);
+}
+
+test "nilo.secure beside a named-origin CORS adds nothing to the request path's allocations" {
+    // Seven policy headers would have taken every slot the Ctx holds and
+    // pushed CORS and gzip into the arena; as one block they take one
+    // (ADR 246). The same request as the allocation budget's, with the
+    // larger preset and a CORS that writes two headers of its own.
+    var db = Db{ .rows = &.{.{ .id = 7, .name = "wati" }} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/users/:id", getUser);
+    try app.use(cors.with(.{ .origins = &.{"https://example.dev"} }));
+    try app.use(secure.pages(.{ .embedder_policy = .credentialless, .permissions_policy = "camera=()" }));
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+
+    const request = "GET /users/7 HTTP/1.1\r\nHost: example.dev\r\nOrigin: https://example.dev\r\n" ++
+        "Accept: */*\r\nConnection: keep-alive\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) void {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+    counting.reset();
+    send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+
+    // The JSON body, as in the budget test, and nothing for the policy.
+    try testing.expectEqual(@as(usize, 1), counting.allocs);
+    try testing.expectEqual(@as(usize, 0), counting.resizes);
+    try testing.expect(std.mem.indexOf(u8, &buf, "Permissions-Policy: camera=()\r\n") != null);
+}
+
 test "csrf takes a named front end, from a list or from the Origins CORS reads" {
     const Held = struct {
         var origins: cors.Origins = .empty;
@@ -4264,6 +4383,120 @@ test "the request path stays inside its allocation budget" {
     //     in the `Ctx` itself; the arena only hears about a seventh.
     try testing.expectEqual(@as(usize, 1), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
+}
+
+test "a traced request stays inside the same allocation budget" {
+    // The budget test's request with `app.trace` on and a `traceparent`
+    // to join: the span is a copy into a ring sized when the chains were
+    // resolved, so the count does not move (ADR 247).
+    var db = Db{ .rows = &.{.{ .id = 7, .name = "wati" }} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/users/:id", getUser);
+    try app.use(cors.permissive);
+    try app.trace(.{ .service = "orders", .spans_per_thread = 8 });
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+
+    const request = "GET /users/7 HTTP/1.1\r\nHost: example.dev\r\nUser-Agent: wrk\r\n" ++
+        "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n" ++
+        "Accept: */*\r\nConnection: keep-alive\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) void {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+    counting.reset();
+    send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+    try testing.expectEqual(@as(usize, 1), counting.allocs);
+    try testing.expectEqual(@as(usize, 0), counting.resizes);
+
+    // And every one of the four was recorded.
+    var out: [8]trace_mod.Record = undefined;
+    try testing.expectEqual(@as(usize, 4), app.tracer.?.drain(&out));
+}
+
+fn tracedChild(c: *Ctx) anyerror!void {
+    var span = c.span("load user");
+    defer span.end();
+    try c.sendText(200, "ok");
+}
+
+test "a traced request is a server span under its caller's, named for its route, with its own spans under it" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/users/:id", tracedChild);
+    try app.trace(.{ .service = "orders", .spans_per_thread = 8 });
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const answer = h.send(
+        &app,
+        "GET /users/7 HTTP/1.1\r\nHost: x\r\n" ++
+            "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n\r\n",
+    );
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 200"));
+
+    var out: [8]trace_mod.Record = undefined;
+    try testing.expectEqual(@as(usize, 2), app.tracer.?.drain(&out));
+    // The handler's span ends first, so it is first out of the ring.
+    const child = out[0];
+    const server = out[1];
+    const caller = trace_mod.Context.parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").?;
+
+    try testing.expectEqual(trace_mod.Kind.server, server.kind);
+    try testing.expectEqualStrings("/users/:id", server.name);
+    try testing.expectEqualStrings("GET", server.method);
+    try testing.expectEqualStrings("/users/7", server.textOf());
+    try testing.expectEqual(@as(u16, 200), server.status);
+    try testing.expectEqualSlices(u8, &caller.trace_id, &server.trace_id);
+    try testing.expectEqualSlices(u8, &caller.span_id, &server.parent);
+
+    try testing.expectEqual(trace_mod.Kind.internal, child.kind);
+    try testing.expectEqualStrings("load user", child.name);
+    try testing.expectEqualSlices(u8, &caller.trace_id, &child.trace_id);
+    try testing.expectEqualSlices(u8, &server.span_id, &child.parent);
+}
+
+test "a request no route matched is a span named for its method, and a 5xx is a failed one" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/boom", testExplode);
+    try app.trace(.{ .service = "orders", .spans_per_thread = 8 });
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    _ = h.send(&app, "GET /nowhere HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = h.send(&app, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    var out: [8]trace_mod.Record = undefined;
+    try testing.expectEqual(@as(usize, 2), app.tracer.?.drain(&out));
+    try testing.expectEqualStrings("", out[0].name);
+    try testing.expectEqual(@as(u16, 404), out[0].status);
+    try testing.expectEqualStrings("/boom", out[1].name);
+    try testing.expectEqual(@as(u16, 500), out[1].status);
+    // A second `app.trace` is refused rather than starting a second exporter.
+    try testing.expectError(error.TracingAlreadyEnabled, app.trace(.{ .service = "again" }));
 }
 
 test "a request is counted against its route, not the path it arrived on" {

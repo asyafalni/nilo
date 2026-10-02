@@ -32,8 +32,8 @@ the job.
 
 The premise the roadmap entry rested on turned out to be half the story.
 A deflate compressor's window is 64 KB, and `std.compress.flate.Compress`
-in Zig 0.16 holds another `~224 KB` beside it: a 128 KB hash table and a
-96 KB token buffer, as fields of the struct. So the thing to be pooled is
+in Zig 0.16 holds another `~224 KB` beside it: a 128 KB hash table (a 64 KB `head`
+and a 64 KB `chain`) and a 96 KB token buffer, as fields of the struct. So the thing to be pooled is
 not 64 KB but `~288 KB`, and the cost of putting one where the standard
 library's `init` puts it is not the window at all.
 
@@ -151,7 +151,7 @@ the arena rotates through, one thread, `ReleaseFast`, this machine
 
 Two things in that table decided defaults. The levels are closer in time
 than expected because **6 µs of every body is the reset**, nearly all of
-it the 128 KB hash table being cleared, which is not optional: a stale
+it the hash table's 64 KB `head` being cleared, which is not optional: a stale
 entry is a distance the matcher subtracts from an index with no bounds
 check, so the clear is what keeps the second body from reading before the
 buffer. And `.best` buys under one percent of size over `.default` for

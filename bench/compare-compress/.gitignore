@@ -1,0 +1,16 @@
+libdeflate/
+zstd/
+brotli/
+zlib-ng/
+build/
+bin/
+bodies/
+harness
+sweep
+zng_bench
+*.csv
+size/*/probe
+size/*/codec.zig
+size/*-*/
+!size/libdeflate-nolibc/
+size/libdeflate-nolibc/probe

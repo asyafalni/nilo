@@ -26,7 +26,7 @@
 
 const std = @import("std");
 const nilo = @import("nilo_http");
-const fetch = @import("fetch.zig");
+const fetch = @import("nilo_fetch");
 
 /// Quieten the log for one test, and the reason it has to be done this way is
 /// worth the four lines.

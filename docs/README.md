@@ -102,6 +102,7 @@ In the order the guide teaches them. Each row is one guide page and the referenc
 | [Testing](./guide/testing.md) | `nilo_http` | [`nilo.testing.Client`](./reference/testing.md#testingclient), [`Wired`](./reference/testing.md#testingwired) | [Testing](./design/testing.md) |
 | [OpenAPI](./guide/openapi.md) | `nilo_http` | [OpenAPI options](./reference/app.md#openapi-options), [the document without a server](./reference/app.md#the-document-without-a-server), [handler returns](./reference/handlers.md#handler-returns) | [OpenAPI](./design/openapi.md) |
 | [Metrics](./guide/metrics.md) | `nilo_http` | [`app.metrics`, `app.expose`](./reference/app.md#app), [`metrics` options](./reference/app.md#metrics-options) | none; the decision is [ADR 079](./adr/079-the-route-table-is-the-registry.md) |
+| [Tracing](./guide/tracing.md) | `nilo_http` | [`app.trace`](./reference/app.md#app), [trace options](./reference/app.md#trace-options), [`c.span` and `c.traceId`](./reference/ctx.md#tracing) | none; the decision is [ADR 247](./adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md) |
 | [Deploying](./guide/deploying.md) | `nilo_http` | [`listen` options](./reference/app.md#listen-options), [`App`](./reference/app.md#app) | [Lifecycle](./design/lifecycle.md), [Deadlines](./design/deadlines.md), [Memory](./design/memory.md), [TLS](./design/tls.md), [The engine](./design/engine.md), [CORS and the proxy in front](./design/cors-proxy.md) |
 
 ### Design topics with no guide page of their own

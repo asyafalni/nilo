@@ -30,6 +30,7 @@ const wiring = @import("wiring.zig");
 const health_mod = @import("health.zig");
 const failurebody = @import("failurebody.zig");
 const compress_mod = @import("compress.zig");
+const trace_mod = @import("trace.zig");
 
 /// Say so if the program was built in a mode its log level does not match.
 /// Lives in `wiring.zig`; re-exported because `nilo.warn…` is public API.
@@ -63,6 +64,38 @@ fn healthRoute(c: *Ctx) anyerror!void {
     // A health answer a proxy remembers is a health answer about the past.
     try c.setStaticHeader("Cache-Control", "no-store");
     try c.send(@intFromEnum(outcome), health_mod.content_type, out.written());
+}
+
+/// The two calls `app.trace` gives the request path (`serve.trace_hooks`).
+pub const TraceHooks = struct {
+    begin: *const fn (*ctx_mod.Ctx, *trace_mod.Tracer) void,
+    finish: *const fn (*ctx_mod.Ctx, []const u8) void,
+    /// The rings, once the thread count is known (`wiring.resolveChains`).
+    size: *const fn (*App) anyerror!void,
+    /// The exporter and the tracer, after the services have stopped.
+    free: *const fn (*App) void,
+};
+
+/// What `trace()` points the App at. Referenced from nowhere else, so none
+/// of what it names is compiled into a program that never traces (ADR 247).
+const tracing_hooks: TraceHooks = .{
+    .begin = serve.traceBegin,
+    .finish = serve.traceFinish,
+    .size = wiring.sizeTracer,
+    .free = freeTracing,
+};
+
+fn freeTracing(self: *App) void {
+    const otlp = @import("otlp.zig");
+    if (self.exporter) |erased| {
+        const e: *otlp.Exporter = @ptrCast(@alignCast(erased));
+        e.deinit();
+        self.gpa.destroy(e);
+    }
+    if (self.tracer) |tracer| {
+        tracer.deinit();
+        self.gpa.destroy(tracer);
+    }
 }
 
 pub const App = struct {
@@ -138,6 +171,20 @@ pub const App = struct {
     /// set just before the chains are resolved. 0 means one per core, which
     /// is what `start(io)` and a test that resolves the chains by hand get.
     compress_slots: u8 = 0,
+    /// What `trace()` set up: the rings, the exporter and its client. Null on
+    /// every App that never asked, and then a request pays one compare
+    /// (ADR 247). On the heap, because it is a service and a service is
+    /// handed out by pointer.
+    tracer: ?*trace_mod.Tracer = null,
+    /// The exporter `trace()` made, behind a pointer with its type erased:
+    /// `otlp.zig` is what names `nilo_fetch` and `nilo_proto`, and an App
+    /// that never traces must not reach it, `deinit` included (ADR 247).
+    exporter: ?*anyopaque = null,
+    /// The span the request path opens and closes, set with `tracer` and
+    /// only by `trace()`. A pointer rather than a call because a call behind
+    /// a runtime null is still linked: this way a program that never traces
+    /// carries none of the ids, the header walk or the ring (ADR 247).
+    trace_hooks: ?*const TraceHooks = null,
     /// The generated document and its reader page, held the way a loaded
     /// directory is so that ETags and 304s arrive without a second code
     /// path. Null until `listen()` builds it.
@@ -282,6 +329,9 @@ pub const App = struct {
         self.gpa.free(self.trusted_proxies);
         self.requirements.deinit(self.gpa);
         self.services.deinit();
+        // After the services: the tracer is one, and its stop hook is what
+        // sends the last of the spans.
+        if (self.trace_hooks) |hooks| hooks.free(self);
         self.router.deinit();
     }
 
@@ -1074,6 +1124,61 @@ pub const App = struct {
     pub fn compress(self: *App, opts: compress_mod.Options) error{CompressionAlreadyEnabled}!void {
         if (self.compress_options != null) return error.CompressionAlreadyEnabled;
         self.compress_options = opts;
+    }
+
+    /// Trace every request, and send the spans to an OpenTelemetry receiver
+    /// ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
+    ///
+    /// ```zig
+    /// try app.trace(.{ .service = "orders" });   // OTLP/HTTP to localhost:4318
+    /// ```
+    ///
+    /// From then on every request is a server span named for its route, a
+    /// request that arrives with a `traceparent` joins that trace, a call
+    /// through `nilo_fetch` is a client span whose `traceparent` names it, and
+    /// `c.span(name)` opens a span of the handler's own. The spans are sent in
+    /// batches by a fiber of the server's every `flush_ms`, and what is left
+    /// when it stops is sent on the way out.
+    ///
+    /// **What it costs is stated rather than hidden.** On the request path:
+    /// two clock reads, two ids from a generator per thread, one walk of the
+    /// headers, and a copy of the finished span into this thread's ring. No
+    /// allocation and no lock. Held for the life of the App: a ring of
+    /// `spans_per_thread` records per thread, allocated when the chains are
+    /// resolved, and a batch of `max_batch`. Nothing per connection.
+    ///
+    /// The text in `opts` is borrowed and has to outlive the App. Options
+    /// that could send nothing (an empty service, an endpoint that is not
+    /// `http://` or `https://`, a sample outside 0 to 1) are refused here.
+    /// Once per App; a second call is `error.TracingAlreadyEnabled`.
+    pub fn trace(self: *App, opts: trace_mod.Options) !void {
+        const otlp = @import("otlp.zig");
+        if (self.tracer != null) return error.TracingAlreadyEnabled;
+
+        // Built inside a block so its errdefers end where the App takes
+        // ownership: after `services.add`, `deinit` frees both, and an
+        // errdefer still standing would free them a second time.
+        const exporter = made: {
+            const tracer = try self.gpa.create(trace_mod.Tracer);
+            errdefer self.gpa.destroy(tracer);
+            tracer.* = try trace_mod.Tracer.init(self.gpa, opts);
+            errdefer tracer.deinit();
+
+            const exporter = try self.gpa.create(otlp.Exporter);
+            errdefer self.gpa.destroy(exporter);
+            exporter.* = try otlp.Exporter.init(self.gpa, tracer);
+            errdefer exporter.deinit();
+
+            // A service, so its client starts on the server's loop and its
+            // stop hook sends the last of the spans.
+            try self.services.add(exporter);
+            self.tracer = tracer;
+            self.trace_hooks = &tracing_hooks;
+            break :made exporter;
+        };
+        self.exporter = exporter;
+        // And a fiber, which is the loop that sends.
+        try self.spawn(otlp.Exporter.exportEvery, .{exporter});
     }
 
     /// Publish a number of the application's own on the metrics page.

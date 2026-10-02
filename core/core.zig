@@ -12,6 +12,9 @@
 //! by being here from the start (ADR 057): the App layer decodes every path
 //! param, a Service signing a URL encodes one, and a Service cannot import
 //! `nilo_http` to share the App layer's copy.
+//! `trace` is the second (ADR 247): the server reads `traceparent` on the
+//! way in and `nilo_fetch`, a Fitting that cannot name the server, writes it
+//! on the way out.
 //!
 //! **Nothing here needs the event loop**, names an Engine, or knows that
 //! HTTP exists. That is what lets `zig test core/core.zig` run the whole of
@@ -49,6 +52,13 @@ pub const routeNameOf = scope_mod.routeNameOf;
 /// between calls and has to know it is still the same one (ADR 117).
 pub const serialOf = scope_mod.serialOf;
 
+/// W3C Trace Context, and the two Scope calls a call that leaves makes so it
+/// joins the request's trace
+/// ([ADR 247](../docs/adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)).
+pub const trace = @import("trace.zig");
+pub const traceBeginOf = scope_mod.traceBeginOf;
+pub const traceEndOf = scope_mod.traceEndOf;
+
 /// A Scope with its type erased, for the one place a shape checked while
 /// compiling cannot reach: the other side of a function pointer
 /// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
@@ -71,4 +81,5 @@ test {
     _ = @import("clock.zig");
     _ = @import("percent.zig");
     _ = @import("limits.zig");
+    _ = @import("trace.zig");
 }
