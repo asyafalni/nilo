@@ -60,7 +60,7 @@ You need Zig 0.16 and nothing else: no C library, no system package.
 
 ```console
 $ zig init                                                          # only if you have no build.zig.zon yet
-$ zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.6.0#221e1b3eaed531efe13de7ab39dedc4091a8775c'
+$ zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.7.0#e1b859f8230a4cffd09d8e84411f7bcd7524258a'
 ```
 
 **Keep the `#commit` part.** The tag is annotated, and Zig 0.16's `zig fetch` doesn't peel it, so `?ref=v0.7.0` on its own gives you whatever `main` is that day.

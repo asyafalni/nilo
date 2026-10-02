@@ -4,6 +4,111 @@ What `bench/release.py` reads for each release, every module side by side with t
 
 **How to read a table.** A figure is comparable with the figures in its own table, measured in the same run on the same machine, and not with a figure from another table: glibc picks its string functions by CPU, and a different runner is a different CPU. The change in brackets is the record. Instructions are counted by cachegrind and RSS is page-granular, so "inside the spread" is rare and a change of a few instructions is a real one; whether it matters is ADR 017's question, not this file's.
 
+## v0.7.0
+
+Run on 2026-10-02 by the **Release numbers** workflow ([run 37007998474](https://github.com/nevindra/nilo/actions/runs/37007998474)), `0da0a56` against v0.6.0, before the tag. The tag's commit, `e1b859f`, differs from `0da0a56` only in the CHANGELOG, the docs and the version strings, so this is the release's reading.
+
+**What it found, and where each change is already paid for.** `http` is +595 instructions a request (+4.55%), the head checked byte by byte for a control or a bare CR and every name for a token, which [ADR 070](../../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md) puts at −1.5 to −4.5% end to end, inside ADR 017's 10%; its +40,944 binary bytes are the rows this release added to ADR 017's running total. `job` allocates 8,648 bytes an operation where it allocated 260, still in one allocation: `job.Memory`'s claim takes its 4,160-byte destination from the tick's arena before it takes its lock ([ADR 160](../../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)), and the figure is the block the arena asked its allocator for. `sql` is 313 instructions and one allocation lighter. An idle connection is 5,186 bytes at both refs.
+
+### Instructions an operation
+
+| module | v0.6.0 `221e1b3` | 0da0a56 `0da0a56` |
+|---|---|---|
+| http | 13,068 | 13,663–13,664 (+595, +4.55%) |
+| core | 3,978 | 3,978 (unchanged) |
+| id | 859 | 859 (unchanged) |
+| config | 406 | 406 (unchanged) |
+| pw | 285,101,771 | 285,101,771 (unchanged) |
+| cache | 740 | 747 (+7, +0.89%) |
+| jwt | 3,722,093 | 3,722,093 (unchanged) |
+| proto | n/a | 71,609 |
+| fetch | 9,759 | 9,784 (+25, +0.26%) |
+| job | 5,132 | 5,271 (+139, +2.71%) |
+| sql | 7,835 | 7,522 (-313, -3.99%) |
+| s3 | 54,359 | 55,138 (+779, +1.43%) |
+
+### Allocations an operation
+
+| module | v0.6.0 `221e1b3` | 0da0a56 `0da0a56` |
+|---|---|---|
+| core | 2 | 2 (unchanged) |
+| id | 0 | 0 (unchanged) |
+| config | 0 | 0 (unchanged) |
+| pw | 1 | 1 (unchanged) |
+| cache | 0 | 0 (unchanged) |
+| jwt | 4 | 4 (unchanged) |
+| proto | n/a | 1 |
+| fetch | 2 | 2 (unchanged) |
+| job | 1 | 1 (unchanged) |
+| sql | 3 | 2 (-1, -33.33%) |
+| s3 | 1 | 1 (unchanged) |
+
+### Bytes allocated an operation
+
+| module | v0.6.0 `221e1b3` | 0da0a56 `0da0a56` |
+|---|---|---|
+| core | 55 | 55 (unchanged) |
+| id | 0 | 0 (unchanged) |
+| config | 0 | 0 (unchanged) |
+| pw | 19,922,944 | 19,922,944 (unchanged) |
+| cache | 0 | 0 (unchanged) |
+| jwt | 1,898 | 1,898 (unchanged) |
+| proto | n/a | 10,002 |
+| fetch | 495 | 495 (unchanged) |
+| job | 260 | 8,648 (+8,388, +3226.15%) |
+| sql | 74 | 74 (unchanged) |
+| s3 | 1,082 | 1,082 (unchanged) |
+
+### Stripped binary bytes
+
+| module | v0.6.0 `221e1b3` | 0da0a56 `0da0a56` |
+|---|---|---|
+| http | 974,392 | 1,015,336 (+40,944, +4.20%) |
+| core | 227,784 | 227,784 (unchanged) |
+| id | 224,776 | 224,776 (unchanged) |
+| config | 226,632 | 226,632 (unchanged) |
+| pw | 262,168 | 262,168 (unchanged) |
+| cache | 239,224 | 242,776 (+3,552, +1.48%) |
+| jwt | 409,912 | 409,912 (unchanged) |
+| proto | n/a | 256,200 |
+| fetch | 899,784 | 900,272 (+488, +0.05%) |
+| job | 301,480 | 325,552 (+24,072, +7.98%) |
+| sql | 1,460,696 | 1,467,400 (+6,704, +0.46%) |
+| s3 | 936,904 | 951,696 (+14,792, +1.58%) |
+
+### Bytes an idle connection
+
+| module | v0.6.0 `221e1b3` | 0da0a56 `0da0a56` |
+|---|---|---|
+| http | 5,186 | 5,186 (unchanged) |
+
+### What each operation is
+
+| module | one operation | counts |
+|---|---|---|
+| http | a `GET /users/7` answered with 1 KB of JSON | 1,000 and 5,000 |
+| core | a path param and a query value percent-decoded, a number read from a `Str` | 1,000 and 5,000 |
+| id | a v7 key made, printed and parsed back | 1,000 and 5,000 |
+| config | a five-field settings struct read from pairs | 1,000 and 5,000 |
+| pw | a password checked against its Argon2id hash at the default Cost | 2 and 6 |
+| cache | one `put` and one `get` of a flat value | 1,000 and 5,000 |
+| jwt | an RS256 token verified, its claims read | 20 and 100 |
+| proto | a 20-record logs request decoded into structs and written back | 200 and 1,000 |
+| fetch | a GET on a pooled keep-alive connection to an upstream in the process | 1,000 and 5,000 |
+| job | a job pushed onto `job.Memory`, claimed, run and marked done | 2,000 and 10,000 |
+| sql | a row found by key on SQLite, `.in_fiber` | 1,000 and 21,000 |
+| s3 | a GetObject signed with SigV4 from a stub in the process | 1,000 and 5,000 |
+
+### Not measured
+
+- `proto` at v0.6.0: error: this ref exports no nilo_proto
+
+### Built byte-identical to an earlier ref
+
+- 0da0a56: `core` (as v0.6.0), `id` (as v0.6.0), `config` (as v0.6.0), `pw` (as v0.6.0), `jwt` (as v0.6.0)
+
+Measured on INTEL(R) XEON(R) PLATINUM 8573C (4 CPUs), Linux 6.17.0-1022-azure, Zig 0.16.0, valgrind-3.22.0, 2 interleaved rounds, a range where they differed. A change in brackets is against the column to its left, and reads "inside the spread" when the two ranges overlap. How to read it: ADR 242.
+
 ## Backfill: v0.2.0 to `main`
 
 Run on 2026-10-01 at `d8ff14b` (`main` after v0.6.0), `python3 bench/release.py v0.2.0 v0.3.0 v0.4.0 v0.5.0 v0.6.0 HEAD`, inside an Ubuntu 24.04 container with valgrind on the host's Ryzen 7 9700X, seccomp off so io_uring was there as on a CI virtual machine. v0.1.0 is not here: it has no `bench/main.zig`. The two rounds agreed to 0.004 instructions a request on `http` and exactly everywhere else, and every idle-connection reading was the same to the byte. The whole run took 232 seconds with the six trees already built; a cold run of three refs took 106.

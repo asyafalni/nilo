@@ -12,7 +12,7 @@ nilo needs **Zig 0.16**. Nothing else: no C library, no system package.
 
 ```
 zig init
-zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.6.0#221e1b3eaed531efe13de7ab39dedc4091a8775c'
+zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.7.0#e1b859f8230a4cffd09d8e84411f7bcd7524258a'
 ```
 
 That writes nilo into your `build.zig.zon`, pinned to the commit the tag points at. **Keep the `#commit`.** The `?ref=` on its own is not a pin: nilo's tags are annotated, Zig 0.16's `zig fetch` does not resolve an annotated tag, and what it gives you for `?ref=v0.7.0` alone is whatever `main` was that day. Two people installing a week apart would get two different versions, and neither asked for one. The commit for each tag is on [its release page](https://github.com/nevindra/nilo/releases).
