@@ -27,6 +27,12 @@ fn getUser(db: *Db, id: u32) !User {
 
 `nilo.blocking` runs the call on the Engine's thread pool and parks the fiber until it returns; the arguments and the result stay on the calling fiber's stack, so nothing is allocated. `nilo.sleep` waits without occupying anything at all. Both fall back to running inline when there is no fiber, `blocking` calls the function directly and `sleep` really does sleep, so a handler using either is still an ordinary function a unit test calls with no server running. `sleep` fails the way `Mutex.lock` already does: `error.Canceled` if the request went away while waiting, mapped to a 503. Long computation is covered by the same tool: `nilo.blocking` around a CPU-bound call moves it off the executor thread just as well as it moves a syscall. The blocking pool is finite, so `blocking` converts "the thread stalls" into "the pool is the queue" rather than into unlimited concurrency, the correct trade for a database, which has a connection limit of its own.
 
+### How the pool grows
+
+**A call that finds no idle worker starts one, up to the pool's ceiling.** `serve` passes zio's pool `scale_threshold = 0` (`blocking_pool` in `http/engine/zio.zig`); the ceiling is zio's default of twice the logical CPUs, and a worker idle for 60 s exits, as before. Past the ceiling a call queues, so the pool is still the queue, just one that fills its workers before it lines anybody up. `blockingReserved` keeps its own rule, a thread past the ceiling if it has to, for a caller holding a connection or a lock ([ADR 064](./064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)).
+
+zio's default threshold of 2 starts a worker only once twice as many calls wait as run, which suits many short calls and strands a short one behind a long one: with one call running for seconds, a second is `1 < 2` and waits for it however many workers the ceiling allows. The photon port met it as a 2 ms write waiting up to 1.9 s behind a compaction pass. Measured on a cold pool, a 2 ms call behind a 500 ms one took 501 ms every time at the default and 2.1 ms at 0; a burst of 512 callers fills the pool to its ceiling either way and reads the same; 16 callers in a steady loop take 16 workers instead of 7, for 6% more CPU, 2.2 MB more RSS and a wall time 38% shorter ([`bench/result/http.md`](../../bench/result/http.md#a-short-blocking-call-behind-a-long-one-and-what-starting-a-worker-for-it-costs)).
+
 ### What is watched: one unparked stretch
 
 `http/watchdog.zig` measures **the longest stretch a fiber ran without parking**, not a sum over the request. A stretch ends wherever the request waits on something that is not the handler's own code, and every one of those says so through a `waiting`/`waited` pair:
@@ -83,6 +89,10 @@ The brackets stay. With no executor they are the only signal, and they give exac
 ## What was rejected
 
 **Wrap handlers automatically**, running every one on the blocking pool. Makes the slow path safe by making the fast path slow: every request would pay a thread hand-off, including the overwhelming majority that only touch memory, and throws away the reason for choosing a fiber Engine.
+
+**zio's default growth rule** (`scale_threshold = 2`), which `serve` ran until the photon port. It saves workers on a steady load of short calls, and the price is a short call waiting out a long one whenever no worker happens to be idle, which no caller can see coming or bound. The measurement under "How the pool grows" is what moved it.
+
+**`min_threads` instead of a growth rule.** Workers kept alive for the life of the process, and still a short call queued once that many are busy.
 
 **Detect blocking calls at compile time.** Zig has no effect system and no way to mark a function as blocking; there is nothing to detect with. The question that has an answer is not whether the compiler can prove a function blocks, but whether the server can notice that one just did.
 

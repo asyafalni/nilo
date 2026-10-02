@@ -2410,6 +2410,51 @@ test "a handler returning ?T answers 404 when there is none, and never sends nul
     try testing.expect(missing.keep_alive);
 }
 
+const Gathered = struct { parts: []const []const u8 };
+
+/// Four threads allocate from the request arena at once, each making two
+/// thousand small allocations and building its part out of the last fifty,
+/// and the handler returns a value that borrows all of it. The arena is
+/// reset after the response is written, so the parts are still there when
+/// it is serialised.
+fn gatheredOnThreads(arena: std.mem.Allocator) !Gathered {
+    const Part = struct {
+        fn build(a: std.mem.Allocator, n: usize, out: *[]const u8) void {
+            for (0..2000) |_| {
+                const scrap = a.alloc(u8, 24) catch return;
+                @memset(scrap, @intCast(n));
+            }
+            var text: []const u8 = "";
+            for (0..50) |i| text = std.fmt.allocPrint(a, "{s}t{d}-{d},", .{ text, n, i }) catch return;
+            out.* = text;
+        }
+    };
+    const parts = try arena.alloc([]const u8, 4);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, n| {
+        parts[n] = "";
+        t.* = try std.Thread.spawn(.{}, Part.build, .{ arena, n, &parts[n] });
+    }
+    for (threads) |t| t.join();
+    return .{ .parts = parts };
+}
+
+test "threads a handler starts may allocate from the request arena at once, and its return may borrow it" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/gathered", gatheredOnThreads);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const answer = h.send(&app, "GET /gathered HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 200 OK\r\n"));
+    for (0..4) |n| {
+        var last: [16]u8 = undefined;
+        const tail = try std.fmt.bufPrint(&last, "t{d}-49,", .{n});
+        try testing.expect(std.mem.indexOf(u8, answer.response, tail) != null);
+    }
+}
+
 /// The failure's `error` string, parsed out of a response body that has to
 /// be JSON whatever the request held.
 fn failureText(response: []const u8, into: []u8) ![]const u8 {

@@ -1317,6 +1317,14 @@ pub fn threadCount(options: anytype) u8 {
 /// refusal in words cost 2.9 KB of every binary (ADR 230).
 const max_threads = @bitSizeOf(usize);
 
+/// The blocking pool `blocking` hands calls to. zio starts a worker for a
+/// queued call only once twice as many calls wait as run, which suits many
+/// short calls and strands a short one behind a long one: with one worker
+/// busy for seconds, a 2 ms call waited for it to finish although the pool
+/// could start dozens more. At 0 a call that finds no idle worker starts
+/// one, up to the pool's ceiling, and idle workers are reaped as before.
+const blocking_pool: zio.ev.ThreadPool.Options = .{ .scale_threshold = 0 };
+
 // ---- how many threads a container means ----
 //
 // A container's CPU limit (`docker --cpus`, a Kubernetes CPU limit, systemd
@@ -1486,7 +1494,7 @@ pub fn serve(
     // request at 500 req/s against 70 without it, 44 against 34 at 8,000,
     // and +3% at saturation, four pairs of four;
     // [ADR 199](../../docs/adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(threads) });
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(threads), .thread_pool = blocking_pool });
     defer rt.deinit();
 
     // **Registered second, so it runs second to last** — after the group
@@ -3091,8 +3099,9 @@ test "a fiber spawned local runs on the thread that spawned it" {
     try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
 }
 
-// zio's pool starts no second worker until twice as many jobs wait as run,
-// so behind one held worker a plain `blocking` call queues. The holder
+// zio's pool left at its defaults, which this test keeps, starts no second
+// worker until twice as many jobs wait as run, so behind one held worker a
+// plain `blocking` call queues; `blocking_pool` is what `serve` runs instead. The holder
 // gives up after two seconds: a call that queued fails this test by
 // setting `gave_up` rather than hanging it.
 test "a reserved blocking call gets a thread while the pool's only worker is held" {
@@ -3130,6 +3139,59 @@ test "a reserved blocking call gets a thread while the pool's only worker is hel
                 try sleep(1);
             }
             blockingReserved(release, .{f});
+        }
+    };
+
+    var flags: Flags = .{};
+    var held = try rt.spawn(H.holder, .{&flags});
+    var called = try rt.spawn(H.caller, .{&flags});
+    try called.join();
+    held.join();
+    try testing.expect(flags.released.load(.acquire));
+    try testing.expect(!flags.gave_up.load(.acquire));
+}
+
+// The same shape with a plain `blocking` call: a short call made while one
+// long one holds the pool's only worker. A pool that starts no worker for
+// it leaves it queued until the long one ends, which is what a WAL write
+// behind a compaction pass met in a port of a log server (2 ms of work
+// queued for up to 1.9 s). The holder gives up after two seconds, so a
+// queued call fails this test rather than hanging it.
+test "a short blocking call gets a thread while a long one holds the pool's only worker" {
+    const rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(1), .thread_pool = blocking_pool });
+    defer rt.deinit();
+
+    const Flags = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        gave_up: std.atomic.Value(bool) = .init(false),
+    };
+
+    const H = struct {
+        fn hold(f: *Flags) void {
+            f.started.store(true, .release);
+            const until = monotonicNanos() + 2 * std.time.ns_per_s;
+            while (!f.released.load(.acquire)) {
+                if (monotonicNanos() > until) return f.gave_up.store(true, .release);
+                std.Thread.yield() catch {};
+            }
+        }
+
+        fn release(f: *Flags) void {
+            f.released.store(true, .release);
+        }
+
+        fn holder(f: *Flags) void {
+            blocking(hold, .{f});
+        }
+
+        fn caller(f: *Flags) !void {
+            var waited: u32 = 0;
+            while (!f.started.load(.acquire)) : (waited += 1) {
+                if (waited == 2000) return error.HolderNeverStarted;
+                try sleep(1);
+            }
+            blocking(release, .{f});
         }
     };
 

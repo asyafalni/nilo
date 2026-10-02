@@ -105,9 +105,12 @@ rather than with an opinion.
 ## A statement under `.hop` gets a thread of its own
 
 Every statement under `.hop` goes through `nilo.blockingReserved`, not
-`nilo.blocking`. zio's pool starts with no workers and adds one only once
-twice as many jobs wait as run, so a plain `blocking` call can queue behind
-one already running. For most callers that is a slower request. For a SQLite
+`nilo.blocking`. zio's pool starts with no workers and, at its default,
+adds one only once twice as many jobs wait as run, so a plain `blocking`
+call could queue behind one already running; the server now starts one for
+any call that finds none idle, but only up to the pool's ceiling
+([ADR 013](./013-handlers-must-not-block-the-thread.md#how-the-pool-grows)),
+and past it a plain call still queues. For most callers that is a slower request. For a SQLite
 statement it is a held connection: one slow read on the only busy worker,
 and the next statement queued behind it holding the writer, so every write
 after that timed out on the writer. Reproduced at one slow read of 25 s with

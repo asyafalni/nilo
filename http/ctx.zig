@@ -298,6 +298,15 @@ pub const Ctx = struct {
     /// allocate for the request without reaching into a field: `nilo_sql`
     /// fills its rows out of here, and rows a handler returns then live
     /// exactly as long as the response that carries them.
+    ///
+    /// Several threads may allocate from it at once: it is a
+    /// `std.heap.ArenaAllocator` over the App's allocator, which is
+    /// thread-safe whenever its child is, and the App's allocator already
+    /// serves every executor thread. So a handler can hand it to a pool
+    /// of its own inside `nilo.blocking` and return a typed value that
+    /// borrows from it, since the reset comes after the response is
+    /// written. Every such thread has to be joined before the handler
+    /// returns.
     pub fn arena(self: *const Ctx) std.mem.Allocator {
         return self._arena;
     }

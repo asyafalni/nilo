@@ -3419,3 +3419,19 @@ The difference is inside the noise: the machine was shared with other builds, an
   being argued with.
 - **The allocations-per-request invariant**, the second row of ADR 017's
   budget, which is held by a test rather than by this document.
+
+## A short blocking call behind a long one, and what starting a worker for it costs
+
+Asked by the photon port, whose WAL writer's `pwritev` and `fdatasync` (2 ms of work) waited 515 to 1,928 ms through `nilo.blocking` while one compaction pass held the pool's only worker. zio starts a worker for a queued call only when none is idle and `queued >= running * scale_threshold`, with a threshold of 2: one call running and one waiting is `1 < 2`, so nothing starts. The run decides whether `serve` should pass `scale_threshold = 0`, which starts a worker for any call that finds none idle, up to the same ceiling.
+
+**The instrument** is a scratch program against the pinned zio (`0299e57`), ReleaseFast, four executors, on the Ryzen 7 9700X (16 logical CPUs, so the pool's ceiling is 32), at nilo `62e280e`. One binary takes the threshold as an argument, so both sides are the same build and the runs are interleaved, five pairs for the first row and three for the others. Three shapes, each a fresh runtime with a cold pool: one fiber holds a 500 ms call and a second makes a 2 ms call once the first has started; 512 fibers make 20 calls of 100 µs each; 16 fibers make 2,000 calls of 10 µs each. The peak is `running_threads` sampled inside every call, and CPU and RSS are the process's own `getrusage`.
+
+| shape | threshold 2 (zio's default) | threshold 0 |
+|---|---:|---:|
+| the 2 ms call, behind the 500 ms one | 501.1 ms, all five | **2.1 ms**, all five |
+| 512 fibers × 20 calls of 100 µs: wall, CPU, peak threads, max RSS | 64.8–65.3 ms, 1,012–1,026 ms, 32, 14.7 MB | 64.8–65.1 ms, 1,019–1,025 ms, 32, 14.6–14.7 MB |
+| 16 fibers × 2,000 calls of 10 µs: wall, CPU, peak threads, max RSS | 48.7–49.0 ms, 367–371 ms, 7, 6.2 MB | **30.2–31.0 ms**, 391–392 ms, 16–17, 8.4–8.7 MB |
+
+**The stall is the rule, not chance.** The short call waits exactly as long as the long one runs, every time, and starts at once with the threshold at 0. **A burst is unchanged**: 512 callers fill the pool to its ceiling either way, because the default rule also starts workers once the queue is twice what runs. **Steady concurrent calls are where it costs**: as many workers as callers instead of seven, 6% more CPU and 2.2 MB more RSS, for a wall time 38% shorter. Every one of those workers exits after zio's idle timeout of 60 s, as before.
+
+The decision: `serve` runs the pool at `scale_threshold = 0` ([ADR 013](../../docs/adr/013-handlers-must-not-block-the-thread.md#how-the-pool-grows)). **Can it be pushed further?** Not by this knob: the ceiling is what bounds the threads now, and a caller that must never queue even at the ceiling is what `blockingReserved` is for.

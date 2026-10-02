@@ -203,7 +203,23 @@ Pure computation does not need it: parsing, JSON, a hash, a loop over a slice. T
 - **A per-call thread cap read from configuration**, passed into the function as an argument, so one request can use at most that many. It bounds one call, not a burst of them: the total is the pool's ceiling times the cap, and the cap should be chosen with that product in mind.
 - **Several `nilo.blocking` calls instead of one with threads inside.** The handler splits the work and issues each part as its own call, which the pool's limit holds the way it holds any other. The parts of one request run one after another, which is slower for that request and is the price of the pool's limit meaning something.
 
+**The threads may allocate their results from `c.arena()`.** It is a `std.heap.ArenaAllocator` over the App's allocator, which is thread-safe when its child is, so a handler can pass it to the function it hands `nilo.blocking`, join its threads there, and return a typed value that borrows from it: the arena is reset after the response is written, not when the handler returns. An arena of the function's own, freed by a `defer` in the handler, is gone before the return value is serialised.
+
 Do not reach for `nilo.blockingReserved` to fan out. It starts a thread whenever it finds none idle, past the pool's ceiling, which is the unbounded growth this section is about ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)). For a call that is expensive rather than slow, a [`nilo.Gate`](../reference/app.md#concurrency) sized to what the machine can afford is the tool, and it is what password hashing does.
+
+**On glibc, cap malloc's arenas when calls spawn threads and allocate with `std.heap.c_allocator`.** glibc gives each new thread an arena of its own, up to eight per core, and keeps what is freed in it, so memory allocated on one thread and freed on another fragments across them. The photon port saw RSS climb from 204 MiB past 500 MiB under repeated identical queries while its own accounting returned to zero; with two arenas the same load settled at 35 to 50 MiB between requests, and the peak under 16 clients fell from 708 to 403 MiB, with no change in latency. One call at the top of `main` does it, and `MALLOC_ARENA_MAX` in the environment still overrides it:
+
+```zig
+extern "c" fn mallopt(param: c_int, value: c_int) c_int;
+const M_ARENA_MAX = -8;
+
+pub fn main() !void {
+    _ = mallopt(M_ARENA_MAX, 2);
+    // ...
+}
+```
+
+A program that allocates with Zig's own allocators (`std.heap.smp_allocator`, a `DebugAllocator`), or links musl, has no such arenas and nothing to cap.
 
 ### A failure that carries data
 

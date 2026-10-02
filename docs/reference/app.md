@@ -189,8 +189,8 @@ A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never comp
 | | |
 |---|---|
 | `nilo.Mutex` | `.init`, then `try lock()`, `unlock()`, `tryLock()`, `lockUncancelable()` |
-| `nilo.blocking(f, args)` | runs a blocking call off the event loop |
-| `nilo.blockingReserved(f, args)` | the same, on a thread of its own instead of queued behind calls already on the pool, for a caller holding a connection or a lock. Every call that finds no idle worker starts one, so its callers must already be bounded ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)) |
+| `nilo.blocking(f, args)` | runs a blocking call off the event loop. A call that finds no idle worker starts one, up to the pool's ceiling (twice the logical CPUs), and past it waits its turn ([ADR 013](../adr/013-handlers-must-not-block-the-thread.md#how-the-pool-grows)) |
+| `nilo.blockingReserved(f, args)` | the same, on a thread of its own even past the pool's ceiling, where a plain call would wait for a worker, for a caller holding a connection or a lock. Every call that finds no idle worker starts one, so its callers must already be bounded ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)) |
 | `nilo.Gate` | `.open(n)`, then `try enter()` or `try enterWithin(ms)`, and `leave()`: a lock that lets `n` callers through and serves the rest in arrival order. `enterWithin` gives up with `error.TimedOut`, holding nothing ([ADR 222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md)) |
 | `nilo.sleep(ms)` | waits without blocking the thread |
 | `nilo.spawn(f, args)` | runs something that is not a request, now. `error.NoServer` if nothing is listening |
