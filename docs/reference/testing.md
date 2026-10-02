@@ -66,6 +66,25 @@ const answer = try wired.post("/partners", body);
 
 **Your routes and services stay yours.** `app` is a field, not something behind methods, so nothing here is a second API and no database is assumed. `Client` is unchanged, and is still what to use when a test needs two clients against one App: two addresses, two cookie jars.
 
+### `testing.Live`
+
+**A real server on an ephemeral port, for what only a running server does.**
+
+```zig
+const live = try nilo.testing.Live.start(testing.allocator, &app, .{ .threads = 1 });
+defer live.stop() catch {};
+// connect to 127.0.0.1:live.port
+```
+
+| | |
+|---|---|
+| `Live.start(gpa, app, options)` | starts `app.tryListen` as an `io.concurrent` task of a `std.Io.Threaded` the value owns, returns a `*Live` once `app.boundPort()` answers; `options` is a `nilo.Options`, whose `port` (forced to 0) and `stop_on_signal` (forced off) are overridden |
+| `live.port` | the port the kernel chose, on 127.0.0.1 |
+| `live.clientIo()` | the `std.Io` of the pool the listener runs on, for a client the test writes; not the server's loop |
+| `live.stop()` | shuts the server down the way a deployed one is, waits for the listener, and frees the value; `error.ServerDidNotStop` after ten seconds, when the value is left alive |
+
+**Every wait is bounded.** `start` gives the port three seconds and returns the error `tryListen` failed with when it fails sooner (`error.ServerNeverCameUp` otherwise). The App must be registered before `start` and outlive the value ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)). It is test-only: nothing outside `nilo.testing` names it.
+
 ### `testing.Conversation`
 
 **A WebSocket route has no answer to read, so it has its own test driver** ([ADR 091](../adr/091-a-websocket-route-can-be-driven-from-a-test.md)):

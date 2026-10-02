@@ -10941,3 +10941,118 @@ test "a tagged union that says .misfit = 422 answers a variant it does not know 
     try expect422(postJson(&h, &app, "/signal", "{\"kind\":\"metrics\"}"), "the request body is missing \"name\"");
     try expect400(postJson(&h, &app, "/signal", "{kind}"), "the request body is not valid JSON");
 }
+
+fn sayListener(c: *Ctx) anyerror!void {
+    try c.sendText(200, if (c.listener() == 0) "first" else if (c.listener() == 1) "second" else "other");
+}
+
+/// The ADR 252 example in the guide: a route that belongs to the second
+/// listener refuses a request that came in on any other.
+fn onlySecondListener(c: *Ctx, next: mw.Next) anyerror!void {
+    if (c.listener() != 1) return c.sendText(404, "no such route");
+    try next.run(c);
+}
+
+var listener_middleware_ran: u32 = 0;
+
+fn countRun(c: *Ctx, next: mw.Next) anyerror!void {
+    listener_middleware_ran += 1;
+    try next.run(c);
+}
+
+test "a request knows which listener it arrived on" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/which", sayListener);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, "GET /which HTTP/1.1\r\nHost: t\r\n\r\n").response, "first"));
+    h.peer.listener = 1;
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, "GET /which HTTP/1.1\r\nHost: t\r\n\r\n").response, "second"));
+    h.peer.listener = 2;
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, "GET /which HTTP/1.1\r\nHost: t\r\n\r\n").response, "other"));
+}
+
+test "a middleware can refuse a route on the wrong listener" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.useOn("/ingest", onlySecondListener);
+    try app.get("/ingest/logs", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    h.peer.listener = 1;
+    try expectOk(h.send(&app, "GET /ingest/logs HTTP/1.1\r\nHost: t\r\n\r\n").response);
+    h.peer.listener = 0;
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, "GET /ingest/logs HTTP/1.1\r\nHost: t\r\n\r\n").response, "HTTP/1.1 404 "));
+}
+
+test "a route bound to one listener is a 404 on the other and the unbound routes answer on both" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/both", plainOk);
+    try app.onListener(&.{1}).post("/v1/logs", plainOk);
+    try app.group("/api").onListener(&.{0}).get("/users", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const both = "GET /both HTTP/1.1\r\nHost: t\r\n\r\n";
+    const ingest = "POST /v1/logs HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n";
+    const users = "GET /api/users HTTP/1.1\r\nHost: t\r\n\r\n";
+
+    h.peer.listener = 0;
+    try expectOk(h.send(&app, both).response);
+    try expectOk(h.send(&app, users).response);
+    // Not a 405 either: the path is spelled out by a route that is not
+    // this listener's, which is a path that is not here.
+    const refused = h.send(&app, ingest).response;
+    try testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 404 "));
+    try testing.expect(std.mem.indexOf(u8, refused, "Allow:") == null);
+
+    h.peer.listener = 1;
+    try expectOk(h.send(&app, both).response);
+    try expectOk(h.send(&app, ingest).response);
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, users).response, "HTTP/1.1 404 "));
+    // A listener past the ones the routes were bound to answers the unbound.
+    h.peer.listener = 7;
+    try expectOk(h.send(&app, both).response);
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, ingest).response, "HTTP/1.1 404 "));
+}
+
+test "a route bound to a listener never reaches its handler from another one" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.useOn("/secret", countRun);
+    try app.onListener(&.{1}).get("/secret/x", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    h.peer.listener = 0;
+    // A 404 runs the scoped middleware like any 404 does (ADR 008), so what
+    // is shown is the handler: it is never reached.
+    const refused = h.send(&app, "GET /secret/x HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 404 "));
+    try testing.expect(!std.mem.endsWith(u8, refused, "handler"));
+    h.peer.listener = 1;
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, "GET /secret/x HTTP/1.1\r\nHost: t\r\n\r\n").response, "handler"));
+}
+
+test "a group bound twice is bound to the listeners both name" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.onListener(&.{ 1, 2 }).onListener(&.{ 2, 3 }).get("/narrow", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    for ([_]u8{ 0, 1, 2, 3 }) |l| {
+        h.peer.listener = l;
+        const response = h.send(&app, "GET /narrow HTTP/1.1\r\nHost: t\r\n\r\n").response;
+        if (l == 2) try expectOk(response) else try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 404 "));
+    }
+}

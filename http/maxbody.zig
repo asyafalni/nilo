@@ -57,11 +57,16 @@ const mw = @import("middleware.zig");
 /// One name for both, because what the argument is already says when it is
 /// read: a number is the route's limit, a pointer is where the route's limit
 /// lives. `nilo.maxBody(50 << 20)` keeps meaning what it always has.
-pub fn with(comptime limit: anytype) mw.Middleware {
+///
+/// What comes back is an `mw.Limited`: the middleware plus the limit it
+/// gives, which `use` and `with` take wherever they take a middleware. A gRPC
+/// call collects its message before any middleware runs, and the limit it is
+/// collected under is read from that registration (ADR 156, ADR 220).
+pub fn with(comptime limit: anytype) mw.Limited {
     const Limit = @TypeOf(limit);
     switch (@typeInfo(Limit)) {
-        .comptime_int, .int => return fixed(limit),
-        .pointer => |p| if (p.size == .one and p.child == usize) return reading(limit),
+        .comptime_int, .int => return .{ .run = fixed(limit), .limit = .{ .bytes = limit } },
+        .pointer => |p| if (p.size == .one and p.child == usize) return .{ .run = reading(limit), .limit = .{ .held = limit } },
         else => {},
     }
     @compileError("nilo: maxBody takes a number of bytes or the address of a usize that holds one, and was handed " ++

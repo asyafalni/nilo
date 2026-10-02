@@ -123,6 +123,11 @@ pub const App = struct {
     /// too: the shape it exists for is the one endpoint inside a group that
     /// needs a guard its neighbours do not.
     attached: std.ArrayList(mw.Attached) = .empty,
+    /// The limits `maxBody` gave, one per function it made, from `use` and
+    /// `with`. A gRPC call is collected before its middleware runs, so the
+    /// limit it is collected under is found here, by the functions in the
+    /// route's chain (ADR 156, ADR 220). Empty unless `maxBody` is used.
+    body_limits: std.ArrayList(mw.Limited) = .empty,
     /// The middleware `guard` said reads the session cookie, if one did
     /// (ADR 153). Read by `writeOpenApi` and by nothing on the request path.
     declared_guard: ?mw.Guard = null,
@@ -329,6 +334,7 @@ pub const App = struct {
         self.scoped.deinit(self.gpa);
         self.exemptions.deinit(self.gpa);
         self.attached.deinit(self.gpa);
+        self.body_limits.deinit(self.gpa);
         self.gpa.free(self.trusted_proxies);
         self.requirements.deinit(self.gpa);
         self.services.deinit();
@@ -371,8 +377,17 @@ pub const App = struct {
     /// Order against route registration does not matter — chains are
     /// resolved in `listen()`. Order among `use`/`useOn` calls is the run
     /// order (ADR 008).
-    pub fn use(self: *App, middleware: mw.Middleware) !void {
-        try self.scoped.append(self.gpa, .{ .prefix = "", .middleware = middleware });
+    pub fn use(self: *App, middleware: anytype) !void {
+        try self.noteLimit(middleware);
+        try self.scoped.append(self.gpa, .{ .prefix = "", .middleware = mw.runOf(middleware) });
+    }
+
+    /// Keep what `maxBody` says, if `middleware` is one, for the gRPC side to
+    /// find (ADR 220). A function is one limit, so one entry is enough.
+    fn noteLimit(self: *App, middleware: anytype) !void {
+        if (@TypeOf(middleware) != mw.Limited) return;
+        for (self.body_limits.items) |l| if (l.run == middleware.run) return;
+        try self.body_limits.append(self.gpa, middleware);
     }
 
     /// Add a middleware that runs only on routes under `prefix`.
@@ -380,9 +395,10 @@ pub const App = struct {
     /// ```zig
     /// try app.useOn("/api", requireToken);
     /// ```
-    pub fn useOn(self: *App, prefix: []const u8, middleware: mw.Middleware) !void {
+    pub fn useOn(self: *App, prefix: []const u8, middleware: anytype) !void {
         std.debug.assert(prefix.len > 0 and prefix[0] == '/');
-        try self.scoped.append(self.gpa, .{ .prefix = prefix, .middleware = middleware });
+        try self.noteLimit(middleware);
+        try self.scoped.append(self.gpa, .{ .prefix = prefix, .middleware = mw.runOf(middleware) });
     }
 
     /// The App, with `middleware` off for the routes registered through what
@@ -405,7 +421,7 @@ pub const App = struct {
     /// **The default stays deny**, so a route added later is guarded by
     /// accident rather than exposed by accident — and the exception is written
     /// where the route is, so renaming the route moves it (ADR 008).
-    pub fn without(self: *App, comptime middleware: mw.Middleware) GroupOf("", &.{middleware}) {
+    pub fn without(self: *App, comptime middleware: anytype) GroupOf("", &.{mw.runOf(middleware)}) {
         return .{ .app = self };
     }
 
@@ -427,7 +443,27 @@ pub const App = struct {
     /// **It runs innermost**, after everything a `use` put in front of the same
     /// route, whatever order the two were written in — a group's session check
     /// has to run before the route's own check of what that session may do.
-    pub fn with(self: *App, comptime middleware: mw.Middleware) GroupWith("", &.{}, &.{middleware}, null) {
+    pub fn with(self: *App, comptime middleware: anytype) GroupWith("", &.{}, &.{mw.runOf(middleware)}, mw.limitsOf(middleware), null, router.every_listener) {
+        return .{ .app = self };
+    }
+
+    /// The App, answering the routes registered through what this hands back
+    /// only on the listeners numbered in `which`: `0` is the one `.address`
+    /// and `.port` name, `1` the first `.also` entry, and so on. A request
+    /// that arrived on another listener finds no such route and gets the
+    /// 404 an unknown path gets, decided before any middleware runs
+    /// ([ADR 252](../docs/adr/252-a-request-knows-which-listener-it-came-in-on.md)).
+    ///
+    /// ```zig
+    /// const ingest = app.onListener(&.{1});
+    /// try ingest.post("/v1/logs", receiveLogs);
+    /// try app.onListener(&.{0}).group("/api").get("/status", status);
+    /// ```
+    ///
+    /// A route that is not bound is answered on every listener, as before.
+    /// **A path is one route** whichever listener it is bound to: the same
+    /// method and shape registered twice is still `DuplicateRoute`.
+    pub fn onListener(self: *App, comptime which: []const u8) GroupWith("", &.{}, &.{}, &.{}, null, router.listenerBits(which)) {
         return .{ .app = self };
     }
 
@@ -483,7 +519,7 @@ pub const App = struct {
     /// Two routes with the same name stop the process at registration, for the
     /// reason a duplicate route does: the document would carry the same key
     /// twice and whichever consumer read it would see one of them.
-    pub fn named(self: *App, comptime name: []const u8) GroupWith("", &.{}, &.{}, name) {
+    pub fn named(self: *App, comptime name: []const u8) GroupWith("", &.{}, &.{}, &.{}, name, router.every_listener) {
         return .{ .app = self };
     }
 
@@ -1678,6 +1714,10 @@ pub const App = struct {
                 const app: *App = @ptrCast(@alignCast(ptr));
                 return app.router.match(.POST, path) != null;
             }
+            fn bodyLimit(ptr: *anyopaque, path: []const u8) usize {
+                const app: *App = @ptrCast(@alignCast(ptr));
+                return app.grpcBodyLimit(path);
+            }
             fn handle(
                 ptr: *anyopaque,
                 arena: std.mem.Allocator,
@@ -1697,9 +1737,66 @@ pub const App = struct {
             .gpa = self.gpa,
             .stop = &self.stop,
             .max_body = self.limits.max_body,
+            .ceiling = self.grpcBodyCeiling(),
+            .body_limit = Adapter.bodyLimit,
             .routes = Adapter.routes,
             .handle = Adapter.handle,
         };
+    }
+
+    /// What a gRPC call to `path` may be collected under: the limit of the
+    /// last `maxBody` in the chain of the route it reaches, which is the one
+    /// that would have the last word on HTTP/1, and `listen()`'s `max_body`
+    /// where there is none. Read before the message arrives, so what the
+    /// route says is what the connection collects (ADR 156, ADR 220).
+    /// Allocates nothing, and does nothing at all for an App that never
+    /// called `maxBody`.
+    fn grpcBodyLimit(self: *App, path: []const u8) usize {
+        const base = self.limits.max_body;
+        if (self.body_limits.items.len == 0) return base;
+        var found: router.Match = undefined;
+        if (!self.router.matchInto(.POST, path, &found)) return base;
+        const found_route = &self.router.routes.items[found.index];
+        if (!found_route.chain_by_path) return self.chainBodyLimit(found.chain, base);
+        // A chain that depends on the path: built from the real one, as the
+        // request path does, and given back. Only such a route pays for it.
+        const chain = mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, found_route.method, found_route.pattern, path) catch return base;
+        defer if (chain.len > 0) self.gpa.free(chain);
+        return self.chainBodyLimit(chain, base);
+    }
+
+    /// The limit `chain` ends up giving: the last non-zero one, `base` if
+    /// no function in it is a `maxBody`.
+    fn chainBodyLimit(self: *const App, chain: []const mw.Middleware, base: usize) usize {
+        var limit = base;
+        for (chain) |m| {
+            for (self.body_limits.items) |l| {
+                if (l.run != m) continue;
+                const n = l.read();
+                if (n != 0) limit = n;
+                break;
+            }
+        }
+        return limit;
+    }
+
+    /// The most any gRPC route may be collected under: what bounds one
+    /// connection's messages together, because `max_body` no longer does once
+    /// a route raises its own (ADR 220). A route whose chain depends on the
+    /// path counts every limit `maxBody` was given. Only POST routes, which
+    /// is what a call is.
+    fn grpcBodyCeiling(self: *App) usize {
+        var most = self.limits.max_body;
+        if (self.body_limits.items.len == 0) return most;
+        for (self.router.routes.items) |r| {
+            if (r.method != .POST) continue;
+            if (r.chain_by_path) {
+                for (self.body_limits.items) |l| most = @max(most, l.read());
+            } else {
+                most = @max(most, self.chainBodyLimit(r.chain, self.limits.max_body));
+            }
+        }
+        return most;
     }
 
     pub fn handleRequest(
@@ -1798,7 +1895,7 @@ pub fn Group(comptime prefix: []const u8) type {
 /// is what puts something in it, and what comes back is a different type, so
 /// which routes carry an exception is decided while compiling.
 pub fn GroupOf(comptime prefix: []const u8, comptime excluded: []const mw.Middleware) type {
-    return GroupWith(prefix, excluded, &.{}, null);
+    return GroupWith(prefix, excluded, &.{}, &.{}, null, router.every_listener);
 }
 
 /// The same, plus the middlewares the routes registered through it carry of
@@ -1814,7 +1911,9 @@ pub fn GroupWith(
     comptime prefix: []const u8,
     comptime excluded: []const mw.Middleware,
     comptime attached: []const mw.Middleware,
+    comptime bounds: []const mw.Limited,
     comptime route_name: ?[]const u8,
+    comptime only: u32,
 ) type {
     comptime checkPrefix(prefix);
     comptime if (route_name) |name| checkName(name);
@@ -1834,18 +1933,20 @@ pub fn GroupWith(
 
         /// A group inside this one. `app.group("/api").group("/v1")` and
         /// `app.group("/api/v1")` are the same thing.
-        pub fn group(self: Self, comptime sub: []const u8) GroupWith(prefix ++ sub, excluded, attached, route_name) {
+        pub fn group(self: Self, comptime sub: []const u8) GroupWith(prefix ++ sub, excluded, attached, bounds, route_name, only) {
             return .{ .app = self.app };
         }
 
         /// This group with `middleware` off for the routes registered through
         /// what comes back — see `App.without`, which is the same call at the
         /// top level.
-        pub fn without(self: Self, comptime middleware: mw.Middleware) GroupWith(
+        pub fn without(self: Self, comptime middleware: anytype) GroupWith(
             prefix,
-            excluded ++ &[_]mw.Middleware{middleware},
+            excluded ++ &[_]mw.Middleware{mw.runOf(middleware)},
             attached,
+            bounds,
             route_name,
+            only,
         ) {
             return .{ .app = self.app };
         }
@@ -1853,11 +1954,13 @@ pub fn GroupWith(
         /// This group with `middleware` **on** for the routes registered
         /// through what comes back — see `App.with`, which is the same call at
         /// the top level.
-        pub fn with(self: Self, comptime middleware: mw.Middleware) GroupWith(
+        pub fn with(self: Self, comptime middleware: anytype) GroupWith(
             prefix,
             excluded,
-            attached ++ &[_]mw.Middleware{middleware},
+            attached ++ &[_]mw.Middleware{mw.runOf(middleware)},
+            bounds ++ mw.limitsOf(middleware),
             route_name,
+            only,
         ) {
             return .{ .app = self.app };
         }
@@ -1865,7 +1968,17 @@ pub fn GroupWith(
         /// This group, with the next route registered through what comes back
         /// carrying `name` as its `operationId` — see `App.named`, which is
         /// the same call at the top level (ADR 119).
-        pub fn named(self: Self, comptime name: []const u8) GroupWith(prefix, excluded, attached, name) {
+        pub fn named(self: Self, comptime name: []const u8) GroupWith(prefix, excluded, attached, bounds, name, only) {
+            return .{ .app = self.app };
+        }
+
+        /// This group, answered only on the listeners numbered in `which`: a
+        /// request that arrived on another listener finds no route here and
+        /// gets the 404 an unknown path gets, before any middleware runs.
+        /// See `App.onListener`, which is the same call at the top level
+        /// (ADR 252). Narrowing only: a group already bound to `{1}` and
+        /// asked for `{1, 2}` is still bound to `{1}`.
+        pub fn onListener(self: Self, comptime which: []const u8) GroupWith(prefix, excluded, attached, bounds, route_name, only & router.listenerBits(which)) {
             return .{ .app = self.app };
         }
 
@@ -1914,10 +2027,17 @@ pub fn GroupWith(
         ) !void {
             try self.app.exemptions.ensureUnusedCapacity(self.app.gpa, excluded.len);
             try self.app.attached.ensureUnusedCapacity(self.app.gpa, attached.len);
+            inline for (bounds) |limited| try self.app.noteLimit(limited);
             if (stops) {
                 try self.app.routeNamed(route_name, method, comptime joined(prefix, pattern), handler);
             } else {
                 try self.app.tryRouteNamed(route_name, method, comptime joined(prefix, pattern), handler);
+            }
+            if (only != router.every_listener) {
+                // The route just added is the last one: `routeNamed` returned
+                // without error, so the router holds it at the end of its list.
+                const routes_added = self.app.router.routes.items;
+                routes_added[routes_added.len - 1].listeners = only;
             }
             self.excepting(pattern, method);
             self.attaching(pattern, method);
@@ -1925,13 +2045,13 @@ pub fn GroupWith(
 
         /// Middleware on everything in this group — `app.useOn(prefix, …)`,
         /// without repeating the prefix.
-        pub fn use(self: Self, middleware: mw.Middleware) !void {
+        pub fn use(self: Self, middleware: anytype) !void {
             if (prefix.len == 0) return self.app.use(middleware);
             return self.app.useOn(prefix, middleware);
         }
 
         /// Middleware on part of this group, `sub` being relative to it.
-        pub fn useOn(self: Self, comptime sub: []const u8, middleware: mw.Middleware) !void {
+        pub fn useOn(self: Self, comptime sub: []const u8, middleware: anytype) !void {
             const full = comptime joined(prefix, sub);
             if (full.len == 0) return self.app.use(middleware);
             return self.app.useOn(full, middleware);

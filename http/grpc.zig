@@ -39,9 +39,11 @@
 //! reset, CVE-2023-44487) gains a client nothing; one that keeps opening past
 //! the cap is sent away. A header block is bounded however many CONTINUATION
 //! frames it arrives in, and so is the header list it decodes to. A message
-//! is bounded by `max_body`, compressed or not, and the messages a
+//! is bounded by its route's limit (`max_body`, or the route's own
+//! `maxBody`, ADR 156), compressed or not, and the messages a
 //! connection holds, arriving or held by a call until its answer is
-//! written, by one `max_body` between them, past which a call waits on a
+//! written, by one ceiling between them (`max_body`, or the largest limit a route
+//! raised to), past which a call waits on a
 //! window the client is held to (`Conn.budget`); a gzip message's inflated
 //! copy is charged to it before it is allocated, and a call whose copy does
 //! not fit in what the other calls leave waits, holding only its compressed
@@ -68,6 +70,14 @@ pub const Host = struct {
     gpa: std.mem.Allocator,
     stop: *const bulkhead.Stop,
     max_body: usize,
+    /// The most a route may raise its own limit to, and `max_body` where none
+    /// does: what one connection's messages are bounded by together
+    /// (`Conn.budget`, ADR 220).
+    ceiling: usize,
+    /// What a call to this path is collected under: the route's `maxBody`
+    /// where it has one, `max_body` where it has not. Read once the headers
+    /// are in, before a byte of the message (ADR 156, ADR 220).
+    body_limit: *const fn (ptr: *anyopaque, path: []const u8) usize,
     /// Whether a `POST` to this path reaches a route.
     routes: *const fn (ptr: *anyopaque, path: []const u8) bool,
     /// `App.handleRequest`, with no waker and no read limits: a call's fiber
@@ -244,6 +254,9 @@ const Stream = struct {
     /// The message as it arrives, length prefix and all.
     body: std.ArrayList(u8) = .empty,
     body_over_limit: bool = false,
+    /// What this call's message may be, from its route once the headers are
+    /// in: `max_body`, or the route's own `maxBody` (ADR 156, ADR 220).
+    limit: usize,
     /// When the call's first HEADERS frame arrived: what `grpc-timeout` is
     /// counted from, because the client's clock started when it sent the
     /// call and not when its message was whole (gRPC over HTTP/2, "Requests").
@@ -299,6 +312,7 @@ const Stream = struct {
             .id = id,
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .limit = app.max_body,
             .send_window = send_window,
             .app = app,
             .peer = peer,
@@ -317,7 +331,7 @@ const Stream = struct {
     fn recycle(s: *Stream) void {
         _ = s.arena.reset(.{ .retain_with_limit = spare_arena_keep });
         const kept = .{ s.gpa, s.arena, s.app, s.peer, s.shared };
-        s.* = .{ .id = 0, .gpa = kept[0], .arena = kept[1], .send_window = 0, .app = kept[2], .peer = kept[3], .shared = kept[4] };
+        s.* = .{ .id = 0, .gpa = kept[0], .arena = kept[1], .limit = kept[2].max_body, .send_window = 0, .app = kept[2], .peer = kept[3], .shared = kept[4] };
     }
 
     fn field(s: *const Stream, name: []const u8) ?[]const u8 {
@@ -618,10 +632,10 @@ const Conn = struct {
     }
 
     /// The bound on sending one call, from `now`.
-    fn collectUntil(c: *const Conn, now: u64) u64 {
+    fn collectUntil(c: *const Conn, now: u64, bound: usize) u64 {
         const rate = c.deadlines.body_min_rate;
         if (rate == 0) return 0;
-        const most: u64 = @as(u64, c.app.max_body) + 5;
+        const most: u64 = @as(u64, bound) + 5;
         const ms = @as(u64, c.deadlines.body_grace_ms) + most * std.time.ms_per_s / rate;
         return now +| ms * std.time.ns_per_ms;
     }
@@ -808,7 +822,7 @@ const Conn = struct {
 
         const s = c.newStream(head.stream) catch return error.Internal;
         s.headers_ns = bulkhead.monotonicNanos();
-        s.collect_until_ns = c.collectUntil(s.headers_ns);
+        s.collect_until_ns = c.collectUntil(s.headers_ns, c.app.max_body);
         c.streams.append(c.gpa, s) catch {
             s.destroy();
             return error.Internal;
@@ -866,6 +880,14 @@ const Conn = struct {
             h2.writeRstStream(c.out, id, .refused_stream) catch return error.Gone;
             return;
         }
+        // The route is known from the headers, and so is what it takes: the
+        // message is collected under that, and the time the client has to
+        // send it is sized from it (ADR 156, ADR 220). Nothing is looked up
+        // for a call with no path, which `dispatch` refuses.
+        if (s.field(":path")) |path| {
+            s.limit = c.app.body_limit(c.app.ptr, path);
+            if (s.limit != c.app.max_body) s.collect_until_ns = c.collectUntil(s.headers_ns, s.limit);
+        }
         s.state = .body;
         if (end_stream) try c.dispatch(s);
     }
@@ -902,8 +924,8 @@ const Conn = struct {
         if (len == 0 and !head.has(h2.Flags.end_stream)) try c.control();
         s.recv_window -= head.len;
         if (s.recv_window < 0) return error.FlowControl;
-        if (s.body_over_limit or s.body.items.len + len > c.app.max_body + 5) {
-            // Past `max_body`: read and dropped, so the connection stays in
+        if (s.body_over_limit or s.body.items.len + len > s.limit + 5) {
+            // Past the call's limit: read and dropped, so the connection stays in
             // step, and answered when the client says it is done.
             s.body_over_limit = true;
             try c.discard(len);
@@ -937,7 +959,7 @@ const Conn = struct {
     /// rather than this side reading, and all a call can hold beyond the
     /// budget is the window it was opened with.
     fn budget(c: *const Conn) usize {
-        return @max(c.app.max_body + 5, h2.default_window);
+        return @max(c.app.ceiling + 5, h2.default_window);
     }
 
     /// What the connection's budget has left for `s`: the budget less what
@@ -1190,7 +1212,7 @@ const Conn = struct {
         c.unstarve(s);
         const a = s.arena.allocator();
         if (s.headers_over_limit) return c.answerNow(s, 8, "the call's metadata is larger than this server reads");
-        if (s.body_over_limit) return c.answerNow(s, 8, "the message is larger than this server's max_body");
+        if (s.body_over_limit) return c.answerNow(s, 8, "the message is larger than its route's body limit");
 
         const method = s.field(":method") orelse return c.malformed(s);
         const path = s.field(":path") orelse return c.malformed(s);
@@ -1254,8 +1276,8 @@ const Conn = struct {
             // alone on its connection always has all of it.
             const announced = encoded.announcedSize(message) catch
                 return c.answerNow(s, 13, "the message's gzip could not be read");
-            if (announced > c.app.max_body)
-                return c.answerNow(s, 8, "the message is larger than this server's max_body");
+            if (announced > s.limit)
+                return c.answerNow(s, 8, "the message is larger than its route's body limit");
             // No room: the call waits with only its compressed bytes, and
             // starts when the calls ahead of it give room back. It used to be
             // refused UNAVAILABLE, which a Collector retries only after its
@@ -1281,7 +1303,7 @@ const Conn = struct {
         if (announced) |size| {
             c.hold(s, size);
             message = encoded.inflate(a, message, size) catch |err| switch (err) {
-                error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than this server's max_body"),
+                error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than its route's body limit"),
                 else => return c.answerNow(s, 13, "the message's gzip could not be read"),
             };
         }
@@ -3203,4 +3225,133 @@ test "a gzip message that inflates to max_body is read when nothing else is held
     const body = try got.message(1);
     try testing.expectEqual(@as(usize, 100_000), body.len);
     for (body) |b| try testing.expectEqual(@as(u8, 'z'), b);
+}
+
+const maxbody = @import("maxbody.zig");
+
+test "a route's maxBody above max_body takes a message between the two, and its neighbours stay under max_body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 16;
+    try app.with(maxbody.with(64)).post("/test.Echo/Say", echoRoute);
+    try app.post("/test.Echo/Other", echoRoute);
+    try app.resolveChains();
+    var client = try TestClient.init();
+    defer client.deinit();
+    const forty = "forty bytes, which is over sixteen....";
+    try client.call(1, "/test.Echo/Say", forty);
+    try client.call(3, "/test.Echo/Other", forty);
+    try client.call(5, "/test.Echo/Say", "x" ** 80);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqualStrings(forty, try got.message(1));
+    // The neighbour has no maxBody: unchanged.
+    try testing.expectEqualStrings("8", Answer.value(try got.trailers(3), "grpc-status").?);
+    // And the raised limit is a limit: eighty is over sixty-four.
+    try testing.expectEqualStrings("8", Answer.value(try got.trailers(5), "grpc-status").?);
+    try testing.expectEqual(@as(usize, 0), Answer.of(.data, &got, 5).len);
+}
+
+test "a route's maxBody below max_body refuses a message past it before the route runs" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 200;
+    try app.with(maxbody.with(8)).post("/test.Echo/Say", echoRoute);
+    try app.resolveChains();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.call(1, "/test.Echo/Say", "eight by");
+    try client.call(3, "/test.Echo/Say", "twelve bytes");
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqualStrings("8", Answer.value(try got.trailers(3), "grpc-status").?);
+    try testing.expectEqual(@as(usize, 0), Answer.of(.data, &got, 3).len);
+}
+
+var held_limit: usize = 0;
+
+test "a maxBody that reads its limit from a usize is read on the gRPC side too, and zero leaves max_body in force" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 16;
+    try app.with(maxbody.with(&held_limit)).post("/test.Echo/Say", echoRoute);
+    try app.resolveChains();
+    const forty = "forty bytes, which is over sixteen....";
+
+    // Zero: the server's own number, as on HTTP/1.
+    held_limit = 0;
+    {
+        var client = try TestClient.init();
+        defer client.deinit();
+        try client.call(1, "/test.Echo/Say", forty);
+        var got = try converse(&app, &client);
+        defer got.deinit();
+        try testing.expectEqualStrings("8", Answer.value(try got.trailers(1), "grpc-status").?);
+    }
+    // Set before listen(): the route takes it.
+    held_limit = 64;
+    {
+        var client = try TestClient.init();
+        defer client.deinit();
+        try client.call(1, "/test.Echo/Say", forty);
+        var got = try converse(&app, &client);
+        defer got.deinit();
+        try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+        try testing.expectEqualStrings(forty, try got.message(1));
+    }
+}
+
+test "a gzip message is held to its route's limit, announced size and all" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 1_000;
+    try app.use(maxbody.with(50_000));
+    try app.with(maxbody.with(500)).post("/test.Echo/Small", echoRoute);
+    try app.post("/test.Echo/Say", echoRoute);
+    try app.resolveChains();
+    var client = try TestClient.init();
+    defer client.deinit();
+
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzipRun(&zipped, 'z', 20_000);
+    const gzip: hpack.Field = .{ .name = "grpc-encoding", .value = "gzip" };
+    // Inflates to 20,000: past max_body of 1,000, under the use()'s 50,000,
+    // and past the narrower route's 500.
+    try client.headersFor(1, "/test.Echo/Say", &.{gzip}, false);
+    try client.message(1, zipped.written(), true);
+    try client.headersFor(3, "/test.Echo/Small", &.{gzip}, false);
+    try client.message(3, zipped.written(), true);
+    try h2.writeWindowUpdate(client.w(), 0, 100_000);
+    try h2.writeWindowUpdate(client.w(), 1, 100_000);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqual(@as(usize, 20_000), (try got.message(1)).len);
+    try testing.expectEqualStrings("8", Answer.value(try got.trailers(3), "grpc-status").?);
+}
+
+test "one connection's budget grows to the largest limit a route raised to, and no further" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 1_000;
+    try app.post("/test.Echo/Say", echoRoute);
+    try app.resolveChains();
+    try testing.expectEqual(@as(usize, 1_000), app.grpcHost().ceiling);
+
+    // A lower limit moves nothing, and a raise on a route a call cannot
+    // reach is not a call's.
+    try app.with(maxbody.with(10)).post("/test.Echo/Low", echoRoute);
+    try app.with(maxbody.with(900_000)).put("/export", echoRoute);
+    try app.resolveChains();
+    try testing.expectEqual(@as(usize, 1_000), app.grpcHost().ceiling);
+
+    try app.with(maxbody.with(3_000_000)).post("/test.Echo/High", echoRoute);
+    try app.resolveChains();
+    try testing.expectEqual(@as(usize, 3_000_000), app.grpcHost().ceiling);
 }

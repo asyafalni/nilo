@@ -64,7 +64,7 @@ A call's metadata arrives as request headers, so `c.header("x-tenant")` reads it
 
 So `return fail.notFound("no order {d}", .{id})` becomes `NOT_FOUND` with that message, and the handler does not need to know gRPC is involved. For a code with no HTTP status of its own, such as `ALREADY_EXISTS`, set a `grpc-status` header on a 200: `try c.setHeader("grpc-status", "6")`.
 
-A path no route answers is `UNIMPLEMENTED`, and a message larger than `max_body` is `RESOURCE_EXHAUSTED`. A request whose `content-type` is not `application/grpc` or `application/grpc+` and a subtype (`application/grpc-web` is another protocol) is a 415, and one that is not well-formed HTTP/2 (a pseudo-header twice, unknown or after a regular field, or no `:scheme`) has its stream reset with `PROTOCOL_ERROR`.
+A path no route answers is `UNIMPLEMENTED`, and a message larger than its route's limit is `RESOURCE_EXHAUSTED`: `max_body`, or what the route said with [`nilo.maxBody`](../reference/middleware.md#nilomaxbody), raised or lowered, as on any route. A connection's messages together are held to `max_body`, or the largest limit a route raised to. A request whose `content-type` is not `application/grpc` or `application/grpc+` and a subtype (`application/grpc-web` is another protocol) is a 415, and one that is not well-formed HTTP/2 (a pseudo-header twice, unknown or after a regular field, or no `:scheme`) has its stream reset with `PROTOCOL_ERROR`.
 
 ## Deadlines
 

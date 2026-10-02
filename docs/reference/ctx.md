@@ -21,6 +21,7 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.queryString()` | `Str`: the query as it arrived, still encoded, no `?` on the front. `""` when there was none |
 | `c.host()` | `Str`: the host this request was addressed to. `X-Forwarded-Host` from a trusted proxy, else the authority of an absolute-form target, else the `Host` header |
 | `c.scheme()` | `Str`: `"https"` or `"http"`, what the **client** used. `"https"` on a listener with its own TLS, else `X-Forwarded-Proto` from a trusted proxy, else `"http"` |
+| `c.listener()` | `u8`: which listener the request arrived on. `0` for the one `address` and `port` name, `1` for `also[0]`, and so on, in the order `listen()` was given them. Read off the connection, so no header can claim it; `0` in a test unless `.listener` is set ([ADR 252](../adr/252-a-request-knows-which-listener-it-came-in-on.md)) |
 | `c.header(name)` | `?Str`, name matched case-insensitively. The **first** of that name |
 | `c.clientHas(version)` | `bool`: whether `If-None-Match` names the tag a `nilo.Versioned(T)` with that `u64` goes out under. Asked before building the body, so `.unchanged(version)` skips the query as well as the bytes ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
 | `c.authorization(.bearer)` | `!Authorization(.bearer)`: the header as one scheme, or the 401 with the challenge on it. For a resolver; a handler asks in its argument list |

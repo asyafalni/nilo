@@ -1053,6 +1053,45 @@ test "a server answers on a second address, and both addresses reach the same ro
     try testing.expect(!stillThere(gpa, where.path));
 }
 
+test "a route bound to a listener answers on that listener only, over a real port and a real socket file" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var where = try SocketDir.init(gpa, "bound.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/who", whoIsAsking);
+    try app.onListener(&.{0}).get("/public", whoIsAsking);
+    try app.onListener(&.{1}).get("/ingest", whoIsAsking);
+
+    var serving: ServingOnBoth = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, ServingOnBoth.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForFirstPort(gpa, &serving);
+
+    const get = "GET {s} HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n";
+    var buf: [96]u8 = undefined;
+    const Case = struct { path: []const u8, first: []const u8, second: []const u8 };
+    for ([_]Case{
+        .{ .path = "/who", .first = "HTTP/1.1 200 ", .second = "HTTP/1.1 200 " },
+        .{ .path = "/public", .first = "HTTP/1.1 200 ", .second = "HTTP/1.1 404 " },
+        .{ .path = "/ingest", .first = "HTTP/1.1 404 ", .second = "HTTP/1.1 200 " },
+    }) |case| {
+        const request = try std.fmt.bufPrint(&buf, get, .{case.path});
+        const over_port = try ask(gpa, port, request);
+        defer over_port.deinit(gpa);
+        try testing.expect(std.mem.startsWith(u8, over_port.head, case.first));
+        const over_path = try askOverPath(gpa, where.path, request);
+        defer over_path.deinit(gpa);
+        try testing.expect(std.mem.startsWith(u8, over_path.head, case.second));
+    }
+}
+
 /// Set by `bigAnswer` once its write has come back, however it came back.
 var big_answer_returned: std.atomic.Value(bool) = .init(false);
 
@@ -1289,4 +1328,135 @@ test "a fiber woken by another request in the same turn is charged for its own s
     answer.deinit(gpa);
     waiter.join();
     try testing.expectEqual(@as(u64, 1), watchdog.caught.load(.monotonic) - before);
+}
+
+/// The write-ahead log's shape (ADR 244), with an idle deadline: a route puts
+/// an item on a queue and waits on the item's event, and one fiber
+/// `app.spawn` started drains the queue, answers each item and, when nothing
+/// is queued, waits on an event with a timeout so it wakes with no request in
+/// flight. The fields are atomics because the fiber and the test run on
+/// different threads.
+const IdleWriter = struct {
+    const Item = struct {
+        done: std.Io.Event = .unset,
+        written: bool = false,
+    };
+
+    slots: [16]*Item = undefined,
+    queue: std.Io.Queue(*Item) = undefined,
+    /// Set by every putter after `put`, reset by the writer before it drains.
+    wake: std.Io.Event = .unset,
+    idle_ms: u32 = 30,
+
+    /// Items answered, and how often the idle deadline passed with nothing
+    /// queued and no request arriving.
+    answered: std.atomic.Value(u32) = .init(0),
+    idle_wakes: std.atomic.Value(u32) = .init(0),
+    /// `userdata` of the `std.Io` each side was given, as an address.
+    writer_loop: std.atomic.Value(usize) = .init(0),
+    route_loop: std.atomic.Value(usize) = .init(0),
+    /// Counts the cancellation of the shutdown reaching the writer.
+    canceled: std.atomic.Value(u32) = .init(0),
+
+    fn init(self: *IdleWriter) void {
+        self.queue = .init(&self.slots);
+    }
+
+    fn run(self: *IdleWriter) void {
+        const io = nilo.io();
+        self.writer_loop.store(@intFromPtr(io.userdata), .release);
+        var batch: [8]*Item = undefined;
+        while (true) {
+            // Reset first, then drain: a put that lands after the drain sets
+            // the event again, so the wait below returns at once.
+            self.wake.reset();
+            const n = self.queue.get(io, &batch, 0) catch break;
+            if (n == 0) {
+                self.wake.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromMilliseconds(self.idle_ms),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => _ = self.idle_wakes.fetchAdd(1, .monotonic),
+                    error.Canceled => {
+                        _ = self.canceled.fetchAdd(1, .release);
+                        break;
+                    },
+                };
+                continue;
+            }
+            for (batch[0..n]) |item| {
+                item.written = true;
+                // Counted before the answer, so a test that has the answer
+                // has the count.
+                _ = self.answered.fetchAdd(1, .release);
+                item.done.set(io);
+            }
+        }
+        self.queue.close(io);
+        while (true) {
+            const n = self.queue.getUncancelable(io, &batch, 1) catch return;
+            for (batch[0..n]) |item| item.done.set(io);
+        }
+    }
+
+    fn append(io: std.Io, self: *IdleWriter) ![]const u8 {
+        self.route_loop.store(@intFromPtr(io.userdata), .release);
+        var item: Item = .{};
+        try self.queue.putOne(io, &item);
+        self.wake.set(io);
+        item.done.waitUncancelable(io);
+        return if (item.written) "written" else "refused";
+    }
+};
+
+/// Wait for `counter` to reach `want`, or give up. Bounded for the reason
+/// `waitForATick` is (`CLAUDE.md`).
+fn waitForCount(counter: *const std.atomic.Value(u32), want: u32) !void {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    for (0..500) |_| {
+        if (counter.load(.acquire) >= want) return;
+        try std.Io.sleep(threaded.io(), .fromMilliseconds(10), .awake);
+    }
+    return error.NeverReached;
+}
+
+test "a fiber app.spawn started takes the server's loop, answers a route, and wakes on its idle deadline with no request" {
+    hush();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    var writer: IdleWriter = .{};
+    writer.init();
+    try app.provide(&writer);
+    try app.post("/append", IdleWriter.append);
+    try app.spawn(IdleWriter.run, .{&writer});
+
+    const live = try nilo.testing.Live.start(gpa, &app, .{ .threads = 1 });
+    var stopped = false;
+    defer if (!stopped) live.stop() catch {};
+
+    const answer = try ask(gpa, live.port, "POST /append HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    defer answer.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("written", answer.body);
+    try testing.expectEqual(@as(u32, 1), writer.answered.load(.acquire));
+
+    // The writer and the route hold the one loop the connections run on, and
+    // it is not the Io the test's own client runs on.
+    const loop = writer.writer_loop.load(.acquire);
+    try testing.expect(loop != 0);
+    try testing.expectEqual(loop, writer.route_loop.load(.acquire));
+    try testing.expect(loop != @intFromPtr(live.clientIo().userdata));
+
+    // No further request: the writer is idle, and its deadline passes twice.
+    const before = writer.idle_wakes.load(.monotonic);
+    try waitForCount(&writer.idle_wakes, before + 2);
+    try testing.expectEqual(@as(u32, 1), writer.answered.load(.acquire));
+
+    stopped = true;
+    try live.stop();
+    try waitForCount(&writer.canceled, 1);
 }

@@ -172,6 +172,72 @@ Four things make this safe.
 
 **A long wait is not reported as a blocked thread.** The detector ([ADR 013](../adr/013-handlers-must-not-block-the-thread.md)) is not told about an `Io` wait, but it sees that the server's loop turned over while the handler waited, and a handler that parked has not held its thread. What it does report is the handler running for `block_warning_ms` (250 ms) without waiting, counted from when the wait ended. A writer that can stall still needs a deadline on its own write, because a queued handler cannot stop waiting.
 
+**A writer that must also wake while it is idle needs a deadline, and `queue.get` has none.** A log that hands its tail on when the active segment grows old has to run at that age with nobody appending, and `get(io, &batch, 1)` waits for an item for as long as it takes. `std.Io.Queue` has no get with a timeout. The queue plus a `std.Io.Event` has one: every putter sets the event after `put`, and the writer resets it, drains without waiting (`min` of 0), and only when the drain found nothing waits on the event with a timeout:
+
+<!-- compiles -->
+```zig
+const std = @import("std");
+const nilo = @import("nilo_http");
+
+const IdleAppend = struct {
+    done: std.Io.Event = .unset,
+    written: bool = false,
+};
+
+const IdleWal = struct {
+    slots: [256]*IdleAppend = undefined,
+    queue: std.Io.Queue(*IdleAppend) = undefined,
+    /// Set by every putter after `put`; reset by the writer before it drains.
+    wake: std.Io.Event = .unset,
+
+    fn init(self: *IdleWal) void {
+        self.queue = .init(&self.slots);
+    }
+
+    /// What a handler calls instead of `queue.putOne`.
+    fn put(self: *IdleWal, io: std.Io, item: *IdleAppend) !void {
+        try self.queue.putOne(io, item);
+        self.wake.set(io);
+    }
+
+    fn write(self: *IdleWal) void {
+        const io = nilo.io();
+        var batch: [64]*IdleAppend = undefined;
+        while (true) {
+            // Reset, then drain. A put that lands after the drain sets the
+            // event again, so the wait below returns at once: no wake-up is
+            // lost, which resetting after the drain would not promise.
+            self.wake.reset();
+            const n = self.queue.get(io, &batch, 0) catch break;
+            if (n == 0) {
+                self.wake.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromMilliseconds(500),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    // Idle for the whole deadline: hand the tail on here.
+                    error.Timeout => {},
+                    error.Canceled => break,
+                };
+                continue;
+            }
+            // …write batch[0..n] and sync once…
+            for (batch[0..n]) |item| {
+                item.written = true;
+                item.done.set(io);
+            }
+        }
+        // Cancelled: close, then answer what is still queued, as above.
+        self.queue.close(io);
+        while (true) {
+            const n = self.queue.getUncancelable(io, &batch, 1) catch return;
+            for (batch[0..n]) |item| item.done.set(io);
+        }
+    }
+};
+```
+
+`waitTimeout` may also return `error.Timeout` on a spurious wake-up, so the timeout branch is "check the deadline", never "the deadline has passed". The cost is one `Event` word per log and one `set` per append, which is a store when nobody waits. A test of it needs the real loop, and [`testing.Live`](./testing.md#a-real-server-in-a-test) has one.
+
 **To test it in memory, start the writer yourself.** `nilo.testing.Wired` has no server and cannot run `app.spawn`, but `io: std.Io` and `c.io()` answer a process-wide `std.Io.Threaded` there, and `wired.io()` hands a test the same one:
 
 ```zig

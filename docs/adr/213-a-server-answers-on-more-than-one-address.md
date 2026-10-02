@@ -68,11 +68,14 @@ them. `max_connections` in particular counts sockets across every listener
 rather than per port, because what it protects is one descriptor table
 (ADR 194).
 
-**The handler is never told which listener a request arrived on.** A
-listener decides how bytes are carried and nothing above it. `Ctx` gained no
-field, the router gained no dimension, and a route is not scoped to a port.
-A program that wants two different surfaces writes two route prefixes, which
-it could already do.
+**A listener decides how bytes are carried, and a request is told only its
+number.** `c.listener()` answers `0` for the listener `address` and `port`
+name and `n` for `also[n - 1]`, and a route can be bound to listeners at its
+registration, which makes it a 404 on the others
+([ADR 252](./252-a-request-knows-which-listener-it-came-in-on.md)). Nothing
+else about a listener reaches a handler. The first version of this ADR said
+the handler was never told, and a program with an ingest port and a public
+port was the case it was waiting for.
 
 `boundPort()` answers for the first listener, the one `address` and `port`
 name. A caller that asked the kernel to choose asked about that one; an
@@ -137,11 +140,13 @@ honest decomposition, and a breaking change to the most-written type in the
 API to buy tidiness for a field almost nobody sets. ADR 212's own reasoning
 applies: the default build, and the default call, are unchanged to the byte.
 
-**Letting a handler know which listener it came in on.** A `Ctx` field, or a
-route scoped to a port. It is the request every "admin port" design starts
-with, and it costs a field on the hot type for a use case nobody here has:
-a program that wants two surfaces has route prefixes already. Left out until
-somebody brings the case, in `docs/roadmap.md`.
+**Letting a handler know which listener it came in on, in the first version.**
+It is the request every "admin port" design starts with, and it was left out
+until somebody brought the case, on the reading that it costs a field on the
+hot type and that route prefixes cover two surfaces. A multi-listener port
+brought it (a bearer-token ingest route reachable on the public port), and
+the cost turned out to be one byte on `Peer` that the frame absorbed to the
+byte (ADR 252).
 
 **Letting the kernel report a repeated address.** Two entries naming one
 address is a typo in a config file, and `AddressInUse` from the kernel reads

@@ -51,10 +51,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** each corrected, and the module headers' code examples brought under `zig build snippets` so the next one cannot rot.
 
-**No test runs `nilo.io()` in a fiber `app.spawn` started on a live server (feedback from the photon port).** The guide's queue pattern ([ADR 244](./adr/244-a-handler-is-given-the-loop-it-runs-on.md)) has its writer call `nilo.io()`, and that is the one entry point with no test behind it where it matters: the tests reach `bulkhead.loopIo()` through `Wired.io()` and `c.io()`, which answer the process-wide `std.Io.Threaded` when no server runs. photon's WAL writer used it through the real server under load and acked every append, but that run is a spike's, not this suite's.
-
-**Needs:** a test in `http/live.zig` that starts a server whose `app.spawn` fiber takes `nilo.io()`, drains a `std.Io.Queue` a route fills and sets the event the route waits on, and checks that the Io is the server's loop (the same `userdata` `c.io()` answers inside the route), in both modes.
-
 ### `nilo_sql`
 
 The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
@@ -311,6 +307,10 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** a workload where it shows.
 
+**A limiting allocator shared across requests.** An allocator that counts live bytes and the peak with atomics and refuses with `OutOfMemory` past a limit, reserving with a compare-and-swap so a refused request never disturbs a neighbour's smaller one, would give a process-wide cap on bounded work such as decompressing a body or building a response, perhaps with a per-request child ("this request may use 64 MiB of the process's 512"). A port of a log search found it at about 100 lines with nothing specific to that program, and it lives there for now. Nothing in `core/` or `http/` is one today; the per-request arena is bounded by `max_body` and `arena_keep`, which is a different number.
+
+**Needs:** a second caller that wants an aggregate cap across concurrent requests, and the cost on the allocation axis stated first ([ADR 017](./adr/017-the-trade-budget-has-four-axes.md)): a feature that adds an allocation to a path that did not ask for it does not ship.
+
 ### `nilo_id`
 
 **A v7 is not sortable within a millisecond.** Two made in the same one come back in random order relative to each other. RFC 9562 allows a counter in `rand_a` and this has none, on the grounds that it buys ordering nobody asked for at the price of a threadlocal.
@@ -326,6 +326,10 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 **A prefix is per reading, not per Config.** `fromWith(T, .{ .prefix = … })` has to be written at each call, so two places reading one Config can disagree about it. Making the prefix part of the type would fix that and cost `Read(T)` its one-type-per-`T` property.
 
 **Needs:** a caller who has actually disagreed with themselves.
+
+**Settings that are not scalars: a list, and a group switched on by presence.** A field is text, a number, a `bool`, an enum or any of those in `?`, and the port of a service with real deployment rules found what that leaves out: a comma-separated list (`PROMOTED_ATTRIBUTES=a,b`); a group of settings that turns on when one variable is present (`DURABLE_ENDPOINT` set means `DURABLE_BUCKET` and `DURABLE_REGION` are now required, inheriting what the file set); and two spellings of `bool` in one program. The first two would be a list type and a "set by presence" section in `Read(T)`. The third is not proposed: `bool` is `true` or `false` and nothing else, and the module keeps its four `Reason`s ([the reference](./reference/config.md#failure)). The program reads its rules by hand today, about sixty lines tested case by case, and says what it gains from the module only for the scalars.
+
+**Needs:** a program that would use the module for its settings if it read a list and a presence group, with the rules it needs written out, so the shape is drawn from two programs and not from one.
 
 ### `nilo_cache`
 
@@ -395,10 +399,6 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** that deployment.
 
-**A handler cannot tell which listener a request arrived on.** `listen(.{ .also = … })` answers on as many addresses as it is given, and deliberately tells nothing above the listener which one carried the bytes ([ADR 213](./adr/213-a-server-answers-on-more-than-one-address.md)): a listener decides how bytes move and a route is a route on every address. The case that would change that is an admin surface on a port of its own, where the point is precisely that the public listener must not reach it, and route prefixes do not express "only from this socket". The shape is a field on `Ctx` or a route scoped to a listener, and both cost something on the hot type for a use case nobody has brought yet.
-
-**Needs:** a caller with an admin or metrics port that must not be reachable from the public one, and a reading of what it costs the park frame, which ADR 212 showed is one page away from noticing anything.
-
 **An extra listener that asked the kernel for a port cannot say which one it got.** `boundPort()` answers for `port`, the first listener, and an entry in `also` with `.port = 0` binds fine and reports nothing ([ADR 213](./adr/213-a-server-answers-on-more-than-one-address.md)). It costs the tests something already: they give a second listener a unix path rather than a port, because a path is knowable and a kernel-chosen port is not. The shape is `boundPorts()` returning the lot, or `boundPort(n)`.
 
 **Needs:** somebody who binds more than one listener to port 0 outside a test, or a test here that cannot be written with a path.
@@ -427,9 +427,17 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** a caller with a map or `Value` field in a body.
 
-**A gRPC connection's message budget is not an option.** The budget is `max_body` (at least 64 KiB), and a call is charged its compressed bytes, its inflated copy and the request text built from it, so a Collector sending 4 MB batches gets about two running at a time per connection at `max_body` 16 MiB and the rest wait ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-does-to-an-opentelemetry-collector)). Waiting replaced the refusal and made a small budget slow rather than lossy; a budget sized from the caller's batches is what would let more run at once.
+**A gRPC connection's message budget is not an option.** The budget is `max_body`, or the largest limit a route raised to with `nilo.maxBody` (at least 64 KiB), and a call is charged its compressed bytes, its inflated copy and the request text built from it, so a Collector sending 4 MB batches gets about two running at a time per connection at `max_body` 16 MiB and the rest wait ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-does-to-an-opentelemetry-collector)). Waiting replaced the refusal and made a small budget slow rather than lossy; a budget sized from the caller's batches is what would let more run at once.
 
 **Needs:** a caller whose throughput per connection is held back by how many calls run at once, rather than by its own work, with the batch size and consumer count that show it.
+
+**Request bodies sent as `Content-Encoding: zstd` are a 415.** Only `gzip` is decoded ([the guide](./guide/requests.md#reading-the-body-yourself)), and an OpenTelemetry exporter can send `zstd` as well. Decoding it needs a C library nilo does not carry, and the shape that is already on record is the `-Dlibdeflate` one ([ADR 248](./adr/248-gzip-is-libdeflate-when-a-build-asks-for-it.md)): a build flag, the library compiled `ReleaseFast` from its release tarball so a build without the flag fetches and links none of it, the same `max_body` check against the announced size before a byte is decoded, and the binary cost written into ADR 017's running total. Whether the compiled library is also exported as a module applications can import (one list of libzstd's files to maintain instead of one in every consumer's `build.zig`) is part of that decision. This is the request side only; zstd for responses was measured and refused ([`decided.md`](./decided.md)).
+
+**Needs:** a decision to decode zstd request bodies, and a caller sending them that cannot be told to send gzip; then the flag's cost in stripped `ReleaseFast` bytes and the allocation the decoded body takes, measured the way ADR 248 measured libdeflate.
+
+**`nilo.blocking.forEach`: fan-out that counts against the pool's limit.** A blocking call that splits CPU-bound work across threads of its own escapes the pool's ceiling ([the guide](./guide/services.md#a-blocking-call-that-fans-out)). The shape that would keep it inside is `nilo.blocking.forEach(n, ctx, work)` running `work(i)` on pool workers under the same limit, so a burst of searches cannot take more than the pool allows. `nilo.blocking` is a function today and would have to become something that can carry a declaration, and a task that waits for its own children on the pool it runs on can deadlock it once every worker is a waiting parent, which is the part the design has to answer.
+
+**Needs:** a second caller that fans out inside a blocking call, and a measurement of how many threads a burst of such calls takes at the pool's ceiling against what the caller's own per-call cap leaves.
 
 ### Modules that do not exist yet
 

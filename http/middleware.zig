@@ -35,6 +35,49 @@ pub const CtxHandler = *const fn (*Ctx) anyerror!void;
 
 pub const Middleware = *const fn (*Ctx, Next) anyerror!void;
 
+/// A middleware that also says how much body the routes it covers take
+/// (`nilo.maxBody`, ADR 156). A function pointer cannot say it: a gRPC call
+/// collects its message before any middleware runs, so the collector has to
+/// learn the limit from the registration instead, and the registration is
+/// where `use` and `with` take this in place of a bare `Middleware`
+/// (ADR 156, ADR 220). Everywhere else it is the `run` inside it.
+pub const Limited = struct {
+    /// What a nilo compile error calls this type, which is the name the
+    /// reader's own import line gives it (ADR 074).
+    pub const nilo_type_name = "nilo.Limited";
+
+    run: Middleware,
+    limit: Limit,
+
+    /// Where the number is: in the program, or in a `usize` it fills before
+    /// `listen()`.
+    pub const Limit = union(enum) {
+        bytes: usize,
+        held: *const usize,
+    };
+
+    /// The limit now, 0 for none: a held limit left at zero leaves
+    /// `listen()`'s number in force, as it does on HTTP/1.
+    pub fn read(self: Limited) usize {
+        return switch (self.limit) {
+            .bytes => |n| n,
+            .held => |p| p.*,
+        };
+    }
+};
+
+/// The function a registration was handed, whether it was a bare
+/// `Middleware` or a `Limited`.
+pub fn runOf(middleware: anytype) Middleware {
+    return if (@TypeOf(middleware) == Limited) middleware.run else middleware;
+}
+
+/// The `Limited` inside a registration, as a slice of none or one, so a
+/// comptime `with` can keep it beside the chain.
+pub fn limitsOf(comptime middleware: anytype) []const Limited {
+    return if (@TypeOf(middleware) == Limited) &[_]Limited{middleware} else &[_]Limited{};
+}
+
 /// The rest of the onion. Two words, passed by value, allocating nothing.
 pub const Next = struct {
     /// What a nilo compile error calls this type, which is the name the

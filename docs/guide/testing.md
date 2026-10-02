@@ -191,6 +191,24 @@ try app.start(threaded.io());     // services checked, pools open, schema checke
 
 `app.start` is for a program that never listens, which a test is. In a program that does listen, the same work goes in `app.before` and `listen()` runs it on its own loop. `app.start` followed by `listen()` is refused ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
+### A real server in a test
+
+**`Wired` has no server, so it cannot run what only a server does.** `app.spawn` fibers, `nilo.io()` as the loop the connections run on, and an idle deadline firing with no request in flight all need `listen()`. [`testing.Live`](../reference/testing.md#testinglive) starts one on the real Engine, on a port the kernel chose, and a test drives it with any client:
+
+```zig
+var app = nilo.App.init(testing.allocator);
+defer app.deinit();
+try app.post("/append", append);
+try app.spawn(Wal.write, .{&wal});
+
+const live = try nilo.testing.Live.start(testing.allocator, &app, .{ .threads = 1 });
+defer live.stop() catch {};
+
+// connect to 127.0.0.1:live.port with std.http.Client, nilo.fetch or a socket
+```
+
+`start` returns once the port is bound, and `stop` is the shutdown a deployed server gets, so the fibers are cancelled before it returns. Every wait in both is bounded: a server that never binds is the error it failed with, not a hung suite. It costs a thread and a second of wall clock at most, so keep it for what only a running server can show and test the rest through `Wired`. The [background guide](./background.md#a-queue-a-handler-fills-and-a-fiber-empties) has the writer this was written for.
+
 ## Testing against a real database
 
 **A handler that takes `db: *Db` is tested against a real database**, because the SQL statement is what it would be tested for, and that is exactly what a fake leaves out. On SQLite this costs nothing to set up: the database lives in memory, one per test, and the App starts it the way `listen()` would. [`examples/sqlite/`](../../examples/sqlite/main.zig) tests itself this way:
@@ -260,6 +278,8 @@ The path goes into a buffer you hold, or into an allocator with `tmp.pathAlloc(g
 zig build test        # Debug, plus the refusals and every module's gate — the loop
 zig build test-all    # the same in ReleaseSafe as well — the gate, and what CI runs
 ```
+
+**Read the exit code, not the word "failed".** `zig build` prints `failed command: …` for every step that wrote to stderr, and a test that logs at `warn` writes to stderr, so a passing run can print several of them and still exit 0. The exit code and the `Build Summary` (which names a failed step as one) are what count. A test passes with a `warn` line in its output; only `std.log.err` fails it, because Zig's test runner treats an `err` line as a failure. That is why everything on nilo's request path logs at `warn` and keeps `err` for a server that is refusing to start, and why a test of your own that exercises a refusal on purpose may log one and still pass. `grep` for the summary rather than for the word if a CI step has to decide.
 
 What each costs is measured, not remembered: [`bench/result/build.md`](../../bench/result/build.md) has the numbers, and what to change when they move.
 

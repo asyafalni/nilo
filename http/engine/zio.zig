@@ -41,6 +41,11 @@ pub const Peer = struct {
     /// This connection's TLS is terminated here, by the listener's own
     /// certificate, so the client used `https` whatever any header says.
     tls: bool = false,
+    /// Which listener this connection arrived on: 0 for the one `address`
+    /// and `port` name, `n` for `also[n - 1]` (ADR 252). One byte on the
+    /// fiber's stack and set once at accept from the acceptor's own
+    /// listener, so it costs no allocation and no field on `Ctx`.
+    listener: u8 = 0,
 
     /// `ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255` — the longest an IP
     /// address gets in text.
@@ -332,6 +337,10 @@ const Accepting = struct {
     /// with `-Dgrpc`; every other build refuses the listener before this
     /// exists.
     grpc: bool = false,
+    /// This listener's place in the list `listen()` was given: 0 for the
+    /// first, then each `also` entry in order (ADR 252). Copied into each
+    /// connection's `Peer`, which is how a request learns it.
+    index: u8 = 0,
 
     fn fail(self: *Accepting, err: anyerror) void {
         self.all.fail(err);
@@ -1547,6 +1556,11 @@ pub fn serve(
         }
     };
 
+    // A listener's number travels in one byte of every connection (ADR 252).
+    if (options.also.len > std.math.maxInt(u8)) {
+        std.log.err("`also` names {d} listeners; a server answers on at most 256 addresses.", .{options.also.len + 1});
+        return error.TooManyListeners;
+    }
     const listeners = try gpa.alloc(Bound, 1 + options.also.len);
     defer gpa.free(listeners);
 
@@ -1900,6 +1914,7 @@ pub fn serve(
             var peer: Peer = .{
                 .port = portOf(stream.socket.address),
                 .local = !over_ip,
+                .listener = sh.index,
             };
             peer._len = writePeer(&peer._text, stream.socket.address);
 
@@ -1970,6 +1985,7 @@ pub fn serve(
                 .port = portOf(stream.socket.address),
                 .local = false,
                 .tls = true,
+                .listener = sh.index,
             };
             peer._len = writePeer(&peer._text, stream.socket.address);
 
@@ -2082,10 +2098,11 @@ pub fn serve(
     // The per-listener half, filled now that the array is final and the
     // server it belongs to exists. `secured` points into `Bound`, so this
     // is the line that fixes the array in place (ADR 213).
-    for (listeners) |*b| b.accepting = .{
+    for (listeners, 0..) |*b, i| b.accepting = .{
         .all = &shared,
         .secured = if (b.secured) |*sec| sec else null,
         .grpc = b.grpc,
+        .index = @intCast(i),
     };
 
     // One acceptor. There is one per executor ([ADR 200](../../docs/adr/200-every-executor-accepts.md)),

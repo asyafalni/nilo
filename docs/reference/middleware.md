@@ -196,6 +196,10 @@ try app.with(nilo.maxBody(1024)).post("/sign-in", signIn);
 
 `listen()`'s `max_body` is one number for every route, but an import and a sign-in need different limits. This is the same argument `nilo.deadline` makes about time, with the same answer: the route decides. It bounds every read into the request arena (`c.body()`, a JSON body, a `Form(T)`, a `Bound(…)` of either), and a `Content-Length` over the limit is a 413 before any byte is read. Lowering the limit works the same way as raising it.
 
+**It means the same on a gRPC route.** A call's message is collected under the route's `maxBody`, raised or lowered, rather than under `listen()`'s `max_body`, and one over it is `RESOURCE_EXHAUSTED` without the route running ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md), [ADR 220](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md)). The route is found from the call's `:path` before the message arrives, so the limit is the last `maxBody` in the route's chain. A connection's total budget for messages is `max_body`, or the largest limit a `POST` route raised to, so a raised route costs a connection what its own limit says and no more. The limit applies before the middleware in front of the route has run, so a client with no session can send a guarded route a message up to its limit.
+
+**`nilo.maxBody` returns an `mw.Limited`**, the middleware together with the limit it gives, so that `use`, `useOn`, `with` and `without` can keep the number for the gRPC side. It goes wherever a middleware goes; a program that stored it in a `nilo.Middleware` variable uses its `.run` field.
+
 **It does not affect `c.bodyStream()`**, which holds nothing in the arena and has its own `max_bytes` ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)). `maxBody(0)` is a compile error.
 
 **Handed the address of a `usize` instead of a number, it reads the limit from there on each request**, for a limit that comes from configuration: an ingest route whose cap is an environment setting. The variable is a container-level `var` that outlives the App, filled before `listen()`, as `cors.reading`'s `Origins` is:

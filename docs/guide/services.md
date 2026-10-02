@@ -194,6 +194,74 @@ Pure computation does not need it: parsing, JSON, a hash, a loop over a slice. T
 
 `nilo.sleep` takes milliseconds and fails with `error.Canceled` if the request went away while waiting, the same way `Mutex.lock` does.
 
+### A blocking call that fans out
+
+**The pool bounds the calls it runs, not the threads a call starts.** `nilo.blocking` takes one worker for as long as the function runs, and the Engine's pool has a ceiling on how many it runs at once. A function that then spawns threads of its own, to split a CPU-bound scan across cores, is outside that count: eight searches at four threads each are thirty-two busy threads while the pool shows eight in use. Nothing in nilo sees them, and the blocking warning does not either, since the handler is parked the whole time.
+
+**So the fan-out is the caller's to bound**, and there are two ways that keep a number on it:
+
+- **A per-call thread cap read from configuration**, passed into the function as an argument, so one request can use at most that many. It bounds one call, not a burst of them: the total is the pool's ceiling times the cap, and the cap should be chosen with that product in mind.
+- **Several `nilo.blocking` calls instead of one with threads inside.** The handler splits the work and issues each part as its own call, which the pool's limit holds the way it holds any other. The parts of one request run one after another, which is slower for that request and is the price of the pool's limit meaning something.
+
+Do not reach for `nilo.blockingReserved` to fan out. It starts a thread whenever it finds none idle, past the pool's ceiling, which is the unbounded growth this section is about ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)). For a call that is expensive rather than slow, a [`nilo.Gate`](../reference/app.md#concurrency) sized to what the machine can afford is the tool, and it is what password hashing does.
+
+### A failure that carries data
+
+**An error union does cross `nilo.blocking`, and an error carries only its name.** `nilo.blocking(f, args)` returns whatever `f` returns, error set included (`ReturnType(func)` in `http/bulkhead.zig`). `error.InvalidQuery` arrives intact, and so does nothing else: a message, a byte offset or a list of what was wrong has nowhere to ride on it.
+
+**Two cases, and nilo already answers the first.** When the data is a status and a sentence, call a `fail` function inside the blocking call: it works there, because the request travels to the worker with the call, and the handler gets `error.Failed` with the message as if it had failed on the fiber ([Errors](./errors.md#failing-a-request)). When the data is structured and the handler decides what to do with it, **return a value instead of an error**: a union of the result and the failure with its data, and map it to a nilo failure in the handler, on the fiber.
+
+<!-- compiles -->
+```zig
+const Found = union(enum) {
+    ok: u32,
+    invalid: struct { at: usize, why: []const u8 },
+};
+
+/// The kernel runs on a pool thread and reports a bad query as a value.
+fn kernel(text: []const u8) Found {
+    if (text.len == 0) return .{ .invalid = .{ .at = 0, .why = "the query is empty" } };
+    return .{ .ok = @intCast(text.len) };
+}
+
+fn search(q: Str) !u32 {
+    return switch (nilo.blocking(kernel, .{q.view()})) {
+        .ok => |count| count,
+        .invalid => |bad| nilo.fail.unprocessable("{s} (at byte {d})", .{ bad.why, bad.at }),
+    };
+}
+```
+
+That is the intended shape, not a workaround: the kernel stays a plain function with no request and no `nilo` in it, a test calls it directly and matches on the union, and the handler is the one place that knows what a failure means to a client. A kernel used by six handlers gets one `switch` in each and nothing more. Passing a diagnostic out-parameter (`diag: *Diag`) into the call works too, and is the same recipe with the data in a place the caller owns; what to avoid is an error the handler has to guess the details of.
+
+### State shared between fibers and blocking workers
+
+**`nilo.Mutex` is the lock for state that fibers and blocking workers both touch.** It is zio's mutex behind the watchdog wrapper in `http/bulkhead.zig`, and the engine documents that it also works from a plain thread with no fiber, which is what a `nilo.blocking` worker is. A fiber that waits on it parks and the thread keeps serving; a worker that waits on it holds only its own pool thread. It needs no `Io`, so it is the one lock that is the same in both places:
+
+<!-- compiles -->
+```zig
+const Manifest = struct {
+    lock: nilo.Mutex = .init,
+    files: u32 = 0,
+
+    /// Called from a handler, and from inside `nilo.blocking`.
+    fn add(self: *Manifest) !void {
+        try self.lock.lock();
+        defer self.lock.unlock();
+        self.files += 1;
+    }
+};
+```
+
+Two rules go with it:
+
+- **Hold it for the copy or the swap, not across the slow part.** A compactor that holds the manifest lock across an `fsync` makes every search that wants the manifest wait for the disk. Take it to read or replace the list, release it, then do the long work on the copy; a second lock for writers, taken across the `fsync`, keeps them in order without holding readers up.
+- **`lock()` fails with `error.Canceled` when the request went away**, so a cleanup path with no one to report to uses `lockUncancelable()` for a short section that does not itself wait.
+
+**A spin lock is for a module that has no loop at all.** `nilo_cache` spins because `std.Io.Mutex.lock` takes an `Io` that layer does not have, and it is safe there only because the lock is held across a `memcpy` and nothing else, ever. A program on nilo has `nilo.Mutex`, so it does not need to copy that.
+
+**A blocking worker is an ordinary thread, so a blocking file call is fine in it.** That is the point of handing it there. What the call needs is an `std.Io`, because Zig 0.16's file API (`std.Io.Dir`) takes one: a program that wants the worker's file work independent of the server's loop owns a `std.Io.Threaded` and passes its `io()`, which is what nilo's own static file loader does (`http/static.zig`, `load`). Plain libc calls (`open`, `pread`, `fsync`, `mkdir`) need none and are what a program that already links libc may use. `nilo.io()` can be read from a pool thread ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)), but nothing here has measured file calls through the server's `Io` from a worker, so this guide does not recommend it for them. nilo ships no file helpers for workers (`mkdirAll`, `listDir`, `writeFileAtomic`); a program that needs the same forty lines in two modules writes them once.
+
 ### The blocking warning
 
 **A handler that blocks its thread is reported in the log, on the first request.** Nothing *forces* you to wrap a call: Zig has no way to mark a function as blocking, so a handler that calls the driver directly still compiles and still passes its tests. But it does not go unnoticed. The server times each handler, minus the time it spent legitimately waiting, and says so:

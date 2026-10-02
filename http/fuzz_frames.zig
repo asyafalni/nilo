@@ -85,6 +85,10 @@ fn stub(gpa: std.mem.Allocator, stop: *const bulkhead.Stop) grpc.Host {
             return path.len > 1 and (path[1] == 'e' or path[1] == 'f' or path[1] == 'c');
         }
 
+        fn limit(_: *anyopaque, _: []const u8) usize {
+            return 1024;
+        }
+
         fn handle(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -112,6 +116,8 @@ fn stub(gpa: std.mem.Allocator, stop: *const bulkhead.Stop) grpc.Host {
         .gpa = gpa,
         .stop = stop,
         .max_body = 1024,
+        .ceiling = 1024,
+        .body_limit = Stub.limit,
         .routes = Stub.routes,
         .handle = Stub.handle,
     };

@@ -56,6 +56,12 @@ pub const Options = struct {
     /// different addresses before there is anything to test.
     client_address: []const u8 = "",
 
+    /// The listener these requests appear to arrive on: what `c.listener()`
+    /// answers, `0` for the first and `n` for `also[n - 1]` (ADR 252). A
+    /// test of a route bound to a listener sets it, or changes
+    /// `client.peer.listener` between calls.
+    listener: u8 = 0,
+
     /// Keep the cookies the answers set, and send them back — a browser's
     /// jar, so a test can sign in and then be that user.
     ///
@@ -436,7 +442,11 @@ pub const Client = struct {
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .buffer = try gpa.alloc(u8, options.response_bytes + 1),
-            .peer = try bulkhead.Peer.from(options.client_address),
+            .peer = peer: {
+                var p = try bulkhead.Peer.from(options.client_address);
+                p.listener = options.listener;
+                break :peer p;
+            },
             .keep_cookies = options.cookies,
         };
     }
@@ -849,6 +859,128 @@ fn parse(raw: []const u8, keep_alive: bool) !Answer {
     return answer;
 }
 
+// ---- a server that is actually running (ADR 244) ----
+
+/// A real server for a test, on the real Engine, on a port the kernel chose.
+///
+/// `Wired` has no server, so `app.spawn` cannot run there and `nilo.io()`
+/// answers a process-wide `std.Io.Threaded`. A test of what only a running
+/// server does (a fiber `app.spawn` started that drains a queue a route
+/// fills, an idle deadline firing with no request in flight) starts one here
+/// and drives it with any client:
+///
+/// ```zig
+/// var app = nilo.App.init(testing.allocator);
+/// defer app.deinit();
+/// try app.get("/x", sayOk);
+/// try app.spawn(Writer.run, .{&writer});
+///
+/// const live = try nilo.testing.Live.start(testing.allocator, &app, .{ .threads = 1 });
+/// defer live.stop() catch {};
+/// // connect to 127.0.0.1:live.port
+/// ```
+///
+/// **The listener runs as a task of a `std.Io.Threaded` this value owns**,
+/// started with `io.concurrent`, never `io.async`, which may run it on the
+/// calling thread where `accept` would wait for a connection the same thread
+/// was about to make (ADR 056). Port 0 is asked and the kernel's answer read
+/// back with `app.boundPort()`, so two optimize modes running at once cannot
+/// collide, and `stop_on_signal` is off so a test run is not the process's
+/// to stop. Both override whatever `options` carries.
+///
+/// **Every wait is bounded and the giving-up path sets something.** `start`
+/// waits three seconds for the port, and a listener that failed to start has
+/// already stored the error it failed with, which `start` returns instead of
+/// waiting out the clock. `stop` waits ten seconds for the listener to finish
+/// and answers `error.ServerDidNotStop` past that, leaving the value (and the
+/// App it points at) alive rather than freeing them under a server that is
+/// still using them.
+///
+/// Test-only by where it lives: a program that does not name `nilo.testing`
+/// does not compile this declaration (ADR 244).
+pub const Live = struct {
+    /// What a nilo compile error calls this type (ADR 074).
+    pub const nilo_type_name = "nilo.testing.Live";
+
+    /// The port the server took, on 127.0.0.1.
+    port: u16,
+
+    gpa: std.mem.Allocator,
+    app: *App,
+    threaded: std.Io.Threaded,
+    listening: std.Io.Future(void),
+    /// Stored once, last, by the listener when it returns for any reason.
+    finished: std.atomic.Value(bool) = .init(false),
+    /// What `tryListen` failed with, written before `finished`.
+    failure: ?anyerror = null,
+
+    /// Start `app` listening on an ephemeral loopback port and return once
+    /// it has bound. The App must outlive the returned value, and be
+    /// registered and provided before this call, exactly as before `listen`.
+    pub fn start(gpa: std.mem.Allocator, app: *App, options: bulkhead.Options) !*Live {
+        const self = try gpa.create(Live);
+        self.* = .{
+            .port = 0,
+            .gpa = gpa,
+            .app = app,
+            .threaded = .init(gpa, .{}),
+            .listening = undefined,
+        };
+        const io = self.threaded.io();
+        var opts = options;
+        opts.port = 0;
+        opts.stop_on_signal = false;
+        self.listening = io.concurrent(serve, .{ self, opts }) catch |err| {
+            self.threaded.deinit();
+            gpa.destroy(self);
+            return err;
+        };
+
+        for (0..300) |_| {
+            if (app.boundPort()) |port| {
+                self.port = port;
+                return self;
+            }
+            if (self.finished.load(.acquire)) break;
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        }
+        // `failure` is the listener's to write until `finished` says it is
+        // done, so it is read only behind that flag: a listen still going
+        // after the three seconds has written nothing worth reading.
+        const failure = if (self.finished.load(.acquire)) self.failure orelse error.ServerNeverCameUp else error.ServerNeverCameUp;
+        self.stop() catch {};
+        return failure;
+    }
+
+    fn serve(self: *Live, opts: bulkhead.Options) void {
+        self.app.tryListen(opts) catch |err| {
+            self.failure = err;
+        };
+        self.finished.store(true, .release);
+    }
+
+    /// The `std.Io` of the pool the listener runs on, for a client the test
+    /// writes. It is not the server's loop, which is the point of a client.
+    pub fn clientIo(self: *Live) std.Io {
+        return self.threaded.io();
+    }
+
+    /// Ask the server to stop, wait for it to, and free this value. The stop
+    /// is the shutdown a deployed server gets (ADR 028), so a fiber
+    /// `app.spawn` started is cancelled and gone before this returns.
+    pub fn stop(self: *Live) error{ServerDidNotStop}!void {
+        self.app.shutdown();
+        const io = self.threaded.io();
+        for (0..1000) |_| {
+            if (self.finished.load(.acquire)) break;
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        } else return error.ServerDidNotStop;
+        self.listening.await(io);
+        self.threaded.deinit();
+        self.gpa.destroy(self);
+    }
+};
+
 // ---- a WebSocket, driven from a test (ADR 091) ----
 
 /// What one frame carries. The four a handler ever sees, plus the two it
@@ -974,7 +1106,11 @@ pub const Conversation = struct {
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .buffer = try gpa.alloc(u8, options.response_bytes + 1),
-            .peer = try bulkhead.Peer.from(options.client_address),
+            .peer = peer: {
+                var p = try bulkhead.Peer.from(options.client_address);
+                p.listener = options.listener;
+                break :peer p;
+            },
         };
     }
 

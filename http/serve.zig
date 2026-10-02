@@ -482,7 +482,12 @@ pub noinline fn serveRequest(
     // one was missing, so a root `/*` would have answered both.
     const routable = path[0] == '/';
 
-    if (routable and self.router.matchInto(c.method, path, &matched)) {
+    // A route bound to other listeners is a path that is not here, decided
+    // before any middleware runs, so it falls to the same 404 an unknown
+    // path gets (ADR 252). A route bound to none is one compare of a word.
+    if (routable and self.router.matchInto(c.method, path, &matched) and
+        router.onListener(self.router.routes.items[matched.index].listeners, peer.listener))
+    {
         const match = &matched;
         // Decoded here rather than before matching: `%2F` is a slash of
         // data, and a router that saw it as a separator would let a
@@ -532,7 +537,7 @@ pub noinline fn serveRequest(
         // A target that is not a path asks the router nothing: `OPTIONS *` is
         // the server-wide question and is answered by `serverOptionsHandler`
         // from every route's method, and a CONNECT is a 404 (ADR 095).
-        const allowed = if (routable) self.router.allowedFor(path) else router.MethodSet.initEmpty();
+        const allowed = if (routable) self.router.allowedForOn(path, peer.listener) else router.MethodSet.initEmpty();
         if (allowed.count() > 0) {
             c._allowed = allowed;
             terminal = methodNotAllowedHandler;

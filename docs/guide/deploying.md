@@ -359,7 +359,41 @@ try app.listen(.{
 
 An entry has an address, a port and a certificate, and nothing else. Every other `listen()` option belongs to the server, not to one of its addresses: the buffers, the deadlines, the thread count, and `max_connections`, which counts the sockets this process holds, not the sockets one port holds.
 
-**A handler is not told which listener a request came in on**, and there is no way to ask. A listener decides how the bytes are carried and nothing above it, so a route is the same route on every address. A program that wants two different sets of routes gives them two route prefixes, as it always could.
+**A route is answered on every listener unless you bind it to some.** A server with an ingest port and a public port wants the ingest routes off the public one, and a session-cookie route off the ingest one. Number the listeners by their position in the list (`0` is `.port`, `1` is `also[0]`) and bind at the registration ([ADR 252](../adr/252-a-request-knows-which-listener-it-came-in-on.md)):
+
+<!-- compiles: body -->
+```zig
+const public = 0;
+const ingest = 1;
+const h = struct {
+    fn ok(ctx: *nilo.Ctx) !void {
+        try ctx.sendText(200, "ok");
+    }
+};
+
+try app.get("/healthz", h.ok); // both
+try app.onListener(&.{ingest}).post("/v1/logs", h.ok);
+try app.group("/api").onListener(&.{public}).get("/users", h.ok);
+
+try app.listen(.{ .port = 8080, .also = &.{.{ .port = 4317 }} });
+```
+
+A request that arrives on the other listener finds no such route: a 404, the one an unknown path gets, decided before the route's middleware runs and with no `Allow` header to give it away. Nothing is allocated and a connection costs the same. One path is still one route, so `/healthz` cannot answer differently on two listeners.
+
+**`c.listener()` is the same number, for what a binding does not say**, such as a middleware that refuses a prefix on the wrong listener, or a limit that differs per port. It is read from the connection, so no header can claim it:
+
+<!-- compiles: body -->
+```zig
+const refuseOffIngest = struct {
+    fn run(ctx: *nilo.Ctx, next: nilo.Next) !void {
+        if (ctx.listener() != 1) return ctx.sendText(404, "not found");
+        try next.run(ctx);
+    }
+}.run;
+try app.useOn("/internal", refuseOffIngest);
+```
+
+In a test, `.listener = 1` in the client's options is the request arriving on `also[0]`.
 
 Three things to know before you use it:
 

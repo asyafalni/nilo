@@ -179,6 +179,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [`testing.Client`](./testing.md#testingclient)
   - [`answer.json`](./testing.md#answerjson)
   - [`testing.Wired`](./testing.md#testingwired)
+  - [`testing.Live`](./testing.md#testinglive)
   - [`testing.Conversation`](./testing.md#testingconversation)
   - [`testing.show`](./testing.md#testingshow)
   - [`testing.tmpDir`](./testing.md#testingtmpdir)

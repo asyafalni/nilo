@@ -661,6 +661,20 @@ pub const Ctx = struct {
         return Str.static("http");
     }
 
+    /// Which listener this request arrived on: `0` for the one `.address` and
+    /// `.port` name, `1` for the first `.also` entry, `2` for the second, and
+    /// so on in the order `listen()` was given them
+    /// ([ADR 252](../docs/adr/252-a-request-knows-which-listener-it-came-in-on.md)).
+    ///
+    /// A number the program chose by writing the list, so a middleware that
+    /// refuses a route on the wrong listener compares it with a constant it
+    /// declared beside that list. It is read off the connection, never off
+    /// a header, so a client cannot say which one it used. `0` for every
+    /// request of a test that did not set `.listener`.
+    pub fn listener(self: *const Ctx) u8 {
+        return self._peer.listener;
+    }
+
     /// Whether the forwarding headers on this request may be believed: it
     /// came from an address `.trusted_proxies` names (or over a unix socket,
     /// ADR 103), or, with no list, `.trusted_hops` says a proxy stands in

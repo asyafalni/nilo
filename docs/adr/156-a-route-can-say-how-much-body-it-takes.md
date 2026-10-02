@@ -63,6 +63,14 @@ pub fn main() !void {
 
 **Zero read at run time leaves `listen()`'s `max_body` in force** and logs once at `warn`. The compile-time form refuses zero because it is a route that refuses every body, and a number that arrives later cannot be refused while compiling. A setting left at zero most often means "no limit"; of the three readings (every body refused, no bound, the server's own bound) only the last fails closed without failing every request.
 
+## On a gRPC call it means the same thing
+
+**A route's `maxBody` is the limit its gRPC call is collected under**, the raised one as much as the lowered. A call's message is collected, and a gzip message's inflated size is checked, before any middleware runs ([ADR 220](220-grpc-is-served-over-h2c-behind-a-flag.md)), so the middleware cannot be what says the limit there. The route is known from `:path` as soon as the headers are in, and the collector asks the App what that route's limit is: the last `maxBody` in the route's chain, the one that has the last word on HTTP/1, or `listen()`'s `max_body` where the chain has none. Over it is `RESOURCE_EXHAUSTED` (8) without the route running, as over `max_body` always was. The `maxBody` middleware still runs, and still sets the limit the route's reads go by.
+
+**What makes that possible is that `maxBody` hands back more than a function.** A middleware is a function pointer, and nothing can ask a function pointer what number it carries without calling it, which is the one thing the collector may not do. So `nilo.maxBody` returns an `mw.Limited`: the middleware and the limit it gives, a number or the `usize` it reads. `use`, `useOn`, `with` and `without` take it wherever they take a middleware, and keep the pair, one per function, in `App.body_limits`, which is empty unless `maxBody` is used. `nilo.maxBody(n)` and `nilo.maxBody(&limit)` are spelled as they were; what stops compiling is a program that stored the result in a `nilo.Middleware` variable, which has to use the `.run` field. `maxBody(&limit)` is read when the call's headers arrive, so it is read once a call, where HTTP/1 reads it once a request.
+
+**The connection's budget follows the largest limit a call can be given.** The budget that protects memory is `max(ceiling + 5, 65,535)`, where `ceiling` is `max_body`, or the largest limit any `POST` route's chain gives where one raises it ([ADR 220](220-grpc-is-served-over-h2c-behind-a-flag.md)). So a raised route does not make one connection hold more than the largest raise, and a connection that never calls it is held to what it was. The worst a connection can hold is therefore the largest limit the program wrote, once, plus the first window of each call, which is the bound a listener's `max_body` set to that number gave before, now paid only by the connection that uses it. **What it does not bound:** a limit is a limit before the middleware in front of the route has run. A client that has no session can collect a message up to the route's limit on a route a session guards, as it could up to `max_body` before, and the budget is what keeps that to one such message per connection.
+
 ## What it bounds, and what it leaves alone
 
 **Every read into the request arena.** `c.body()`, a JSON body, `Form(T)`,
@@ -88,6 +96,8 @@ nothing on the hot path that was not there. `bytes` is `comptime`, so
 `maxBody.with` is generic on it and a program that never calls it links none
 of it.
 
+**On a gRPC call**, an App that never used `maxBody` pays nothing: `body_limits` is empty, the lookup returns `max_body` before it matches anything, and no allocation is added. One that did pays one more route match when a call's headers arrive (no allocation), and a route whose chain depends on the path (`useOn` with a `:param` in the prefix) pays one chain built and freed. A stream holds one `usize` more, 8 bytes of a call and not of an idle connection, and the retained spare streams hold it too. **Binary size: +144 B on `hello` and +176 B on `rest`**, stripped `ReleaseFast` against `689b034`, though neither uses gRPC or `maxBody`: the registration that notes a `Limited` and the gRPC host's two fields are linked whatever the program registers (ADR 017's running total).
+
 **For a route that reads its number**: one load from a global, a compare and the same store. No allocation, no bytes per idle connection, and the once-only warning is `noinline` and cold, so its format machinery is not on the frame of a request that does not reach it ([ADR 062](062-where-a-connection-waits-is-what-it-costs.md)). A program that never hands it a pointer links none of it.
 
 **A refusal**: `nilo.maxBody(0)` stops compilation. Zero is what somebody
@@ -95,6 +105,12 @@ writes for "no limit", and the answer to that is to leave the middleware off.
 **A second refusal**: `nilo.maxBody(&n)` with `n` anything but a `usize`. Taking a `u32` would mean a conversion per request for a number whose type is already `listen()`'s `max_body`.
 
 ## What was rejected
+
+**Collecting a gRPC message under `max_body` and checking the route's limit afterwards**, which is what shipped first. It made `maxBody` mean two things: on HTTP/1 a limit that raises or lowers, on a gRPC route one that lowers only, since the message had already been refused at `max_body`. A program raising a gRPC route past `max_body` had to raise it for the whole listener, which makes it every route's ceiling (photon's feedback found it).
+
+**Finding the limit by running the chain's `maxBody` early**, against a stand-in request. Middleware is arbitrary code: a session check or a rate limit run for its side effects on a request that is not one is worse than the asymmetry it removes. **Recognising a `maxBody` by its address**, with no change to what it returns, was looked for and has no way in: a function pointer carries nothing, `with(comptime m)` is evaluated while compiling and cannot register anything at run time, and a section of the binary with its bounds is a linker feature that is not the same everywhere.
+
+**A limit per listener**, `.also` entries with a `max_body` each. It answers the whole-listener case and none of the route one: the OTLP route and the rest of the API share a listener.
 
 **`nilo.maxBody.reading(&limit)`**, the shape photon's feedback suggested, beside `cors.reading`. `cors` is a namespace and `nilo.maxBody` is a function, and Zig hangs no declaration off a function, so `.reading` would mean renaming every `nilo.maxBody(n)` to `nilo.maxBody.with(n)`: a breaking change to every route that has one, to buy a name. **A separate `nilo.maxBodyReading`** was the other way to get a name, and it is a second entry for one middleware whose argument already says which form it is. Reading the argument's type is the project's idiom anyway: a pointer is a service and a value is request data in a typed handler, and here a pointer is where the number lives and a value is the number.
 

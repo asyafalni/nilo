@@ -1929,6 +1929,14 @@ const refusals = [_]Refusal{
         .says = "the first argument to allowance.keyed is what a request is counted against, and it has to be a function of one `*nilo.Ctx` returning an optional key.",
     },
     .{
+        .name = "on_listener_names_none",
+        .says = "`onListener` names no listener, so no listener would answer the route. Name at least one: `app.onListener(&.{1})`.",
+    },
+    .{
+        .name = "on_listener_past_thirty_one",
+        .says = "a route can be bound to listeners 0 to 31, and `onListener` was given a larger number.",
+    },
+    .{
         .name = "allowance_of_no_requests",
         .says = "an allowance of 0 requests is not a limit, it is a closed door.",
     },
@@ -2699,6 +2707,7 @@ const Snippets = struct {
         .{ .path = "docs/guide/id.md" },
         .{ .path = "docs/guide/jwt.md" },
         .{ .path = "docs/guide/proto.md" },
+        .{ .path = "docs/guide/services.md" },
         .{ .path = "docs/guide/cache.md" },
         .{ .path = "docs/guide/idempotency.md" },
         .{ .path = "docs/guide/deploying.md" },

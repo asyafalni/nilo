@@ -54,6 +54,34 @@ pub const Match = struct {
     index: usize = 0,
 };
 
+/// The `Route.listeners` of a route bound to no listener in particular:
+/// every bit, so a listener that was never named is answered.
+pub const every_listener: u32 = std.math.maxInt(u32);
+
+/// The `Route.listeners` word for the listeners numbered in `which`, which
+/// is what `onListener` on an App or a group spells. Checked while
+/// compiling: a route can be bound to listeners 0 to 31, and naming none
+/// would be a route no listener answers (ADR 252).
+pub fn listenerBits(comptime which: []const u8) u32 {
+    comptime {
+        if (which.len == 0) @compileError("nilo: `onListener` names no listener, so no listener would answer the route. Name at least one: `app.onListener(&.{1})`.");
+        var bits: u32 = 0;
+        for (which) |n| {
+            if (n >= 32) @compileError("nilo: a route can be bound to listeners 0 to 31, and `onListener` was given a larger number.");
+            bits |= @as(u32, 1) << @as(u5, @intCast(n));
+        }
+        return bits;
+    }
+}
+
+/// Whether a route bound to `bound` answers on the listener numbered
+/// `listener`. A listener past the 32nd is not one a route can be bound to,
+/// so it answers only a route bound to none.
+pub fn onListener(bound: u32, listener: u8) bool {
+    if (bound == every_listener) return true;
+    return listener < 32 and bound & (@as(u32, 1) << @as(u5, @intCast(listener))) != 0;
+}
+
 /// The name a `*` catch-all is captured under, so `c.param("*")` reaches
 /// it. A typed handler takes it as a positional `Str` like any other.
 pub const wildcard = "*";
@@ -88,6 +116,9 @@ pub const Segment = struct {
 
 pub const Route = struct {
     method: http1.Method,
+    /// Which listeners answer this route, one bit each (ADR 252). Every
+    /// bit set, the default, is a route no listener is singled out for.
+    listeners: u32 = every_listener,
     pattern: []const u8,
     handler: CtxHandler,
     chain: []const Middleware = &.{},
@@ -402,6 +433,14 @@ pub const Router = struct {
     /// Only reached once the ordinary match has already failed, so walking
     /// every route a second time costs nothing on the path that matters.
     pub fn allowedFor(self: *const Router, path: []const u8) MethodSet {
+        return self.allowedForOn(path, null);
+    }
+
+    /// `allowedFor`, as the listener numbered `listener` would answer it: a
+    /// route bound to other listeners is not here, so it neither makes a
+    /// 405 nor puts its verb in an `Allow` header (ADR 252). Null is every
+    /// listener.
+    pub fn allowedForOn(self: *const Router, path: []const u8, listener: ?u8) MethodSet {
         var allowed: MethodSet = .initEmpty();
 
         var buf: [max_segments][]const u8 = undefined;
@@ -409,6 +448,7 @@ pub const Router = struct {
 
         for (self.routes.items) |*route| {
             if (allowed.contains(route.method)) continue;
+            if (listener) |on| if (!onListener(route.listeners, on)) continue;
             if (answers(route, split_path.items, split_path.deep)) allowed.insert(route.method);
         }
 
