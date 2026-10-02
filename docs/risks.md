@@ -28,7 +28,7 @@ const slice, or an untagged union.
 something else usually writes it. `covers()` decides while compiling which
 types the generated writer may touch, and it errs narrow. A tuple, a `[N]u8`, a
 type with its own `jsonStringify`, and anything unrecognised all fall back.
-Floats are handed to `std.json` field by field rather than reimplemented.
+A float is the exception, spelled the way serde_json spells it on the generated writer and on every fallback path alike, so the two cannot disagree about one ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
 
 **This one has gone off, which is why it is worth reading rather than nodding
 at.** `[:0]const u8` was recognised by neither and went out as a JSON array of

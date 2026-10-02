@@ -77,11 +77,11 @@ The entries here came from an audit of `cache/` at `1738286` that read every lin
 
 #### P2
 
-**The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:340`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:934`). Not measured.
+**The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:371`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:1107`). Not measured.
 
 **Needs:** test-and-test-and-set with a yield after some spins, the refusal's lock dropped, and both measured under contention.
 
-**Small things that say the wrong thing.** `open` answers `error.TooSmall` when a shard would exceed 4 GiB (`store.zig:747`); `flat.zig:44`, `space.zig:107` and the `cache_value_over_the_ceiling` refusal still say a bucket's four ways are a cache line, where it is eight; `registerSpace` is documented as not thread-safe while the guide calls `Space.open` from handlers, so two at once race on `n_spaces`.
+**Small things that say the wrong thing.** `open` answers `error.TooSmall` when a shard would exceed 4 GiB (`store.zig:890`); `flat.zig:44`, `space.zig:107` and the `cache_value_over_the_ceiling` refusal still say a bucket's four ways are a cache line, where it is eight; `registerSpace` is documented as not thread-safe while the guide calls `Space.open` from handlers, so two at once race on `n_spaces`.
 
 **Needs:** each corrected, the refusal's `.says` with its text, and `registerSpace` made safe to call twice for one name.
 
@@ -539,7 +539,7 @@ Suspected from the code, and not yet made to fail through nilo. Each becomes a d
 
 **What would settle it:** a run behind pgbouncer in transaction mode, or the `DEALLOCATE` sent before the `ROLLBACK`.
 
-**Whether `expect` can boot under a role that may only read and write rows.** `expect` reaches `ensureLedger` (`migrate.zig:2305`), whose `CREATE TABLE IF NOT EXISTS` is checked against the schema's CREATE privilege, so an application role that is not the migration's owner may be refused at boot.
+**Whether `expect` can boot under a role that may only read and write rows.** `expect` reaches `ensureLedger` (`migrate.zig:2601`), whose `CREATE TABLE IF NOT EXISTS` is checked against the schema's CREATE privilege, so an application role that is not the migration's owner may be refused at boot.
 
 **What would settle it:** a live test under a role granted DML only.
 

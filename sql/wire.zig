@@ -125,6 +125,13 @@
 //!   ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
 //!   Null is "this Wire cannot say", which the Fake answers, and it is not
 //!   a failure: the statement runs unchecked, as it did before.
+//! - `columnsOf(arena, query, schema, table)` / `labelsOf(arena, query,
+//!   type_name)` and their `columnsOfMany` / `labelsOfMany`, which take a
+//!   list of tables (or of enum types) and answer one list each **in the
+//!   order asked**, with an empty list for a name that is not there. The
+//!   startup check asks the catalog through the `Many` pair, once a schema
+//!   and once for every enum, and `Tx` forwards each of them down its
+//!   connection ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
 //!
 //! ## The rule all three of those are instances of
 //!

@@ -23,8 +23,8 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 
 | | |
 |---|---|
-| `app.use(mw)` | middleware on every route |
-| `app.useOn(prefix, mw)` | middleware under a path prefix |
+| `app.use(mw)` | middleware on every route. One that returns without answering and without calling `next.run(c)` is a 500 that names it (`middleware 2 of 3`) ([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)) |
+| `app.useOn(prefix, mw)` | middleware under a path prefix. A route whose pattern has a `:param` or `*` where the prefix has a word (`GET /files/*` beside `useOn("/files/private", …)`) has its chain resolved per request from the real path |
 | `app.without(mw)` | the same App with `mw` turned off for the routes registered through the value it returns. This is how a sign-up route sits inside a guarded prefix ([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)) |
 | `app.with(mw)` | the opposite: the same App with `mw` turned **on** for the routes registered through the value it returns, so one endpoint can be guarded while its neighbours are not ([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)) |
 | `app.guard(mw, cookie)` | declares that `mw` rejects a request without the session cookie named `cookie`, so every route it covers is described in the API document with a `cookieAuth` requirement and a 401. Which routes it covers is read from `use`/`useOn`/`with`/`without` when the document is written; only the cookie's name is taken on trust. One per App; a second is `error.GuardAlreadyDeclared`. Declaring it does not install it ([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)) |

@@ -263,7 +263,7 @@ test "a cart is remembered for the next request" {
 }
 ```
 
-To test expiry, use a short TTL rather than a long wait: `putFor(key, value, 1)` and a `std.Thread.sleep` of one second is the honest way, and the module's own suite does it once so yours does not have to.
+To test expiry, use a short TTL rather than a long wait: `putFor(key, value, 1)` and a `std.Thread.sleep` of two seconds is the honest way, since a TTL of `n` lives up to `n + 1`, and the module's own suite does it once so yours does not have to.
 
 ## See also
 

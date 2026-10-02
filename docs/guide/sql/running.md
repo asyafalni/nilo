@@ -216,7 +216,7 @@ A Row can declare more about its table than its columns: a default, a unique, an
 | `error.Locked` | a `.lock = .update_nowait` found a row somebody else holds. No default |
 | `error.Disconnected` | the database went away, or was never there. **503** by default |
 | `error.RolledBack` | the database rolled the transaction back (a serialization failure, a deadlock). Run it again ([Transactions](./transactions.md#retrying-a-rolled-back-transaction)). **503** by default |
-| `error.TimedOut` | a statement ran past the `tx.deadline` you set |
+| `error.TimedOut` | a statement ran past the `tx.deadline` you set, or a wait for a free connection ran out of `timeout_ms` |
 | `error.QueryFailed` | anything else. The server's text is logged, never sent |
 
 Each of the three defaults means the same thing whatever the request was. A duplicate is a conflict. A database that is not there, or that rolled the work back, is a 503, and the client may send the request again. The rest have no default, on purpose: a failed check is a 422 for one endpoint and a 500 for another, and the module does not know which request it is running in. So it gives you an error you can read and lets you decide. A default is only a default: catch the error before it leaves the handler and the answer is yours:

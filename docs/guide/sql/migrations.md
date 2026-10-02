@@ -64,7 +64,7 @@ A column whose default is written in a step, or filled by a trigger, also goes i
 
 ### Unique constraints and indexes
 
-**`.unique` and `.index` take one column (`.email`), several columns as one constraint (`.{ .org_id, .created_at }`), or the named form when there is more to say.** `.ignoring_case` becomes `lower("email")` on Postgres and `COLLATE NOCASE` on SQLite. It covers the case where two people sign up as `Wati@` and `wati@` and a plain unique accepts both.
+**`.unique` and `.index` take one column (`.email`), several columns as one constraint (`.{ .org_id, .created_at }`), or the named form when there is more to say.** `.ignoring_case` becomes `lower("email")` on Postgres and `COLLATE NOCASE` on SQLite. It covers the case where two people sign up as `Wati@` and `wati@` and a plain unique accepts both. On Postgres the index is built over `lower("email") text_pattern_ops`, so `.istarts_with` reads it as a range; one made by an earlier release keeps its old index until it is dropped and made again.
 
 **Give a constraint a `.name` when somebody will have to read the violation.** Postgres reports a violation by the constraint's name and nothing else, so `members_one_account_per_address` is something your support engineer can act on, where `members_email_key` is a column list they have to look up. A name over 63 bytes is a compile error on both databases, because Postgres silently shortens a longer one with a `NOTICE` nobody reads.
 

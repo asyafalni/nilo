@@ -473,7 +473,7 @@ pub const Rules = @import("bound.zig").Rules;
 /// `Idempotent-Replayed: true`, and the handler does not run. No key is a
 /// 400, a key still being answered is a 409, a key reused on a different
 /// request is a 422. A failure is not kept, so a retry after one runs the
-/// handler again. `Replays` is any bytes Space with `putIfAbsent` — a
+/// handler again. `Replays` is any bytes Space with `putIfAbsentFor` — a
 /// `nilo_cache` one — provided as a service; `.by` is whose key it is.
 pub const Idempotent = @import("typed.zig").Idempotent;
 pub const IdempotentOptions = @import("typed.zig").IdempotentOptions;

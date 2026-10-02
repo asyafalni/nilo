@@ -20,7 +20,7 @@
 //! .{ .where = .{ .age = .{ .gt = 18 } }, .order = .{ .created_at = .desc }, .limit = 10 }
 //! ```
 //! ```sql
-//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC, "id" ASC LIMIT 10
+//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC, "id" DESC LIMIT 10
 //! ```
 //!
 //! At runtime what is sent is that constant and one value. Drizzle, whose

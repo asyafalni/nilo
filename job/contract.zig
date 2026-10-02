@@ -1,8 +1,8 @@
 //! What a store has to answer, and the shapes it answers in.
 //!
 //! A `Jobs` never names a store type: it is handed one, and asks it these
-//! eight questions through whatever methods it has, the way `nilo.Idempotent`
-//! asks a Space for `getInto` and `putIfAbsent` rather than for `nilo_cache`
+//! ten questions through whatever methods it has, the way `nilo.Idempotent`
+//! asks a Space for `getInto` and `putIfAbsentFor` rather than for `nilo_cache`
 //! ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 //! That is what keeps `job/` importing `nilo_core` and nothing else while
 //! `job.Table` sits on a `nilo_sql` Db: the Db type arrives as a parameter,
@@ -22,6 +22,7 @@
 //! | `release(scope, id, attempts) !bool` | put it back untouched: the server is going |
 //! | `unkey(scope, id, attempts) !bool` | a running row stops holding its `unique` key and goes on running, so a successor can be queued under the same key: what a schedule with `overlap = .queue` needs (ADR 161) |
 //! | `stats(scope) !Stats` | how many are waiting, running and dead |
+//! | `deadOnes(scope) ![]Dead` | the dead rows, newest first |
 //! | `retryDead(scope, id, now, comptime scheduled) !bool` | queue a dead row again from the first attempt; `error.Scheduled` when its kind is one of `scheduled`, decided on the row it would revive, changing nothing (a dead tick's successor is already queued, so reviving it would run the kind on two chains) |
 //!
 //! **The four calls about a held row are fenced on the claim.** `attempts` is

@@ -1,6 +1,6 @@
 # nilo
 
-A toolkit for Zig — eleven modules for the ordinary jobs, of which the largest is an HTTP server. It puts the comfort of writing code first, with performance as a consequence rather than the other way round. It is aimed at people who are used to Go or Node and are giving Zig a try.
+A toolkit for Zig — twelve modules for the ordinary jobs, of which the largest is an HTTP server. It puts the comfort of writing code first, with performance as a consequence rather than the other way round. It is aimed at people who are used to Go or Node and are giving Zig a try.
 
 ## Language
 
@@ -166,6 +166,14 @@ _Avoid_: extension, module, add-on, middleware bundle
 The OpenAPI document nilo writes from the handler signatures. Not maintained alongside the code — read off the same argument list the compile-time engine reads, and built once when the server starts. It promises what the signature settles and nothing else.
 _Avoid_: schema, spec file, swagger, annotations
 
+**Listener**:
+One address the server answers on. `listen()` is given a list of them, and a request knows its position in it with `c.listener()`. A route can belong to some, and a request that arrives on another gets the 404 an unknown path gets, before any middleware runs.
+_Avoid_: port, socket, bind, endpoint, interface
+
+**Span**:
+One timed piece of work inside a request that `app.trace` sends to a collector: the request itself, every outbound call under it, and whatever a handler measures with `c.span`. A request carrying a `traceparent` joins that trace, and an outbound call passes it on.
+_Avoid_: segment, timer, measurement, trace (which is the whole tree of them)
+
 **Metrics page**:
 What `app.metrics` puts on `/metrics`: requests, status classes, a latency histogram and exact status codes, in the text format Prometheus scrapes. An ordinary route, counted per **route** rather than per path, because a counter is the route's index in the table rather than a key somebody hashed.
 _Avoid_: telemetry, instrumentation, observability endpoint, stats
@@ -242,6 +250,10 @@ _Avoid_: mock, fixture, test server, harness
 What a test client keeps of the cookies the answers set, and sends back on the requests that follow. Off unless asked for. A browser's word, kept because that is what it imitates.
 _Avoid_: cookie store, session store, cookie cache
 
+**Live server**:
+A real server a test starts, with `testing.Live`: the real Engine on a port the kernel chose, stopped by the test. For what only a running server does, such as a spawned fiber or an idle deadline. A Test client is the other choice, and the one for everything that fits in it.
+_Avoid_: integration server, end-to-end harness, spawned process
+
 ### SQL
 
 **Row**:
@@ -271,6 +283,18 @@ _Avoid_: relation, association, include, eager load, belongs-to
 **Children field**:
 A field of a narrower Row that is a list of another table's Row: every row pointing back at this one, read by one more statement for all the rows at once.
 _Avoid_: has-many, preload, populate, nested query, subcollection
+
+**Through field**:
+A field of a narrower Row that reads one column of another table flat, by naming the references to cross: `.customer_name = .{ .customer_id, .name }`. The joined column arrives in a field of its own, so a response whose contract is flat needs no second struct. Not a Parent field, which brings the whole row.
+_Avoid_: flattened join, projection, alias, denormalised column
+
+**Unread column**:
+A column the table has and its Row does not read, named in the marker with `.unread`. It is in the table and the migration diff, and a condition, an order or a write may name it on this Row, but the Row's `SELECT` and its JSON leave it out.
+_Avoid_: hidden column, ignored field, write-only column
+
+**Feed**:
+The rows of a page up to a limit and whether any came after them, with no count of the rest. What a "load more" button needs, read as one row past the limit. A page is the other shape, and pays for a total.
+_Avoid_: infinite scroll, cursor page, timeline
 
 **Grouped Row**:
 A narrower Row that names its computed fields in `nilo_aggregate`, so each of its rows is a group and every other field is a key of it. One with no keys at all is exactly one row, and is read with `exactlyOne`.

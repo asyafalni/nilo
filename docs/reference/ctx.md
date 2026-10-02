@@ -102,7 +102,7 @@ Setting the same header twice replaces it, except for `Set-Cookie` and `Vary`, w
 
 ### `c.url`
 
-**`c.url` is checked while compiling.** A param with no value, a value with no param, a value a path segment cannot carry, and a `*` catch-all are all compile errors naming the field. Values are matched by name, so `.{ .slug = t, .id = 42 }` and `.{ .id = 42, .slug = t }` give the same URL. `nilo.url.into(buf, pattern, args)` is the same call with your own buffer and no allocation, for code with no request in flight.
+**`c.url` is checked while compiling.** A param with no value, a value with no param, a value a path segment cannot carry, and a `*` catch-all are all compile errors naming the field. Values are matched by name, so `.{ .slug = t, .id = 42 }` and `.{ .id = 42, .slug = t }` give the same URL. `nilo.url.into(buf, pattern, args)` is the same call with your own buffer and no allocation, for code with no request in flight. A text value that is empty, `.` or `..` is `error.BadValue`, because a browser follows `/u/../settings` to `/settings` and reads `%2E` as a dot ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)).
 
 ### `c.sendFile`
 

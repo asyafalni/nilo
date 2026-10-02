@@ -194,11 +194,11 @@ The first request with a key runs the handler and **stores what it returned**: t
 
 | | |
 |---|---|
-| `Replays` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsentFor`, `put`, `del`, `max_bytes` and `Held` works, which is what a Redis-backed table would provide |
+| `Replays` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsentFor`, `put`, `del`, `max_bytes` and `Held` works, which is what a Redis-backed table would provide. It is a service the route needs, so `listen()` names it when it is missing |
 | `.by` | whose key it is: a function of one `*Ctx` returning `?Str`. Two callers who pick the same key must never see each other's answer, so leave it null only on an endpoint with a single caller. Null from the function is a 403 |
 | `.key` | the header as sent |
 
-**Checked before the handler runs, each answer naming the header:** **400** with no `Idempotency-Key` or one over 255 bytes; **409** when the same key is still being answered; **422** when the key is reused on a different request (the method, path, query and body are fingerprinted). In the document: a required header parameter and the two extra responses. A handler that returns nothing, a file or a redirect has no answer nilo can store, and is a Refusal.
+**Checked before the handler runs, each answer naming the header:** **400** with no `Idempotency-Key`, one over 255 bytes, or one too long for the Space to hold a key to (a long `.by`, or a Space sized small), refused before the handler runs; **409** when the same key is still being answered; **422** when the key is reused on a different request (the method, path, query and body are fingerprinted). In the document: a required header parameter and the two extra responses. A handler that returns nothing, a file or a redirect has no answer nilo can store, and is a Refusal.
 
 **What it costs, only on the route that uses it:** one arena allocation of the Space's `max_bytes` to read a stored answer into, one to encode the answer being stored, and the JSON buffer the answer was using anyway. Nothing on the stack.
 
@@ -218,7 +218,7 @@ fn frontPage(page: nilo.Cached(Pages, .{ .ttl_s = 60 })) !Front {
 }
 ```
 
-The first request runs the handler and **stores what it returned** (status, the `Response(T)` headers, the body) under the path and query. Every request for the same path and query within `ttl_s` gets the stored answer back, byte for byte, with `Cache-Status: nilo; hit`, and the handler does not run; a fresh answer carries `Cache-Status: nilo; fwd=miss`. A failure is not stored, so the next request runs the handler again.
+The first request runs the handler and **stores what it returned** (status, the `Response(T)` headers, the body) under the path and query. Every request for the same path and query within `ttl_s` gets the stored answer back, byte for byte, with `Cache-Status: nilo; hit`, and the handler does not run; a fresh answer carries `Cache-Status: nilo; fwd=miss`. A failure is not stored, so the next request runs the handler again. **An answer that sets a cookie, or carries a header `setHeader` refuses, is sent and not kept**, with a `warn`, so the first visitor's `Set-Cookie` is never replayed to everybody ([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 | | |
 |---|---|

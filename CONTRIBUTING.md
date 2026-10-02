@@ -39,7 +39,7 @@ The rest of the build steps are in [`CLAUDE.md`](./CLAUDE.md#commands), and the 
 
 **The refusals never cache.** The compiler keeps nothing from a compilation that failed, so every one of them is re-analysed on every run. They are the floor of a run rather than its slow part: a run after an edit is longer by whichever single compilation is biggest, because that one cannot be split across cores. [`bench/result/build.md`](./bench/result/build.md) has the numbers and the levers.
 
-**The bottom layer runs without the build system.** `zig test core/core.zig`, and the same for `id/`, `config/`, `pw/`, `cache/` and `jwt/`, work on their own, filters and all. That is the entry condition for the layer, not a nicety: if a change stops one of them working, the layering broke, not the test. A Fitting is one step short because it borrows the loop ([ADR 061](./docs/adr/061-a-fitting-borrows-the-loop.md)), and needs `nilo_core` in the graph and nothing else:
+**The bottom layer runs without the build system.** `zig test core/core.zig`, and the same for `id/`, `config/`, `pw/`, `cache/`, `jwt/` and `proto/`, work on their own, filters and all. That is the entry condition for the layer, not a nicety: if a change stops one of them working, the layering broke, not the test. A Fitting is one step short because it borrows the loop ([ADR 061](./docs/adr/061-a-fitting-borrows-the-loop.md)), and needs `nilo_core` in the graph and nothing else:
 
 ```
 zig test --dep nilo_core -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig

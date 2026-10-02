@@ -77,6 +77,8 @@ What it cannot do is run any of the handler's own code between events. For that,
 | `b.size()` | `?u64`: what the request announced; `null` if chunked |
 | `b.reader` | a plain `std.Io.Reader` |
 
+**`read`, `writeTo` and `discardRest` fail with `error.BodyTruncated`, a 400, when the connection ends while bytes are still owed**, so an upload cut short is never stored as a whole one. `null` from `read` is always the real end ([ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)).
+
 ## `Socket`
 
 | | |

@@ -197,6 +197,7 @@ Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes.
   and is tried again five seconds later. A credential source that is down does
   not take the process with it until the old key actually expires; past that,
   each request that tries and fails gets the error.
+- **`open` refuses what could never sign**, where each of these opened and then answered 403 to every request, each taking the refresh gate to refresh nothing: an empty key id or secret, an `expires_at` already past, a key id or session token longer than `sign` derives from, a key id or region holding `,`, `/`, a space or a control byte (`BadCredentials`, `BadRegion`), and an endpoint authority over 255 bytes, which also panicked a safe build at the first `list` or `presign` (`BadEndpoint`). A `max_streams` over `max_in_flight` is `BadStreams`. `open` keeps its own copy of `.static` credentials and zeroes the secrets it frees.
 - **The clock is the one the rest of the process uses.** SigV4 rejects a request
   whose `X-Amz-Date` is more than fifteen minutes from the server's, so a
   container with a drifting clock returns `Rejected` for everything —

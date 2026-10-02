@@ -135,6 +135,8 @@ It passes the Scope check, so `db.select(Row, &erased, …)` works: a callback c
 
 **It borrows.** The pointer inside is the Scope's own, so an `AnyScope` must not outlive the `Ctx` or `Run` it was made from; in practice it is a local variable next to the call. **The ordinary Scope is unchanged**: every call in nilo and in `nilo_sql` still takes `anytype` and still costs no indirect call. The vtable is paid for only where somebody erases a Scope.
 
+**A Scope can also be asked what it knows, through plain functions that take any Scope and answer `null` for one that does not know.** `nilo_core.requestIdOf(S, scope)` is the request id ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)); `routeNameOf(scope)` is the `operationId` of the route its request matched, which is what `nilo_sql` puts on a statement it reports ([ADR 108](../adr/108-a-statement-can-be-watched.md)); `serialOf(scope)` says which request or tick it is on, for a module that keeps something between calls and has to know it is still the same one ([ADR 117](../adr/117-a-statement-that-failed-says-what-the-database-said.md)); `traceBeginOf(scope)` and `traceEndOf(scope, begun, ended)` open and close the span of a call that is leaving, which `nilo_fetch` asks so its `traceparent` names the call ([ADR 247](../adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md)). `nilo_core.trace` holds the W3C Trace Context they speak.
+
 ## `nilo_core.percent`
 
 **Percent coding by RFC 3986, in both directions.** The server decodes every path param and query value with it, and you never call that half. The encoding half is for building a URL or signing one. It is in Core rather than in `nilo_http`, so a Service can use it too ([ADR 057](../adr/057-percent-is-needed-by-two-layers.md)).

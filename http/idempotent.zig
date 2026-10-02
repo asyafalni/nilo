@@ -19,7 +19,8 @@
 //! **Three refusals nilo writes before the handler runs**, each with the
 //! header named:
 //!
-//! - 400 — no `Idempotency-Key`, or one longer than 255 bytes.
+//! - 400 — no `Idempotency-Key`, one longer than 255 bytes, or one too long
+//!   for the Space to hold a key to.
 //! - 409 — the same key is still being answered. Two requests with one key
 //!   in flight at once is a client retrying too soon, and the second one
 //!   waits by asking again.

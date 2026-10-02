@@ -319,10 +319,12 @@ SELECT "customer"."name" AS "customer.name", count(*) AS "invoices",
        avg("invoices"."total")::float8 AS "mean"
 FROM "invoices" JOIN "customers" AS "customer" ON "customer"."id" = "invoices"."customer_id"
 WHERE "invoices"."year" = $1
-GROUP BY "customer"."name"
+GROUP BY "customer"."name", "customer"."id"
 HAVING sum("invoices"."total") > $2
-ORDER BY "revenue" DESC LIMIT 10
+ORDER BY "revenue" DESC, "customer"."name" DESC, "customer"."id" DESC LIMIT 10
 ```
+
+**A group with a parent is grouped by the parent's key as well as its columns**, so two customers named Acme are two rows and not one summed together. A `.limit` or an `.offset` makes the order end in every column the Row groups by that it did not name, running the way its last term runs, so a page of groups has one order and the next page picks up where it stopped ([ADR 218](../../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md), [ADR 150](../../adr/150-a-page-knows-what-it-left-out.md)).
 
 `year` is not a field of `ByCustomer`, yet it is in the condition. **A grouped Row's condition can name any column of the table, not only the Row's fields**, because the rows being grouped are the table's rows. A term on a column or a parent's column becomes `WHERE`, applied before grouping; a term on an aggregate field becomes `HAVING`, applied after. You do not mark which is which at the call site, because the Row already says.
 

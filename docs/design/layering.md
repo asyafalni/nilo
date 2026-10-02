@@ -10,7 +10,7 @@ The layout table is in [`CLAUDE.md`](../../CLAUDE.md#layout), the vocabulary is 
 
 ```
 Core (nilo_core)             no loop, needed by two layers, plain `zig test`
-  ├─ Tool module (id, config, pw, cache, jwt)   no loop, may name Core, never a sibling
+  ├─ Tool module (id, config, pw, cache, jwt, proto)   no loop, may name Core, never a sibling
   ├─ Fitting (fetch, job)                       borrows the loop, owns no destination
   │    └─ Service (sql, s3)                     borrows the loop, holds a named system
   └─ App (http)                                 owns the loop
@@ -22,7 +22,7 @@ Imports only ever point down this stack. `zig build layering` goes through every
 
 1. **The layer question is "does it need the event loop", not "does it do IO".** Reading the clock or generating a UUID's bytes never waits, so they can sit in a layer that could not otherwise do IO at all. Needing the loop is what the layering has really always been about. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
 2. **A module imports only downward, and never a module in its own layer.** Core imports nothing from nilo. A tool module may import `nilo_core` and no other tool module. A Fitting or Service may import `nilo_core`, any tool module, and its own third-party drivers. An App may import `nilo_core` and any tool module, and no Service reaches up into it. Two modules in the same layer share no files, which is what lets them be worked on separately. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
-3. **For Core and for a tool module, running under a plain `zig test` is a requirement, not a nicety.** `zig test core/core.zig` and `zig test id/id.zig` (and `config/`, `pw/`, `cache/`, `jwt/`) run the whole module without `build.zig`. A module that cannot do that is in the wrong layer. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
+3. **For Core and for a tool module, running under a plain `zig test` is a requirement, not a nicety.** `zig test core/core.zig` and `zig test id/id.zig` (and `config/`, `pw/`, `cache/`, `jwt/`, `proto/`) run the whole module without `build.zig`. A module that cannot do that is in the wrong layer. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
 4. **A Fitting uses the loop but owns no destination**: it is given `std.Io` and an address on every call, so it holds no connection to any named system. `fetch/` and `job/` are tested under `std.Io.Threaded` with no Engine and no module graph beyond Core, which is this layer's requirement. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
 5. **A Service uses the loop and holds a connection to a named system.** `sql/` and `s3/` may import `nilo_core`, a tool module and a Fitting (`s3/` uses `nilo_fetch`), but never an App. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)
 6. **Core is shared vocabulary, not a place for leftovers.** A file belongs in `nilo_core` only if two layers need it, never because it has nowhere else to go. `Str`, the Scope, the clock and `percent` each got there by passing that test, not by being there from the start. [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)

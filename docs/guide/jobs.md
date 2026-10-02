@@ -155,7 +155,7 @@ Past it the run is cancelled, counted as a failed attempt named `TimedOut`, and 
 |---|---|
 | `after_ms` | run no sooner than this many milliseconds from now |
 | `at` | run no sooner than this moment, in microseconds since the epoch. Use one of the two, not both |
-| `unique` | a key of up to 64 bytes that at most one queued-or-running row of this kind may carry. The result becomes `?Id`, null when a row already carries the key |
+| `unique` | a key of up to 64 bytes that at most one queued-or-running row of this kind may carry. The result becomes `?Id`, null when a row already carries the key. Never empty: `.unique = ""` is a compile error and an empty key built at run time is `error.EmptyUniqueKey`, because it is nearly always a value that went missing |
 | `within` | a `cache.Space` of `job.Mark` checked before `unique`, for "at most one of these every thirty seconds" |
 
 <!-- compiles -->

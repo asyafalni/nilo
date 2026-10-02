@@ -25,7 +25,7 @@ fn listAdults(db: *sql.Db, c: *nilo.Ctx) ![]User {
 
 ```sql
 SELECT "id", "email", "age", "created_at" FROM "users"
-WHERE "age" > $1 ORDER BY "created_at" DESC, "id" ASC LIMIT 10
+WHERE "age" > $1 ORDER BY "created_at" DESC, "id" DESC LIMIT 10
 ```
 
 The `"id"` at the end of the order is the table's key, added to any order a `LIMIT` or an `OFFSET` cuts that does not name it already, so rows the order ties still come back in one order and a page never repeats or skips one. An index that serves a paged order should end in the key as well, `(created_at, id)` rather than `(created_at)`, or Postgres sorts every row that ties with the page's. Only the `18` reaches run time. The table, the columns, the operators and the number of parameters are all decided while compiling, and each is a compile error when wrong. You can read the constant too: `sql.selectFor(User, @TypeOf(options)).sql` is the text above, and `sql.on(sql.SQLite).selectFor(User, @TypeOf(options)).sql` is the same statement written with `?1`. `sql.on(D)` binds `selectFor` and the fourteen functions beside it to a Dialect you choose.

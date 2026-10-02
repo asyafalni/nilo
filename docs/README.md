@@ -65,7 +65,7 @@ In the order the guide teaches them. Each row is one guide page and the referenc
 
 | Topic | Module | Reference | Design |
 |---|---|---|---|
-| [Middleware and resolved values](./guide/middleware.md) | `nilo_http` | [`app.use`, `app.useOn`](./reference/app.md#app), [`with`, `without`](./reference/app.md#group), [built-in middleware](./reference/middleware.md#built-in-middleware) | [Middleware](./design/middleware.md), [CORS and the proxy](./design/cors-proxy.md), [Rate limiting](./design/rate-limiting.md) |
+| [Middleware and resolved values](./guide/middleware.md) | `nilo_http` | [`app.use`, `app.useOn`](./reference/app.md#app), [`with`, `without`](./reference/app.md#group), [built-in middleware](./reference/middleware.md#built-in-middleware), [`nilo.secure`](./reference/middleware.md#nilosecure) | [Middleware](./design/middleware.md), [CORS and the proxy](./design/cors-proxy.md), [Rate limiting](./design/rate-limiting.md) |
 | [Services](./guide/services.md) | `nilo_http` | [`app.provide`](./reference/app.md#app), [`nilo.blocking` and `nilo.Mutex`](./reference/app.md#concurrency) | [Lifecycle](./design/lifecycle.md), [Memory](./design/memory.md) |
 | [Static files](./guide/static-files.md) | `nilo_http` | [`app.static`, `app.embedded`](./reference/app.md#app), [static options](./reference/app.md#static-options) | [Static files](./design/static-files.md) |
 | [Errors](./guide/errors.md) | `nilo_http` | [`fail` functions](./reference/ctx.md#failing), [`app.failures`](./reference/app.md#app), [`c.requestId`](./reference/ctx.md#reading) | [Errors](./design/errors.md) |
@@ -99,7 +99,7 @@ In the order the guide teaches them. Each row is one guide page and the referenc
 
 | Topic | Module | Reference | Design |
 |---|---|---|---|
-| [Testing](./guide/testing.md) | `nilo_http` | [`nilo.testing.Client`](./reference/testing.md#testingclient), [`Wired`](./reference/testing.md#testingwired) | [Testing](./design/testing.md) |
+| [Testing](./guide/testing.md) | `nilo_http` | [`nilo.testing.Client`](./reference/testing.md#testingclient), [`Wired`](./reference/testing.md#testingwired), [`testing.Live`](./reference/testing.md#testinglive), [`testing.tmpDir`](./reference/testing.md#testingtmpdir) | [Testing](./design/testing.md) |
 | [OpenAPI](./guide/openapi.md) | `nilo_http` | [OpenAPI options](./reference/app.md#openapi-options), [the document without a server](./reference/app.md#the-document-without-a-server), [handler returns](./reference/handlers.md#handler-returns) | [OpenAPI](./design/openapi.md) |
 | [Metrics](./guide/metrics.md) | `nilo_http` | [`app.metrics`, `app.expose`](./reference/app.md#app), [`metrics` options](./reference/app.md#metrics-options) | none; the decision is [ADR 079](./adr/079-the-route-table-is-the-registry.md) |
 | [Tracing](./guide/tracing.md) | `nilo_http` | [`app.trace`](./reference/app.md#app), [trace options](./reference/app.md#trace-options), [`c.span` and `c.traceId`](./reference/ctx.md#tracing) | none; the decision is [ADR 247](./adr/247-a-request-is-a-span-and-the-trace-leaves-as-otlp.md) |

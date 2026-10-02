@@ -15,7 +15,7 @@ app.static(prefix, dir) ──► walk once ──► Set        GET prefix/name
   held file:   bytes, ETag, gzip copy                     │
   spilled file (over max_file_bytes): name, size, mtime   ├─ held  ──► slice, maybe gzip (211), maybe a Range (020)
 app.embedded(prefix, files) ──► same Set,                 ├─ spilled ──► open, stat the descriptor, sendfile (098)
-  bytes borrowed from the binary, owns_bytes = false       └─ miss  ──► fallbackFor(path, Sec-Fetch-Mode, Accept) (087)
+  bytes borrowed from the binary, owns_bytes = false       └─ miss  ──► fallbackFor(path, Asked) (087)
                                                                   a navigation → spa_fallback
                                                                   otherwise → 404 naming the path
 ```

@@ -253,7 +253,7 @@ std.log.info("bye", .{}); // and this runs
 
 What happens in between is what matters for a deploy. The server stops accepting. Requests already being answered are finished, and their responses go out with `Connection: close`, so the client opens a fresh connection to whatever replaced this process. Connections sitting idle between keep-alive requests are closed at once: they hold no work, and waiting on them would put the whole grace period behind every open browser tab.
 
-A handler that runs past `.shutdown_grace_ms` (10 seconds by default) is cut off, and the log says how many were. Pressing Ctrl-C a second time skips the wait entirely.
+A handler that runs past `.shutdown_grace_ms` (10 seconds by default) is cut off, and the log says how many were. Pressing Ctrl-C a second time skips the wait entirely; the count is of signals, so a first signal after `app.shutdown()` still gets the grace period.
 
 A stream or a WebSocket needs your help: `live()` becomes false when the stop begins, and a loop that checks it lets the deploy finish instead of waiting out the whole grace period. See [Streaming](./streaming.md#when-a-stream-ends).
 

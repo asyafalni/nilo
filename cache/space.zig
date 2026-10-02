@@ -193,8 +193,8 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         /// than a `get` followed by a `put`. An expired entry is free.
         ///
         /// A value too large is `error.TooLarge` the way `put` says it, and a
-        /// flat value cannot be. `nilo.Idempotent` is what this was built for
-        /// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
+        /// flat value cannot be. `nilo.Cached` claims its key with this
+        /// ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
         pub const putIfAbsent = if (kind == .flat) claimFlat else claimBytes;
 
         /// The same claim, for an entry that lives `ttl_s` rather than the

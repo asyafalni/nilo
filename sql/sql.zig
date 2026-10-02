@@ -77,7 +77,7 @@
 //! | **Dialect** | `dialect.zig` | comptime, writes the SQL, may refuse |
 //! | **where** | `where.zig` | a condition into a fragment and a value list |
 //! | **statements** | `statement.zig` | every one of them, each as a constant |
-//! | **types** | `types.zig` | Timestamp, Date and Json — value, not arithmetic. `Uuid` is `nilo_id`'s, and `AsText` is the door out |
+//! | **types** | `types.zig` | Timestamp, Date, UnixMillis, UnixSeconds and Json — value, not arithmetic. `Uuid` is `nilo_id`'s, and `AsText` is the door out |
 //! | **schema** | `schema.zig` | Row against table, while the server starts |
 //! | **table** | `table.zig` | what a Row says about the *table*: the marker's words |
 //! | **ddl** | `ddl.zig` | the SQL that changes a table's shape. `CREATE` is a constant |
