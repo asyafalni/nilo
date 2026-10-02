@@ -146,7 +146,7 @@ Both options are off by default: the id costs a header on every response, and th
 | 409 | an `Idempotency-Key` that is still being answered ([Answering once](./idempotency.md)) |
 | 408 | a request head or a body that stopped arriving within the [deadlines](./deploying.md#deadlines) |
 | 413 | a body past `c.body()`'s megabyte, or a stream's `max_bytes` |
-| 422 | a `Bound(…)` argument whose handler answered `b.fail()` ([Forms](./forms.md#collecting-every-field-error-bound)); an `Idempotency-Key` reused on a different request |
+| 422 | a `Bound(…)` argument whose handler answered `b.fail()` ([Forms](./forms.md#collecting-every-field-error-bound)); a JSON body of the wrong shape whose type says `.misfit = 422` ([Requests](./requests.md#json-bodies)); an `Idempotency-Key` reused on a different request |
 | 429 | an address past its [allowance](./middleware.md#rate-limiting), with a `Retry-After` |
 | 431 | a request head bigger than `read_buffer` |
 | 500 | a `Session(T)` asked for with no `session_secret` set, a header value with a control byte in it, a cookie value with a `;` |

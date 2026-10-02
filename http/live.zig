@@ -613,20 +613,20 @@ fn converse(
 /// down `sendfile.send`. The path is relative to the working directory, which
 /// is what `staticWith` takes.
 const Spilled = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
+    tmp: nilo.testing.TmpDir,
+    path: [:0]u8,
 
     /// Longer than one page and not a round number of them, so a partial last
     /// chunk is exercised rather than an exact multiple.
     const contents = "nilo sends this from a descriptor, not from memory. " ** 200;
 
     fn init(gpa: std.mem.Allocator) !Spilled {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        var tmp = nilo.testing.tmpDir();
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = contents });
         return .{
             .tmp = tmp,
-            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path}),
+            .path = try tmp.pathAlloc(gpa, ""),
         };
     }
 
@@ -806,15 +806,15 @@ fn whoIsAsking(c: *nilo.Ctx) anyerror!void {
 /// A temporary directory with room for a socket in it, named short enough
 /// that the whole path fits in the 108 bytes the operating system allows.
 const SocketDir = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
+    tmp: nilo.testing.TmpDir,
+    path: [:0]u8,
 
     fn init(gpa: std.mem.Allocator, name: []const u8) !SocketDir {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = nilo.testing.tmpDir();
         errdefer tmp.cleanup();
         return .{
             .tmp = tmp,
-            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name }),
+            .path = try tmp.pathAlloc(gpa, name),
         };
     }
 

@@ -119,13 +119,16 @@ const by_month = try db.raw(MonthLine, c,
 
 ## The database filename
 
-**A bare `:memory:` is rejected when you open it.** A pool of them would be several separate empty databases: writes would go to one and reads would find nothing. The shared form is one database, and it is what to write:
+**`:memory:` is a fresh database for the pool that opens it, and for nobody else.** Its writer and readers see one database, and a second `Db` on `:memory:`, in the next test or one running beside it, gets an empty one of its own. It is gone when the pool closes. That is the spelling a test wants, and it needs no name:
 
 ```zig
-"file:test?mode=memory&cache=shared"     // lives as long as a connection to it
+":memory:"                               // one database per pool, private to it
+"file:cache?mode=memory&cache=shared"    // one database per name, for pools that mean to share
 ```
 
-**A test that checks read-only enforcement has to use a file.** SQLite's URI `mode=` overrides the flags a connection is opened with, so a reader on an in-memory database can write, where the same reader on a file cannot.
+The second form is SQLite's own, and nilo leaves it alone: every pool in the process that opens the same name opens the same database, which lives as long as a connection to it does. Two tests that reuse a name see each other's rows, so reach for it only when sharing is the point. **An empty URL is refused** at `open`, because it is far more often a setting that was never set than a choice.
+
+**A test of WAL, locking or `Locked` has to use a file.** An in-memory database answers `memory` to `journal_mode = WAL` and has no other process to hold a lock. A reader refuses a write in both: on a file through the read-only flag, and in memory through `query_only`, because SQLite's URI `mode=memory` overrides the flag.
 
 ## What it costs
 

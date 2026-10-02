@@ -1092,6 +1092,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
         // Whether nilo can refuse this request before the handler runs.
         // Not a guess — it is exactly the routes with something to convert.
         var can_reject = false;
+        var misfit = false;
 
         // A handler holding a `*Ctx` and returning nothing has sent its
         // answer itself, somewhere in its body, and no reading of its
@@ -1123,6 +1124,9 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
             .body => {
                 body = openapi.schemaOf(p.type.?);
                 can_reject = true;
+                // A body type that answers its wrong shape with a 422 says
+                // so, and the document says it with it (ADR 251).
+                misfit = mark.misfitStatus(p.type.?) != null;
             },
             // The same slot as a body and described the same way, with one
             // difference the document has to carry: which encoding the
@@ -1200,6 +1204,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
             .body_kind = body_kind,
             .answer = answer,
             .can_reject = can_reject,
+            .misfit = misfit,
         };
     }
 }
@@ -2403,4 +2408,39 @@ test "a Str path param is still a bare string, so nothing was widened by acciden
         "\"required\":true,\"schema\":{\"type\":\"string\"}") != null);
     // Nothing to convert, so nothing to refuse.
     try testing.expect(std.mem.indexOf(u8, doc, "\"400\"") == null);
+}
+
+test "a body type that says .misfit = 422 puts the 422 in the document beside the 400" {
+    const Search = struct {
+        pub const nilo_json = .{ .misfit = 422 };
+        start: Str,
+    };
+    const Plain = struct { start: Str };
+    const handlers = struct {
+        fn search(incoming: Search) Str {
+            return incoming.start;
+        }
+        fn plain(incoming: Plain) Str {
+            return incoming.start;
+        }
+    };
+
+    var said = comptime operation("/search", handlers.search);
+    said.method = .POST;
+    var quiet = comptime operation("/plain", handlers.plain);
+    quiet.method = .POST;
+    try testing.expect(said.misfit);
+    try testing.expect(!quiet.misfit);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try openapi.write(testing.allocator, &w, &.{said}, .{});
+    const doc = buf[0..w.end];
+    // Text that is not JSON is still the 400; JSON of the wrong shape is the 422.
+    try testing.expect(std.mem.indexOf(u8, doc, "\"400\"") != null);
+    try testing.expect(std.mem.indexOf(u8, doc, "\"422\":{\"description\":\"the body is JSON that does not fit") != null);
+
+    w = std.Io.Writer.fixed(&buf);
+    try openapi.write(testing.allocator, &w, &.{quiet}, .{});
+    try testing.expect(std.mem.indexOf(u8, buf[0..w.end], "\"422\"") == null);
 }

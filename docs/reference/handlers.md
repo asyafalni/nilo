@@ -460,6 +460,29 @@ The API document says `additionalProperties: true` for such a type and says noth
 
 **A payload under an externally tagged union** (`{"metrics":{...}}`, with no `nilo_json` on the union) is read by `std.json`, which cannot see the marker, so it stays strict. Give the union a `.tag` to get the marker honoured.
 
+#### Answering JSON of the wrong shape with a 422
+
+**A body that does not fit is a 400, and a type can say that JSON of the wrong shape is a 422 instead**, with `.misfit = 422` ([ADR 251](../adr/251-json-that-does-not-fit-can-be-a-422.md)):
+
+```zig
+const SearchRequest = struct {
+    pub const nilo_json = .{ .unknown_fields = .ignore, .misfit = 422 };
+
+    start_ts_nanos: nilo.Str,
+    limit: u32 = 500,
+};
+```
+
+| the body | without the entry | with `.misfit = 422` |
+|---|---|---|
+| text that is not JSON, empty, or nested past 64 levels | 400 | 400 |
+| JSON with a field missing, a value of the wrong kind, a mistake nested inside a field, a key the type does not know, a key given twice, or not an object | 400 | 422 |
+| a rule a `nilo_check` reports | 422 | 422 |
+
+The sentence is the same either way; only the status moves. It applies wherever the type is read as a body: a typed argument, `c.json(T)`, and `Bound(T)`, where the refusals the binding cannot collect take the type's status and what it does collect is still answered by `b.fail()`. It is read off the type the body is read into: a struct nested inside it is answered for by the body's type. The API document lists a 422 beside the 400 for a typed body argument whose type says it.
+
+Five things are compile errors: `.misfit = 400` (it is the default), any other status, a value that is not a number, and the entry on an enum or on a union with no `.tag`, which `std.json` reads by itself.
+
 #### The marker is not inherited
 
 **The marker is per type.** A struct renames its own fields; a union renames its *variants* and leaves a payload struct's fields to that struct's own marker; a nested struct without a marker keeps its own spelling.

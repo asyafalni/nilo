@@ -341,3 +341,33 @@ The first row is the one the question was about, and the last is the same save i
 **What it changed:** the sentence in the static-files guide and the row in `decided.md` that offered `zig build dev` as a way to restart on a bundle were wrong and were corrected; the guide gained [What a save has to touch](../../docs/guide/getting-started.md#what-triggers-a-restart), and `bench/devloop.py` runs the first two rows against any dev step so the line is a check. It ran clean here in 25 s against `dev-spa`, and again through `--cmd` against the dependent in the last row; a run with the root as the "outside" file fails the way it should. Building that dependent is also what found that the guide's `dev` step dropped `b.args`, so the `-- --incremental` on the same page never reached the runner; the guide's snippet forwards it now.
 
 **Can it go further:** it does not need to. A second path for `nilo-dev` to watch would let a bundle restart the server, and it is the second reading of which files matter that the ADR rejected; the bundler's own dev server with a proxy is the loop for the front end. What the table does not cover is a front end that reaches the binary some way other than `@embedFile`, a generated `.zig` listing the bundle's names say, which would be inside the line by construction and is untested because nothing here does it.
+
+## What SQLite costs a cold build
+
+16 cores (AMD Ryzen 7 9700X), x86_64 Linux, Zig 0.16.0, commit `0635e31` against the working tree that became [ADR 249](../../docs/adr/249-sqlite-is-compiled-releasefast-whatever-the-program-is.md), `-Dtarget=x86_64-linux-gnu`. The question came from photon, whose first `ReleaseSafe` build with `nilo_sql` spent 48 seconds and a gigabyte compiling the amalgamation. Wall and CPU from `wait4` around the whole process, peak RSS its `ru_maxrss`, every cache cold.
+
+The amalgamation alone, `zig build-obj -O <mode> lib/sqlite3.c -cflags -std=c99`, fresh local and global caches:
+
+| mode | wall | CPU | peak RSS | object |
+|---|---|---|---|---|
+| Debug | 5.1 s | 5.0 s | 746 MB | 18,576,368 B |
+| `ReleaseSafe` | 34.3 s | 33.6 s | 1,034 MB | 8,030,024 B |
+| `ReleaseFast` | 19.8 s | 19.4 s | 704 MB | 7,762,128 B |
+
+`ReleaseSafe` is the slow one because it is `-O2` with the undefined-behaviour sanitizer, which `ReleaseFast` does not carry and Debug carries at `-O0`.
+
+Through a program, `zig build example-sqlite` with a fresh `--cache-dir` (the global cache warm, so libc is not in it), before and after interleaved, two runs a side:
+
+| | before | after |
+|---|---|---|
+| Debug, cold | 9.1 s, 8.8 s | 22.1 s, 23.5 s |
+| then `ReleaseSafe`, same cache | 69.8 s, 71.5 s | 31.2 s, 35.2 s |
+| `ReleaseSafe` alone, cold | 71.9 s, 72.6 s | 57.2 s, 57.4 s |
+| peak RSS, `ReleaseSafe` | 1,082 MB, 1,096 MB | 874 MB, 864 MB |
+
+CPU is within a second of wall on every `ReleaseSafe` row, so the C compile and the Zig compile ran one after the other, not side by side.
+
+**What it changed:** SQLite's C is compiled `ReleaseFast` whatever the program is (ADR 249), which trades 14 seconds on a cold Debug build for 15 on a cold `ReleaseSafe` one, 25 on a cold build in both modes, and about 200 MB of peak memory.
+
+**Can it go further:** the `ReleaseSafe` row after the change is the Zig program, not SQLite, and is the compiler's. The 20 seconds left are clang at `-O2` on one 9 MB file and cannot be split; what could move them is a cache that outlives the checkout, which a CI runner keeping `~/.cache/zig` and the project's `.zig-cache` already has.
+

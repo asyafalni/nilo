@@ -250,18 +250,18 @@ const nilo_testing = @import("testing.zig");
 /// A directory with one file in it, written for one test and removed
 /// afterwards. The `Dir` is what a static Set or a Service would hold open.
 const OneFile = struct {
-    tmp: std.testing.TmpDir,
+    tmp: nilo_testing.TmpDir,
     dir: bulkhead.Dir,
 
     const name = "big.bin";
 
     fn init(bytes: []const u8) !OneFile {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = nilo_testing.tmpDir();
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
 
         var path_buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const path = try tmp.path(&path_buf, "");
         return .{ .tmp = tmp, .dir = try bulkhead.Dir.open(path) };
     }
 

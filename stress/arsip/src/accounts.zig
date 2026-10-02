@@ -263,13 +263,11 @@ pub fn migrateFile(gpa: Allocator, path: []const u8) !void {
 
 // ---- tests ----
 //
-// A file database in a temporary directory rather than `:memory:`. The shared
-// in-memory form would work and the guide says which one to write, but a file is
-// what the read-only backstop needs to be real — on an in-memory database
-// SQLite's URI `mode=` beats the flags a reader was opened with, so a `raw` that
-// writes and looks like a read would quietly succeed there and fail in
-// production. Tests that cannot fail the way production does are worse than no
-// tests.
+// A file database in a temporary directory rather than `:memory:`. The
+// in-memory form would work, and its readers refuse a write as a file's do, but
+// only a file runs in WAL, the journal mode production does: an in-memory
+// database answers `memory` to the same pragma. Tests that cannot fail the way
+// production does are worse than no tests.
 
 const testing = std.testing;
 

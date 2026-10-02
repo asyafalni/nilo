@@ -105,6 +105,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
     - [Renamed types are for output only](./handlers.md#renamed-types-are-for-output-only)
     - [Leaf types](./handlers.md#leaf-types)
     - [Skipping the keys a body struct does not know](./handlers.md#skipping-the-keys-a-body-struct-does-not-know)
+    - [Answering JSON of the wrong shape with a 422](./handlers.md#answering-json-of-the-wrong-shape-with-a-422)
     - [The marker is not inherited](./handlers.md#the-marker-is-not-inherited)
   - [`nilo.jsonParseFor`](./handlers.md#nilojsonparsefor)
   - [Unions](./handlers.md#unions)
@@ -142,6 +143,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [`AnyScope`](./core.md#anyscope)
 - [`nilo_core.percent`](./core.md#nilo_corepercent)
 - [The clock](./core.md#the-clock)
+- [`nilo_core.tmpDir`](./core.md#nilo_coretmpdir)
 - [A handler that blocks its thread](./core.md#a-handler-that-blocks-its-thread)
 - [`nilo.spawn` and `app.spawn`](./core.md#nilospawn-and-appspawn)
 
@@ -179,6 +181,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [`testing.Wired`](./testing.md#testingwired)
   - [`testing.Conversation`](./testing.md#testingconversation)
   - [`testing.show`](./testing.md#testingshow)
+  - [`testing.tmpDir`](./testing.md#testingtmpdir)
   - [`testing.Refusals`](./testing.md#testingrefusals)
 
 **[nilo_sql](./sql.md)**: `nilo_sql` talks to Postgres and SQLite through one API: a Row is a struct that names its table, and every statement is fixed while compiling.

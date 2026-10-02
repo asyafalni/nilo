@@ -156,7 +156,10 @@ test "an enum of 1,000 values is read from a query and a body, and listed in the
     try app.post("/pick", pickByBody);
     app.docs(.{ .title = "t", .version = "1" });
 
-    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    // The document lists every value, about 80 KB, past the default 64 KiB:
+    // this test passed on the 200 of an answer cut short until that became
+    // `error.ResponseTooLarge`.
+    var client = try nilo_testing.Client.init(testing.allocator, .{ .response_bytes = 1 << 20 });
     defer client.deinit();
     try answer(&app, &client, "/pick?kind=an_enum_value_with_a_longish_name_0999");
     const posted = try client.post(&app, "/pick", "{\"kind\":\"an_enum_value_with_a_longish_name_0999\"}");

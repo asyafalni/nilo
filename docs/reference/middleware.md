@@ -35,6 +35,7 @@ nilo.allowance.keyed(account, .{ .per_window = 1000,        // …counted agains
 
 nilo.deadline(2000)                                         // how long a route gets
 nilo.maxBody(50 << 20)                                      // how much body it takes
+nilo.maxBody(&limit)                                        // …read from a usize at run time
 ```
 
 ### `nilo.cors`
@@ -196,6 +197,31 @@ try app.with(nilo.maxBody(1024)).post("/sign-in", signIn);
 `listen()`'s `max_body` is one number for every route, but an import and a sign-in need different limits. This is the same argument `nilo.deadline` makes about time, with the same answer: the route decides. It bounds every read into the request arena (`c.body()`, a JSON body, a `Form(T)`, a `Bound(…)` of either), and a `Content-Length` over the limit is a 413 before any byte is read. Lowering the limit works the same way as raising it.
 
 **It does not affect `c.bodyStream()`**, which holds nothing in the arena and has its own `max_bytes` ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)). `maxBody(0)` is a compile error.
+
+**Handed the address of a `usize` instead of a number, it reads the limit from there on each request**, for a limit that comes from configuration: an ingest route whose cap is an environment setting. The variable is a container-level `var` that outlives the App, filled before `listen()`, as `cors.reading`'s `Origins` is:
+
+<!-- compiles -->
+```zig
+var ingest_limit: usize = 16 << 20;
+
+fn ingest(c: *nilo.Ctx) !void {
+    _ = try c.body();
+    try c.sendEmpty(202);
+}
+
+fn ingestRoutes(app: *nilo.App, max_body_bytes: usize) !void {
+    ingest_limit = max_body_bytes;
+    try app.with(nilo.maxBody(&ingest_limit)).post("/v1/logs", ingest);
+}
+```
+
+| | |
+|---|---|
+| `nilo.maxBody(&limit)` | `limit` a `usize`; anything else (a `*u32`, a slice) is a compile error naming both forms |
+| a limit of `0` | `listen()`'s `max_body` applies instead, and a warning is logged once, because a setting left at zero most often means "no limit" |
+| cost | one load and a compare on top of the compile-time form's one store. No allocation, nothing per idle connection |
+
+There is no lock: the number is written before the server starts and read while it runs, and changing it while the server is running is a race with every request in flight.
 
 ## `nilo.accept`
 

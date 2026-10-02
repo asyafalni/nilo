@@ -305,19 +305,19 @@ test "a name is refused by segment, not by substring" {
 /// A directory with one file in it, written for one test and removed
 /// afterwards — what a Service holding a `nilo.Dir` looks like.
 const Files = struct {
-    tmp: std.testing.TmpDir,
+    tmp: nilo_testing.TmpDir,
     dir: bulkhead.Dir,
 
     const there = "invoice-1.pdf";
     const contents = "%PDF-1.7 not really";
 
     fn init() !Files {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = nilo_testing.tmpDir();
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = there, .data = contents });
 
         var path_buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const path = try tmp.path(&path_buf, "");
         return .{ .tmp = tmp, .dir = try bulkhead.Dir.open(path) };
     }
 

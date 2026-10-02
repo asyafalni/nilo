@@ -15,6 +15,9 @@
 //! `trace` is the second (ADR 247): the server reads `traceparent` on the
 //! way in and `nilo_fetch`, a Fitting that cannot name the server, writes it
 //! on the way out.
+//! `tmp` is the third (ADR 250): a test under `http/` and a test under
+//! `sql/` both need the path of a directory of their own, and the second
+//! cannot reach `nilo.testing`. It is the one file here only a test calls.
 //!
 //! **Nothing here needs the event loop**, names an Engine, or knows that
 //! HTTP exists. That is what lets `zig test core/core.zig` run the whole of
@@ -75,6 +78,12 @@ pub const percent = @import("percent.zig");
 
 pub const Limits = @import("limits.zig").Limits;
 
+/// A directory for one test, with the path to it that `std.testing.tmpDir`
+/// does not give ([ADR 250](../docs/adr/250-a-test-directory-hands-back-its-path.md)).
+/// `nilo.testing.tmpDir` is this one.
+pub const tmpDir = @import("tmp.zig").tmpDir;
+pub const TmpDir = @import("tmp.zig").TmpDir;
+
 test {
     _ = @import("str.zig");
     _ = @import("scope.zig");
@@ -82,4 +91,5 @@ test {
     _ = @import("percent.zig");
     _ = @import("limits.zig");
     _ = @import("trace.zig");
+    _ = @import("tmp.zig");
 }

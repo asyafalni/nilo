@@ -275,6 +275,11 @@ pub const Operation = struct {
     /// validate. Not a guess: it is exactly the set of routes with a typed
     /// param, a query struct, or a body.
     can_reject: bool,
+    /// Whether a body that is JSON and not this endpoint's shape is a 422
+    /// rather than the 400, because the body's type says `.misfit = 422`
+    /// ([ADR 251](../docs/adr/251-json-that-does-not-fit-can-be-a-422.md)).
+    /// The 400 stays listed beside it: text that is not JSON is still one.
+    misfit: bool = false,
     /// The `operationId`, when the route was given one with `app.named(…)`.
     /// Null is the derived name below
     /// ([ADR 119](../docs/adr/119-a-route-can-say-its-own-name.md)).
@@ -1223,11 +1228,24 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
     if (op.answer.not_found) {
         try writeFailure(w, "404", "there is no such thing");
     }
+    // One key for both 422s a route can give, because a JSON object read
+    // twice keeps one of them.
     if (op.idempotent) {
-        try writeFailure(w, "422", "this Idempotency-Key was already used for a different request");
+        try writeFailure(w, "422", if (op.misfit) both_422 else both_422[0..reused_key_len]);
+    } else if (op.misfit) {
+        try writeFailure(w, "422", both_422[both_422.len - misfit_len ..]);
     }
     try w.writeAll("}}");
 }
+
+/// The three 422 descriptions, as one string sliced three ways. This writer
+/// is in every program that serves its document, whether or not a route says
+/// `.misfit`, so three literals were 304 stripped bytes on `hello` and one is
+/// what the Idempotency-Key sentence already cost (ADR 251).
+const both_422 = "this Idempotency-Key was already used for a different request, " ++
+    "or the body is JSON that does not fit what this endpoint takes";
+const reused_key_len = "this Idempotency-Key was already used for a different request".len;
+const misfit_len = "the body is JSON that does not fit what this endpoint takes".len;
 
 /// A failure this endpoint's signature promises, carrying the shape every
 /// failure nilo assembles has (ADR 024).
@@ -2056,4 +2074,44 @@ test "openness is the type's own: a strict struct holding an open one says nothi
     try expectSchema(Outer,
         \\{"type":"object","properties":{"inner":{"type":"object","properties":{"id":{"type":"integer","minimum":0}},"required":["id"],"additionalProperties":true}},"required":["inner"]}
     );
+}
+
+test "a route that can answer 422 two ways lists it once, saying both" {
+    const Body = struct { id: u32 };
+    const ops = comptime [_]Operation{
+        .{
+            .method = .POST,
+            .pattern = "/orders",
+            .params = &.{},
+            .query = &.{},
+            .body = schemaOf(Body),
+            .answer = .{ .status = 200, .content_type = "application/json", .schema = schemaOf(Body) },
+            .can_reject = true,
+            .idempotent = true,
+            .misfit = true,
+        },
+        .{
+            .method = .POST,
+            .pattern = "/search",
+            .params = &.{},
+            .query = &.{},
+            .body = schemaOf(Body),
+            .answer = .{ .status = 200, .content_type = "application/json", .schema = schemaOf(Body) },
+            .can_reject = true,
+            .misfit = true,
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(testing.allocator, &out.writer, &ops, .{});
+    const doc = out.written();
+
+    // A JSON object holding the key twice keeps one of them, so the two
+    // reasons share a key on the route that has both (ADR 251).
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, doc, "\"422\":"));
+    try testing.expect(std.mem.indexOf(u8, doc, "different request, or the body is JSON that does not fit") != null);
+    try testing.expect(std.mem.indexOf(u8, doc, "\"description\":\"the body is JSON that does not fit") != null);
+    // Text that is not JSON is still a 400 on both.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, doc, "\"400\":"));
 }

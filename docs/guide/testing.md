@@ -2,7 +2,7 @@
 
 **A handler is tested by calling it; a handler that writes its own answer is tested through a test client with no server and no socket.**
 
-**Reference:** [`nilo.testing.Client`](../reference/testing.md#testingclient), [`Wired`](../reference/testing.md#testingwired) · **Design:** [Testing](../design/testing.md)
+**Reference:** [`nilo.testing.Client`](../reference/testing.md#testingclient), [`Wired`](../reference/testing.md#testingwired), [`tmpDir`](../reference/testing.md#testingtmpdir) · **Design:** [Testing](../design/testing.md)
 
 ## Testing a handler by calling it
 
@@ -165,7 +165,9 @@ try testing.expectEqual(@as(u16, 201), answer.status);
 
 `Client` is still there for a test that needs two clients against one App: two addresses, two cookie jars.
 
-Use `Client.init(gpa, .{ .response_bytes = 1 << 20 })` for a stream that produces a lot. A response that doesn't fit is cut short instead of failing.
+Use `Client.init(gpa, .{ .response_bytes = 1 << 20 })` for a stream that produces a lot. **A response that does not fit is `error.ResponseTooLarge`** from the call that sent the request, where it used to be cut short with its status intact, so a 200 with half a body passed every assertion on the status.
+
+**What `listen()` would have set, a test sets on the App.** A Client never calls `listen()`, so the App has the default limits; `wired.app.limits.max_body = 4096` is what `listen(.{ .max_body = 4096 })` copies there, and `max_in_flight` and `request_deadline_ms` sit beside it. `app.session_key` is the same kind of field ([Sessions](./sessions.md)).
 
 None of this is on the request path, and none of it exists in a running server.
 
@@ -200,13 +202,13 @@ const Stack = struct {
     app: nilo.App,
     client: nilo.testing.Client,
 
-    fn open(gpa: std.mem.Allocator, comptime name: []const u8) !*Stack {
+    fn open(gpa: std.mem.Allocator) !*Stack {
         const self = try gpa.create(Stack);
         self.* = .{
             .threaded = .init(gpa, .{}),
-            // One database the whole pool shares, gone when the last
-            // connection closes. A name per test keeps tests apart.
-            .db = Db.init(gpa, "file:test-" ++ name ++ "?mode=memory&cache=shared", .{ .size = 2 }),
+            // One database the whole pool shares and no other test sees,
+            // gone when the pool closes.
+            .db = Db.init(gpa, ":memory:", .{ .size = 2 }),
             .app = nilo.App.init(gpa),
             .client = try nilo.testing.Client.init(gpa, .{}),
         };
@@ -229,9 +231,28 @@ const Stack = struct {
 };
 ```
 
-It is heap-allocated because the App holds a pointer to the Db and the client hands out a `Ctx` pointing at the App, so none of the three may move. A bare `:memory:` is refused when the pool opens it: a pool of them is several separate empty databases, with writes going to one and reads finding nothing ([SQLite](./sql/sqlite.md#the-database-filename)).
+It is heap-allocated because the App holds a pointer to the Db and the client hands out a `Ctx` pointing at the App, so none of the three may move. `:memory:` is a database private to the pool that opens it, so every test gets an empty one without naming it, and tests running side by side cannot see each other's rows; a `file:NAME?mode=memory&cache=shared` URL is shared by every pool on that name ([SQLite](./sql/sqlite.md#the-database-filename)).
 
 A program on Postgres tests against Postgres. `sql/live.zig` shows how this repository does it: the URL comes from `DATABASE_URL` through `build.zig`, and every test skips when there is none, so the everyday loop never needs a server running. Where `$CI` is set, a missing URL fails the build instead, so losing the variable cannot turn the suite green ([ADR 239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)).
+
+### A file opened by its path
+
+**A test that needs a real file, a SQLite database in WAL, a socket, a directory to serve, takes a directory of its own from `nilo.testing.tmpDir()` and asks it for the path.** `std.testing.tmpDir` gives a `Dir` and no path, and the one it uses is not documented ([ADR 250](../adr/250-a-test-directory-hands-back-its-path.md)):
+
+```zig
+test "a write waits on a lock another connection holds" {
+    var tmp = nilo.testing.tmpDir();
+    defer tmp.cleanup(); // the directory and the database in it
+
+    var buf: [128]u8 = undefined;
+    const url = try tmp.path(&buf, "app.db");
+    var db: Db = .init(testing.allocator, url, .{ .size = 2 });
+    defer db.deinit();
+    // ...
+}
+```
+
+The path goes into a buffer you hold, or into an allocator with `tmp.pathAlloc(gpa, "app.db")`, and nothing points back into `tmp`, so a fixture can take it in `init` and return the `TmpDir` by value. An empty name is the directory itself, for `app.static`. Use a file rather than `mode=memory` when the test is about locking, WAL or `Locked`: an in-memory database answers `memory` to `PRAGMA journal_mode = WAL` and never takes the locks a file does ([ADR 065](../adr/065-one-writer-is-not-a-setting-it-is-the-database.md)).
 
 ## Running the suite
 

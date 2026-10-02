@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| `testing.Client.init(gpa, .{ .response_bytes = 64 * 1024 })` | |
+| `testing.Client.init(gpa, .{ .response_bytes = 64 * 1024 })` | an answer larger than this is `error.ResponseTooLarge` |
 | `.{ .client_address = "203.0.113.7" }` | what `c.peer()` and `c.clientIp()` return |
 | `.{ .cookies = true }` | keeps the cookies responses set and sends them back, like a browser's cookie jar. Off by default |
 | `client.get(&app, path)` / `post(&app, path, body)` | |
@@ -58,6 +58,7 @@ const answer = try wired.post("/partners", body);
 |---|---|
 | `Wired.init(gpa, options)` | the same `Options` a `Client` takes |
 | `wired.app` | a plain `App`: every registration call is the one documented in [The App](./app.md) |
+| `wired.app.limits.max_body = 4096` | what `listen(.{ .max_body = 4096 })` would have copied onto the App; `max_in_flight` and `request_deadline_ms` likewise |
 | `wired.get(path)` / `post(path, body)` / `postWith(…)` / `request(…)` | the `Client` calls, without the `&app` |
 | `wired.sendRequest(r)` / `send(raw)` / `setHeader(n, v)` / `cookie(n)` | likewise |
 | `wired.io()` | the `std.Io` a handler gets from `c.io()` or an `io: std.Io` argument in a test: a process-wide `std.Io.Threaded`. Start a writer fiber on it with `io.concurrent`; `Wired` cannot run `app.spawn` ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
@@ -108,6 +109,30 @@ errdefer std.debug.print("row: {f}\n", .{nilo.testing.show(row)});
 `show(value)` renders the value as JSON into whatever writer is formatting it, using the rendering nilo already has for its own types: a `Uuid` is text, a `Str` is a string, and a `Timestamp` is RFC 3339. **Nothing is allocated**, which is why it can sit inside a `std.debug.print` while you are debugging. For an actual `[]const u8`, `std.fmt.allocPrint(gpa, "{f}", .{nilo.testing.show(v)})` needs nothing extra.
 
 It is a renderer, not an assertion, on purpose. An `expectEqual` of nilo's own would drag in `expectEqualDeep`, `expectEqualSlices` and `expectError`, and it would not have helped the failure that prompted this, which was an `expectError` finding a payload, not two values that differed. A `Json(T)` column nests JSON inside the JSON, which reads well but is not meant to be parsed back.
+
+### `testing.tmpDir`
+
+**A directory of its own for one test, and the path to a file in it**, for code that opens a file by name: a SQLite database, a socket, a directory `app.static` serves ([ADR 250](../adr/250-a-test-directory-hands-back-its-path.md)). `std.testing.tmpDir` gives a `Dir` and no path.
+
+```zig
+var tmp = nilo.testing.tmpDir();
+defer tmp.cleanup();
+
+var buf: [128]u8 = undefined;
+const url = try tmp.path(&buf, "app.db");
+var db: Db = .init(gpa, url, .{ .size = 2 });
+```
+
+| | |
+|---|---|
+| `nilo.testing.tmpDir()` | `TmpDir`: a new directory under `.zig-cache/tmp/`, open. Always iterable, so listing it cannot panic the way std's does without `.iterate = true` |
+| `tmp.dir` | the open `std.Io.Dir`, for writing a file in by handle |
+| `tmp.path(buf, name)` | `![:0]u8`: the path of `name` in the directory, written into `buf` and zero-terminated. `error.NoSpaceLeft` when `buf` is too short |
+| `tmp.pathAlloc(gpa, name)` | `![:0]u8`: the same path in memory the caller frees |
+| `tmp.path(buf, "")` | the directory itself, which is what `app.static` takes. `TmpDir.dir_path_len` is its length |
+| `tmp.cleanup()` | closes the directory and removes it with everything in it |
+
+**No path points into the `TmpDir`**, so a fixture can take a path in its `init` and return the `TmpDir` by value. The path is relative to the working directory, as std's directory is. It is `nilo_core.tmpDir`, so a test in `nilo_sql` or any module that cannot name `nilo_http` has the same one.
 
 ### `testing.Refusals`
 

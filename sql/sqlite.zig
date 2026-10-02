@@ -32,7 +32,15 @@
 //! `db.raw`, where the text is the caller's, it is a guess — and a guess that
 //! goes the wrong way lands on a connection SQLite itself will not let write.
 //! The failure is loud, immediate, and names the connection; the alternative
-//! designs fail by being slow or by being wrong.
+//! designs fail by being slow or by being wrong. The net is two strands, the
+//! read-only open flag and `PRAGMA query_only`, because SQLite's URI `mode=`
+//! outranks the flag and an in-memory database, where a suite runs, would
+//! otherwise have none.
+//!
+//! **`:memory:` is one database for the whole pool and private to it.** On
+//! its own SQLite gives each connection a private one, which would make a
+//! pool several empty databases; `open` turns it into a shared-cache name no
+//! other pool in the process has (ADR 065).
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -171,6 +179,35 @@ fn resolve(comptime opts: Options) Settled {
         .cache_kib = opts.cache_kib,
         .synchronous = opts.synchronous,
     };
+}
+
+/// How many `:memory:` pools this process has opened, which is what keeps
+/// them apart.
+///
+/// **At file scope rather than inside `Wire`**, because `Wire` is a function
+/// of its options: `sql.Sqlite` and `sql.SqliteNamed("cache", …)` are two
+/// types, and a counter in each would hand both of them `0`, one database
+/// under two names. Atomic because tests in one process open pools from
+/// several threads at once, and monotonic because all a name needs is to be
+/// unequal to every other.
+var memory_pools: std.atomic.Value(usize) = .init(0);
+
+/// The shared-cache name a `:memory:` pool opens, written into the buffer
+/// `open` already has for the path, so the name costs no allocation and has
+/// no owner to outlive the Db: SQLite keys the database by it while a
+/// connection is open, and nothing reads it after.
+///
+/// The counter's address goes in beside its value, so two copies of this
+/// module linked into one program, each counting from zero, still cannot
+/// meet. A caller's own `file:NAME?mode=memory&cache=shared` is untouched and
+/// still shared by name, which is what that spelling is for.
+fn privateMemoryName(buf: []u8) [:0]const u8 {
+    const n = memory_pools.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrintZ(
+        buf,
+        "file:nilo-memory-{x}-{d}?mode=memory&cache=shared",
+        .{ @intFromPtr(&memory_pools), n },
+    ) catch unreachable;
 }
 
 pub fn Wire(comptime opts_in: Options) type {
@@ -574,13 +611,23 @@ pub fn Wire(comptime opts_in: Options) type {
         /// Postgres Wire has no such declaration and is taken to dial.
         pub const dials_on_open = false;
 
+        /// `:memory:` opens a database the pool shares and nobody else does:
+        /// its writer and readers see one another, and a second pool on
+        /// `:memory:`, in this test or the one running beside it, gets a
+        /// database of its own (`privateMemoryName`). It goes when the pool
+        /// closes, as SQLite's own `:memory:` goes with its connection.
+        ///
+        /// **An empty URL is refused.** SQLite would give each connection a
+        /// private temporary database, which is a pool of several empty ones,
+        /// and an empty URL is far more often a setting that was never set
+        /// than a choice; `:memory:` is how the choice is spelled.
         pub fn open(
             io: std.Io,
             gpa: std.mem.Allocator,
             url: []const u8,
             open_opts: wire.OpenOpts,
         ) !Self {
-            if (isBarePrivateMemory(url)) return error.PrivateMemoryDatabase;
+            if (url.len == 0) return error.EmptyDatabaseUrl;
 
             const size = @max(open_opts.size, 2);
             const conns = try gpa.alloc(Conn, size);
@@ -588,7 +635,10 @@ pub fn Wire(comptime opts_in: Options) type {
 
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             if (url.len >= path_buf.len) return error.PathTooLong;
-            const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{url}) catch return error.PathTooLong;
+            const path = if (std.mem.eql(u8, url, ":memory:"))
+                privateMemoryName(&path_buf)
+            else
+                std.fmt.bufPrintZ(&path_buf, "{s}", .{url}) catch return error.PathTooLong;
 
             var made: usize = 0;
             errdefer for (conns[0..made]) |*conn| conn.deinit(gpa);
@@ -621,10 +671,18 @@ pub fn Wire(comptime opts_in: Options) type {
         /// **The writer sets the journal mode and a reader does not**, because
         /// `journal_mode = WAL` is a write to the database header and a
         /// read-only connection cannot make one.
+        ///
+        /// **A reader also gets `query_only`**, the half of the backstop that
+        /// holds in memory: SQLite's URI `mode=memory` outranks the read-only
+        /// open flag, so without it a reader on `:memory:` writes (check 6c
+        /// of `spike/sqlite_facts`), and a `raw` routed there by mistake
+        /// would succeed on the connection meant to refuse it (ADR 065).
         fn prime(conn: zqlite.Conn, writer: bool) !void {
             var buf: [64]u8 = undefined;
 
             try conn.busyTimeout(@intCast(opts.busy_timeout_ms));
+
+            if (!writer) try conn.execNoArgs("PRAGMA query_only = ON");
 
             if (writer) {
                 try conn.execNoArgs("PRAGMA journal_mode = WAL");
@@ -643,19 +701,6 @@ pub fn Wire(comptime opts_in: Options) type {
                     std.fmt.bufPrintZ(&buf, "PRAGMA cache_size = -{d}", .{kib}) catch unreachable,
                 );
             }
-        }
-
-        /// `:memory:` on its own is private to the connection that opened it,
-        /// so a pool of one writer and several readers opened on it would be
-        /// *several separate empty databases* — writes going to one and reads
-        /// finding nothing, which reads as a bug in the caller's code.
-        ///
-        /// Refused rather than worked around, because the shared form is a
-        /// different string and the caller has to know which one they have:
-        /// `file:name?mode=memory&cache=shared` is one database, and it lives
-        /// only as long as a connection to it does.
-        fn isBarePrivateMemory(url: []const u8) bool {
-            return std.mem.eql(u8, url, ":memory:") or url.len == 0;
         }
 
         pub fn close(self: *Self) void {
@@ -1852,8 +1897,9 @@ fn withIoPair(comptime body: fn (std.Io) anyerror!void) !void {
 /// connections — the form check 2 of `spike/sqlite_facts` confirmed is one
 /// database rather than several.
 ///
-/// Each test names its own, because a shared in-memory database is keyed by
-/// that name and two tests on one name would be one database.
+/// `:memory:` is a database nobody else has. A test that names its own,
+/// `file:NAME?mode=memory&cache=shared`, shares it with any other test on the
+/// same name while both are open, so each name here is used once.
 fn openTest(io: std.Io, name: [:0]const u8, size: u16) !TestWire {
     return TestWire.open(io, testing.allocator, name, .{ .size = size });
 }
@@ -1862,18 +1908,10 @@ test "the sqlite wire satisfies the contract" {
     comptime wire.assertWire(TestWire);
 }
 
-test "a bare :memory: is refused, because a pool of them is several databases" {
+test "an empty database URL is refused, because it is a setting nobody set" {
     try withIo(struct {
         fn run(io: std.Io) !void {
-            try testing.expectError(
-                error.PrivateMemoryDatabase,
-                openTest(io, ":memory:", 4),
-            );
-            // The shared form is the one that works, and the message the
-            // caller gets has to name it — otherwise the fix is a search
-            // rather than a read.
-            var w = try openTest(io, "file:refused-check?mode=memory&cache=shared", 2);
-            w.close();
+            try testing.expectError(error.EmptyDatabaseUrl, openTest(io, "", 4));
         }
     }.run);
 }
@@ -2477,20 +2515,17 @@ test "a reader refuses a write, which is what makes routing safe to get wrong" {
     // which is how that was found; check 6c of `spike/sqlite_facts` is where
     // it is pinned.
     //
-    // So the backstop exists on a file and does not exist in memory — one more
-    // thing a suite running entirely in memory would never have tested.
-    var tmp = std.testing.tmpDir(.{});
+    // So the flag holds on a file and not in memory, which is why a reader
+    // also gets `query_only`, tested on `:memory:` at the bottom of this file.
+    // WAL, below, is still one more thing a suite running entirely in memory
+    // would never have tested.
+    tmp = core.tmpDir();
     defer tmp.cleanup();
-    tmp_sub_path = tmp.sub_path;
 
     try withIo(struct {
         fn run(io: std.Io) !void {
             var path: [96]u8 = undefined;
-            const url = try std.fmt.bufPrintZ(
-                &path,
-                ".zig-cache/tmp/{s}/roles.db",
-                .{tmp_sub_path},
-            );
+            const url = try tmp.path(&path, "roles.db");
 
             var w = try openTest(io, url, 4);
             defer w.close();
@@ -2524,14 +2559,13 @@ test "a write that waits past busy_timeout on a lock another program holds answe
     // With one writer in the pool, a lock held elsewhere is another program
     // on the same file, and only a file can have one: `busy_timeout` counts
     // down and the write answers `Locked`, the word Postgres's `55P03` gets.
-    var tmp = std.testing.tmpDir(.{});
+    tmp = core.tmpDir();
     defer tmp.cleanup();
-    tmp_sub_path = tmp.sub_path;
 
     try withIo(struct {
         fn run(io: std.Io) !void {
             var path: [96]u8 = undefined;
-            const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/busy.db", .{tmp_sub_path});
+            const url = try tmp.path(&path, "busy.db");
             const Quick = Wire(.{ .threading = .in_fiber, .busy_timeout_ms = 50 });
             var w = try Quick.open(io, testing.allocator, url, .{ .size = 2 });
             defer w.close();
@@ -2577,10 +2611,10 @@ test "each SQLite failure a caller branches on has the name the Postgres one has
     for (cases) |case| try testing.expectEqual(case[1], translate(conn, case[0]));
 }
 
-/// Where `std.testing.tmpDir` put the directory the test above uses. A file
-/// rather than a shared in-memory database, and the path has to reach a
-/// closure `withIo` calls as a plain function.
-var tmp_sub_path: [@typeInfo(@FieldType(std.testing.TmpDir, "sub_path")).array.len]u8 = undefined;
+/// The directory the two tests above put their file in. A file rather than a
+/// shared in-memory database, and the directory has to reach a closure
+/// `withIo` calls as a plain function.
+var tmp: core.TmpDir = undefined;
 
 test "each constraint a caller branches on arrives under its own name" {
     // Item 55: `23503` used to arrive as `ConstraintViolated` beside a check
@@ -2875,6 +2909,90 @@ test "an old broken key in a table a rebuild never touched does not fail the reb
             _ = try tx.exec(a, "DROP TABLE p", .{}, null, null);
             _ = try tx.exec(a, "ALTER TABLE p_new RENAME TO p", .{}, null, null);
             try testing.expectError(error.ForeignKeyViolated, tx.commit(a, null));
+        }
+    }.run);
+}
+
+test "two pools on :memory: are two databases, and each is one database across its own pool" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            const gpa = testing.allocator;
+            var a = try openTest(io, ":memory:", 3);
+            defer a.close();
+            // A second type of Wire as well as a second pool: the counter
+            // lives outside `Wire`, or each type would count from zero and
+            // the two would meet under one name.
+            var b = try Wire(.{ .threading = .in_fiber, .busy_timeout_ms = 1 }).open(
+                io,
+                gpa,
+                ":memory:",
+                .{ .size = 2 },
+            );
+            defer b.close();
+
+            _ = try a.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+            _ = try a.exec(gpa, "INSERT INTO t(id) VALUES (7)", .{}, null, null);
+
+            // The writer's row through a reader: one database, not three.
+            var rows = try a.run(gpa, "SELECT id FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(rows.at != 0);
+            try testing.expect(try a.next(&rows));
+            try testing.expectEqual(@as(i64, 7), try a.read(&rows, i64, 0));
+
+            // And nothing of it in the other pool, which is the property a
+            // suite running its tests side by side needs.
+            var tables = try b.run(gpa, "SELECT count(*) FROM sqlite_master", .{}, null, null);
+            defer tables.close();
+            try testing.expect(try b.next(&tables));
+            try testing.expectEqual(@as(i64, 0), try b.read(&tables, i64, 0));
+        }
+    }.run);
+}
+
+test "a reader on :memory: refuses a write, though mode=memory outranks the read-only flag" {
+    // The test on a file shows the flag holding; this is the database the
+    // flag does not hold on, and `query_only` is what refuses here.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, ":memory:", 3);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+            for (w.conns[1..]) |conn| {
+                try testing.expectError(
+                    error.ReadOnly,
+                    conn.handle.execNoArgs("INSERT INTO t(id) VALUES (99)"),
+                );
+            }
+
+            // And through the routing it backs: a write that reads as a read
+            // lands on a reader and is refused rather than kept.
+            var rows = try w.run(gpa, "PRAGMA user_version = 3", .{}, null, null);
+            defer rows.close();
+            try testing.expect(rows.at != 0);
+            try testing.expectError(error.QueryFailed, w.next(&rows));
+        }
+    }.run);
+}
+
+test "a name given to a shared in-memory database is still shared by every pool that gives it" {
+    // `:memory:` is the private spelling; a caller's own name keeps meaning
+    // what SQLite says it means, so two pools can share on purpose.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            const gpa = testing.allocator;
+            var a = try openTest(io, "file:shared-on-purpose?mode=memory&cache=shared", 2);
+            defer a.close();
+            var b = try openTest(io, "file:shared-on-purpose?mode=memory&cache=shared", 2);
+            defer b.close();
+
+            _ = try a.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+            var tables = try b.run(gpa, "SELECT count(*) FROM sqlite_master", .{}, null, null);
+            defer tables.close();
+            try testing.expect(try b.next(&tables));
+            try testing.expectEqual(@as(i64, 1), try b.read(&tables, i64, 0));
         }
     }.run);
 }

@@ -212,7 +212,10 @@ pub const App = struct {
     bound_port: std.atomic.Value(u16) = .init(0),
     /// The part of `listen()`'s options a request reads rather than the
     /// socket, copied out once when the server starts. Defaults stand for
-    /// an App a test drives directly, which never calls `listen()`.
+    /// an App a test drives directly, which never calls `listen()`; a test
+    /// that wants another `max_body`, `max_in_flight` or deadline sets the
+    /// field, `wired.app.limits.max_body = 4096`, the way it sets
+    /// `session_key`.
     limits: Limits = .{},
     /// How much of a connection's request arena survives between requests,
     /// from `listen(.{ .arena_keep = … })`. Held here rather than read from

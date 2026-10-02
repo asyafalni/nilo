@@ -6,7 +6,7 @@
 //! the driver's rather than the kernel's. `.in_fiber` runs the statement on
 //! the thread that asked, so no hop to another thread lands in the count
 //! (ADR 064). The database is shared memory, `file:…?mode=memory&cache=shared`,
-//! because a bare `:memory:` is refused.
+//! because the refs this is compared against refuse a bare `:memory:`.
 //!
 //! The table is made with `db.exec` and written-out DDL rather than
 //! `migrate.createMissing`, whose signature changed at v0.5.0 and which

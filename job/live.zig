@@ -64,12 +64,12 @@ const Fixture = struct {
     db: SqliteDb,
     run: core.Run,
 
-    fn open(name: []const u8) !*Fixture {
+    /// `:memory:` is a database this fixture's pool has to itself, so no
+    /// two tests share a queue whatever order they run in.
+    fn open() !*Fixture {
         const f = try testing.allocator.create(Fixture);
         f.threaded = .init(testing.allocator, .{});
-        const url = try std.fmt.allocPrint(testing.allocator, "file:{s}?mode=memory&cache=shared", .{name});
-        defer testing.allocator.free(url);
-        f.db = .init(testing.allocator, url, .{ .size = 2, .unchecked = true });
+        f.db = .init(testing.allocator, ":memory:", .{ .size = 2, .unchecked = true });
         f.run = .init(testing.allocator);
         try f.db.nilo_start(f.threaded.io(), .off);
         try sql.migrate.createMissing(&f.db, &f.run, .{ .tables = &.{ SqliteTable.Row, Note } });
@@ -85,7 +85,7 @@ const Fixture = struct {
 };
 
 test "on SQLite a row is pushed, claimed once, and finished" {
-    const f = try Fixture.open("job-claim");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -109,7 +109,7 @@ test "on SQLite a row is pushed, claimed once, and finished" {
 }
 
 test "on SQLite a unique key is the index, and is free again once the row is finished" {
-    const f = try Fixture.open("job-unique");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -131,7 +131,7 @@ test "on SQLite a unique key is the index, and is free again once the row is fin
 }
 
 test "on SQLite cancel deletes a queued row and leaves one a worker holds" {
-    const f = try Fixture.open("job-cancel");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -147,7 +147,7 @@ test "on SQLite cancel deletes a queued row and leaves one a worker holds" {
 }
 
 test "on SQLite pushIn commits with the transaction and rolls back with it" {
-    const f = try Fixture.open("job-tx");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -173,7 +173,7 @@ test "on SQLite pushIn commits with the transaction and rolls back with it" {
 }
 
 test "a Jobs over a SQLite table runs a job that writes through the same Db, and keeps a status" {
-    const f = try Fixture.open("job-e2e");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -333,7 +333,7 @@ test "on SQLite the claim takes the most urgent due row, not the oldest" {
     // rather than `ANY`, the i16 priority mapped back through RETURNING — so
     // the order and the narrowing are worth asserting on both, not just on
     // whichever one the harness reaches.
-    const f = try Fixture.open("job-priority");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -352,7 +352,7 @@ test "on SQLite the claim takes the most urgent due row, not the oldest" {
 }
 
 test "on SQLite a kind this program does not know is left in the queue" {
-    const f = try Fixture.open("job-foreign");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -413,7 +413,7 @@ fn lapsedLease(table: anytype, run: *core.Run) !void {
 }
 
 test "on SQLite a worker whose lease lapsed cannot touch the row a second worker holds" {
-    const f = try Fixture.open("job-fence");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
     try lapsedLease(&table, &f.run);
@@ -427,7 +427,7 @@ test "on Postgres a worker whose lease lapsed cannot touch the row a second work
 }
 
 test "on SQLite unkey frees the key of a running row and leaves it running" {
-    const f = try Fixture.open("job-unkey");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 
@@ -458,7 +458,7 @@ fn claimSql() []const u8 {
 }
 
 test "a row pushed in a transaction has no status before a worker takes it, and none after a rollback" {
-    const f = try Fixture.open("job-tx-status");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
     var store = try cache.open(testing.allocator, .{ .bytes = 1 << 20 });
@@ -513,7 +513,7 @@ const TickJobs = job.Jobs(.{
 });
 
 test "on SQLite retryDead refuses a dead row of a scheduled kind, so the schedule keeps one chain" {
-    const f = try Fixture.open("job-retry-scheduled");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
     var jobs: TickJobs = .open(testing.allocator, &table, .{ .db = &f.db }, .{});
@@ -539,7 +539,7 @@ test "on SQLite retryDead refuses a dead row of a scheduled kind, so the schedul
 }
 
 test "on SQLite an empty unique key is refused before it reaches the index" {
-    const f = try Fixture.open("job-empty-unique");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
     try testing.expectError(error.EmptyUniqueKey, table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "" }));
@@ -547,7 +547,7 @@ test "on SQLite an empty unique key is refused before it reaches the index" {
 }
 
 test "on SQLite a row's created_at is the time of the push and finished_at the injected clock" {
-    const f = try Fixture.open("job-times");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
     var jobs: TickJobs = .open(testing.allocator, &table, .{ .db = &f.db }, .{});
@@ -565,7 +565,7 @@ test "on SQLite a row's created_at is the time of the push and finished_at the i
 }
 
 test "on SQLite retryDead takes the scheduled kinds it is told, and created_at is the push time" {
-    const f = try Fixture.open("job-store-times");
+    const f = try Fixture.open();
     defer f.close();
     var table = SqliteTable.open(&f.db);
 

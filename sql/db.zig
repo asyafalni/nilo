@@ -10653,10 +10653,10 @@ test "a read inside a transaction that has written sees the write, because it go
     // database: there a read sent down the pool by mistake waits on the
     // writer's table lock with nothing to bound it, and the test would hang
     // where it should fail. Here it reads its own snapshot and counts one.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = core.tmpDir();
     defer tmp.cleanup();
     var path: [96]u8 = undefined;
-    const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/tx-reads.db", .{tmp.sub_path});
+    const url = try tmp.path(&path, "tx-reads.db");
     var db: SqliteDb = .init(testing.allocator, url, .{ .size = 2, .unchecked = true });
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -10772,10 +10772,10 @@ test "on SQLite, rawExplain inside a transaction does not wait for the writer th
     defer run.deinit();
     // A file in WAL, as the test above says: a reader of a shared in-memory
     // database waits on the writer's table lock with nothing to bound it.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = core.tmpDir();
     defer tmp.cleanup();
     var path: [96]u8 = undefined;
-    const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/explain.db", .{tmp.sub_path});
+    const url = try tmp.path(&path, "explain.db");
     var db: SqliteDb = .init(testing.allocator, url, .{ .size = 2, .unchecked = true });
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);

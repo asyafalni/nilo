@@ -42,6 +42,8 @@ The rule: **a per-field failure needs a field to fail.** Everything else is abou
 - **A field the endpoint has never heard of.** It is not one of `T`'s fields, so there is nowhere to record it.
 - **A mistake nested inside a field.** `describeField` names it down to eight levels (`address.street`), the same limit `openapi.schemaOf` and `str.stamp` use because a type holding one of its own has to stop somewhere.
 
+Hard means the handler never sees it, not that the status is fixed. A JSON body whose type says `.misfit = 422` answers the ones that are JSON of the wrong shape (a body that is not an object, an unknown key, a nested mistake) with that 422 instead, and text that is not JSON stays the 400 ([ADR 251](./251-json-that-does-not-fit-can-be-a-422.md)).
+
 ### The walk says when it hit its own ceiling
 
 The eight-level walk used to go silent exactly where it ran out of room: a shape past the ceiling produced the same bare `{"error":"Bad Request","status":400}` as text that was not JSON at all, throwing away everything the framework did know (that the JSON parsed, that it was an object, that the shape is wrong somewhere below a known depth).

@@ -4,7 +4,7 @@
 
 **Guide:** [Testing](../guide/testing.md) · **Reference:** [Testing](../reference/testing.md#testing)
 
-The code is `http/testing.zig` (`Client`, `Wired`, `Answer`, `Refusals`, `show`), `http/wiring.zig` (`program_mode`, `checkRootWiring`), and `refusals/` together with the tables in `build.zig`.
+The code is `http/testing.zig` (`Client`, `Wired`, `Answer`, `Refusals`, `show`), `core/tmp.zig` (`tmpDir`, which `nilo.testing` re-exports), `http/wiring.zig` (`program_mode`, `checkRootWiring`), and `refusals/` together with the tables in `build.zig`.
 
 ## Overview
 
@@ -28,6 +28,8 @@ nilo.testing.Refusals.begin() ──► fail.status(...) ──► refusals.caug
 nilo.testing.show(value) ──► {f} in std.debug.print / errdefer                  (ADR 137)
 
 wiring.program_mode ──► checkRootWiring() and Client.init() ──► std.log.warn    (ADR 069)
+
+nilo.testing.tmpDir() ──► tmp.path(&buf, "app.db") ──► SQLite, app.static, a socket   (ADR 250)
 ```
 
 From the outside, a check that has only ever passed looks exactly like a check that cannot fail. The left column exists because the compiler keeps nothing from a failed build; the right column exists because a body, a status and whether an answer is current all look fine right up until they are not.
@@ -50,6 +52,7 @@ From the outside, a check that has only ever passed looks exactly like a check t
 14. **`nilo.testing.show` renders a value as JSON into whatever is formatting it**, for `{f}` in an `errdefer` or a plain `std.debug.print`, because `std.testing.expectEqual` prints with `{any}` and never calls a type's own formatter. [ADR 137](../adr/137-a-failed-assertion-that-can-be-read.md)
 15. **A test suite whose database will not connect passes, not fails.** `nilo_start`'s connection diagnostics log at `warn`. A `Row` that disagrees with its table still logs at `err`, because that is a broken program, not a machine without a database running. [ADR 145](../adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)
 16. **This repository's live SQL tests skip on a laptop and fail on CI.** With `$CI` set and no `DATABASE_URL`, `test-sql` fails before it runs. Every live connection carries `lock_timeout` and `idle_in_transaction_session_timeout` of ten seconds in its URL, and a test that ends with a connection still out fails naming it, so a leaked transaction costs a test rather than a hung run. [ADR 239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)
+17. **`nilo.testing.tmpDir()` hands back a directory and the path to a file in it**, into a buffer or an allocator the caller holds, so a `TmpDir` can move without a path pointing at the copy it moved from. It is always iterable, and it lives in Core because `sql/`'s tests need it too and cannot reach `nilo.testing`. [ADR 250](../adr/250-a-test-directory-hands-back-its-path.md)
 
 ## Decisions
 
@@ -65,6 +68,7 @@ From the outside, a check that has only ever passed looks exactly like a check t
 | [147](../adr/147-a-response-is-read-back-the-way-it-was-written.md) | `Answer.bytes`/`.json`, and `Wired` for building an `App` and a `Client` together |
 | [171](../adr/171-an-answer-knows-which-request-it-was.md) | `Answer` records a generation, so reading a stale answer is `error.AnswerStale` instead of the wrong body |
 | [239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md) | This repository's live SQL tests skip without a URL, fail the build on CI without one, and give up on a leaked transaction after ten seconds |
+| [250](../adr/250-a-test-directory-hands-back-its-path.md) | `tmpDir` in Core, with a path into the caller's buffer or allocator, always iterable |
 
 Related topics: the second `Content-Length` and second `Host` that turn a hand-built test request into a 400 are [ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md) (http1-protocol); `clearCookie`'s `Max-Age` is [ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md) (cookies-sessions); the four-axis budget every check here is measured against is [ADR 017](../adr/017-the-trade-budget-has-four-axes.md) (principles); a handler that blocks the thread, which the watchdog catches instead of a refusal file, is [ADR 013](../adr/013-handlers-must-not-block-the-thread.md) (engine).
 

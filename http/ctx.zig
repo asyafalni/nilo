@@ -1064,7 +1064,7 @@ pub const Ctx = struct {
     /// How much body this request may read into the arena, in place of
     /// `listen()`'s `max_body`. `app.with(nilo.maxBody(bytes))` is the way to
     /// say it for a route; this is what that middleware does
-    /// ([ADR 155](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
+    /// ([ADR 156](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
     ///
     /// Bounds every read into the arena — `body()`, `json`, a `Form(T)` —
     /// and not `bodyStream()`, which holds nothing there and takes its own
@@ -1428,7 +1428,7 @@ pub const Ctx = struct {
         // A repeated key already said which on the Failure (`json.parseLeaky`),
         // and the dynamic re-read below cannot hold a repeated key at all.
         var value = json_mod.parseLeaky(T, self._arena, b, .{}) catch |err|
-            return if (err == error.DuplicateField) repeatedKey(err) else describeBadBody(T, self._arena, b, err);
+            return if (err == error.DuplicateField) misfit(T, repeatedKey(err)) else describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
         // A struct that checks itself is checked once it is whole, and a
         // rule that did not hold is a 422 naming it (ADR 193).
@@ -1502,7 +1502,7 @@ pub const Ctx = struct {
             for (outcomes) |*o| o.* = .{};
             return value;
         } else |err| {
-            if (err == error.DuplicateField) return repeatedKey(err);
+            if (err == error.DuplicateField) return misfit(T, repeatedKey(err));
             return collectBadBody(T, self._arena, self._lifetime, b, err, outcomes);
         }
     }
@@ -2682,15 +2682,17 @@ fn describeBadBody(
         .{ diagnostics.getLine(), diagnostics.getColumn() },
     );
 
+    // From here on the body is JSON, so whatever is wrong with it is its
+    // shape, and that is the refusal a type can choose the status of.
     if (dynamic != .object) {
-        if (comptime tagged) return fail.badRequest(
+        if (comptime tagged) return misfit(T, fail.badRequest(
             "the request body has to be an object whose \"{s}\" is one of {s}, not {s}",
             .{ comptime tagOf(T).?, comptime variantList(T), kindOf(dynamic) },
-        );
-        return fail.badRequest(
+        ));
+        return misfit(T, fail.badRequest(
             "the request body has to be a JSON object with: {s} — this is {s}",
             .{ comptime fieldList(T), kindOf(dynamic) },
-        );
+        ));
     }
 
     var deeper = false;
@@ -2698,8 +2700,35 @@ fn describeBadBody(
         describeTagged(T, arena, dynamic.object, "", max_body_depth, &deeper)
     else
         describeObject(T, arena, dynamic.object, "", .{}, max_body_depth, &deeper);
-    if (found) |explained| return explained;
-    return if (deeper) tooDeep() else err;
+    if (found) |explained| return misfit(T, explained);
+    return misfit(T, if (deeper) tooDeep() else err);
+}
+
+/// A refusal of a body that is JSON and not `T`'s shape, answered with the
+/// status `T` chose (`.misfit = 422` in its `nilo_json`), or exactly as it
+/// came when `T` chose none, which is every type that says nothing and costs
+/// it nothing: the first line returns while compiling
+/// ([ADR 251](../docs/adr/251-json-that-does-not-fit-can-be-a-422.md)).
+///
+/// The sentence is the one the 400 would have carried, so only the status
+/// moves. A refusal with no sentence behind it, the bare `std.json` error a
+/// walk that found nothing hands back, is given one, because the error's own
+/// status is 400 by name.
+fn misfit(comptime T: type, refused: anyerror) anyerror {
+    const chosen = comptime jsonmark.misfitStatus(T);
+    if (comptime chosen == null) return refused;
+    const status = chosen.?;
+    // Outside a request there is no Failure, and the bare error is the answer
+    // a fail function gives there too.
+    const failure = fail.current() orelse return refused;
+    if (fail.failed(failure, refused)) {
+        // Only a 400 is a refusal of the shape; anything else was chosen by
+        // something below, such as a type's own reader, and stands.
+        if (failure.status == 400) failure.status = status;
+        return refused;
+    }
+    if (refused == error.OutOfMemory) return refused;
+    return fail.status(status, "the request body is valid JSON and does not fit this endpoint", .{});
 }
 
 /// Turn a failed body parse into one outcome per field of `T`, instead of
@@ -2749,20 +2778,25 @@ fn collectBadBody(
         .{ diagnostics.getLine(), diagnostics.getColumn() },
     );
 
-    if (dynamic != .object) return fail.badRequest(
+    // JSON from here on: what stays a hard refusal is a refusal of the shape,
+    // answered with the status `T` chose for that (ADR 251).
+    if (dynamic != .object) return misfit(T, fail.badRequest(
         "the request body has to be a JSON object with: {s} — this is {s}",
         .{ comptime fieldList(T), kindOf(dynamic) },
-    );
+    ));
 
     const object = dynamic.object;
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        // The type's own word on keys it does not know, as `describeObject`
+        // reads it; skipped, they are left for the fields below to ignore.
+        if (comptime jsonmark.ignoresUnknown(T)) break;
         const name = entry.key_ptr.*;
-        if (!hasField(T, name)) return fail.badRequest(
+        if (!hasField(T, name)) return misfit(T, fail.badRequest(
             "the request body has a field \"{s}\" this endpoint does not know. It takes: {s}",
             .{ name, comptime fieldList(T) },
-        );
+        ));
     }
 
     var out: T = undefined;
@@ -2834,8 +2868,8 @@ fn collectBadBody(
                     if (f.defaultValue()) |default| @field(out, f.name) = default;
                 } else {
                     var deeper = false;
-                    if (describeField(f.type, arena, given, f.name, max_body_depth, &deeper)) |found| return found;
-                    return if (deeper) tooDeep() else err;
+                    if (describeField(f.type, arena, given, f.name, max_body_depth, &deeper)) |found| return misfit(T, found);
+                    return misfit(T, if (deeper) tooDeep() else err);
                 }
             }
         } else if (f.default_value_ptr == null) {

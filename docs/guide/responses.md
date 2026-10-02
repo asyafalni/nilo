@@ -24,6 +24,8 @@ fn handler(c: *nilo.Ctx) !void { … }
 
 Every call is listed in [the reference](../reference/ctx.md#answering).
 
+**JSON that is already bytes goes out through `send`.** A body serialised somewhere else (kept in a cache, built by another library, read from a file) is `c.send(200, "application/json", bytes)`, and nothing parses or re-encodes it. The bytes are written before `send` returns, compressed first when [compression](#compression) is on, so a buffer of your own can be freed or reused on the next line. What it costs is the API description: a handler that returns nothing is documented as `default`, because its signature cannot say what it sent ([OpenAPI](./openapi.md)), and returning the typed value is what documents it.
+
 ## Headers
 
 | | |

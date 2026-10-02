@@ -2036,6 +2036,10 @@ const refusals = [_]Refusal{
         .name = "maxbody_of_no_bytes",
         .says = "a body limit of 0 bytes is not a limit, it is a route that refuses every body.",
     },
+    .{
+        .name = "maxbody_read_from_a_u32",
+        .says = "maxBody takes a number of bytes or the address of a usize that holds one, and was handed *u32.",
+    },
     // The five ways of writing the pair a type that writes its own answer
     // carries (ADR 157).
     .{
@@ -2229,6 +2233,27 @@ const refusals = [_]Refusal{
     .{
         .name = "json_unknown_fields_says_something_else",
         .says = "`json_unknown_fields_says_something_else.Settings` says `.unknown_fields = .warn`, which is not something it can do with a key it has no field for.",
+    },
+    // The status of a body that is JSON and not the type's shape (ADR 251).
+    .{
+        .name = "json_misfit_400_written_out",
+        .says = "`json_misfit_400_written_out.Search` says `.misfit = 400`, which is what every type already answers for a body that is JSON and not its shape, so it would change nothing.",
+    },
+    .{
+        .name = "json_misfit_another_status",
+        .says = "`json_misfit_another_status.Search` says `.misfit = 409`, and a body that is JSON and not this type's shape is a 400 or a 422, nothing else.",
+    },
+    .{
+        .name = "json_misfit_not_a_number",
+        .says = "`json_misfit_not_a_number.Search`'s `misfit` is a @EnumLiteral(), and it is the status a body that is JSON and not this type's shape is refused with, which is written as a number.",
+    },
+    .{
+        .name = "json_misfit_on_an_enum",
+        .says = "`json_misfit_on_an_enum.Severity` says `.misfit`, and it is an enum, which is read from one string and is never a body of its own.",
+    },
+    .{
+        .name = "json_misfit_on_an_untagged_union",
+        .says = "`json_misfit_on_an_untagged_union.Condition` says `.misfit`, and it is a union with no `.tag`, which `std.json` reads by itself, so nilo cannot tell JSON of the wrong shape from anything else it refuses.",
     },
     .{
         .name = "json_reader_for_a_renamed_union",
@@ -3250,16 +3275,15 @@ fn protoFor(
     // One per mode, because `nilo_http` names it for the trace exporter
     // (ADR 247) and a compilation that holds the server and a program's own
     // `nilo_proto` may hold only one module rooted at `proto/proto.zig`.
-    for (proto_made[0..proto_count]) |made| {
-        if (made.mode == mode) return made.module;
+    for (proto_made.items) |made| {
+        if (made.owner == b and made.mode == mode) return made.module;
     }
     const module = b.createModule(.{
         .root_source_file = b.path("proto/proto.zig"),
         .target = target,
         .optimize = mode,
     });
-    proto_made[proto_count] = .{ .mode = mode, .module = module };
-    proto_count += 1;
+    remember(b, &proto_made, .{ .owner = b, .mode = mode, .module = module });
     return module;
 }
 
@@ -3268,15 +3292,24 @@ fn protoFor(
 /// Zig refuses a compilation in which one file belongs to two modules, and
 /// since `nilo_http` names both for tracing (ADR 247), every root that holds
 /// the server beside one of them would otherwise hold two.
+///
+/// Keyed by the builder as well, and grown rather than fixed: the build
+/// runner compiles this file once per process, so these lists are shared by
+/// every instance of nilo in it, and a dependent that asks for nilo in two
+/// optimize modes runs `build` twice into the same lists. A fixed array of 32
+/// overflowed on the second instance (`index out of bounds` in `fetchFor`).
 const Made = struct {
+    owner: *std.Build,
     mode: std.builtin.OptimizeMode,
     core: ?*std.Build.Module = null,
     module: *std.Build.Module,
 };
-var proto_made: [8]Made = undefined;
-var proto_count: usize = 0;
-var fetch_made: [32]Made = undefined;
-var fetch_count: usize = 0;
+var proto_made: std.ArrayList(Made) = .empty;
+var fetch_made: std.ArrayList(Made) = .empty;
+
+fn remember(b: *std.Build, list: *std.ArrayList(Made), made: Made) void {
+    list.append(b.allocator, made) catch @panic("OOM");
+}
 
 /// A copy of `nilo_fetch` for one optimize mode (ADR 061).
 ///
@@ -3292,8 +3325,8 @@ fn fetchFor(
     mode: std.builtin.OptimizeMode,
     core_mod: *std.Build.Module,
 ) *std.Build.Module {
-    for (fetch_made[0..fetch_count]) |made| {
-        if (made.mode == mode and made.core == core_mod) return made.module;
+    for (fetch_made.items) |made| {
+        if (made.owner == b and made.mode == mode and made.core == core_mod) return made.module;
     }
     const module = b.createModule(.{
         .root_source_file = b.path("fetch/fetch.zig"),
@@ -3301,8 +3334,7 @@ fn fetchFor(
         .optimize = mode,
         .imports = &.{.{ .name = "nilo_core", .module = core_mod }},
     });
-    fetch_made[fetch_count] = .{ .mode = mode, .core = core_mod, .module = module };
-    fetch_count += 1;
+    remember(b, &fetch_made, .{ .owner = b, .mode = mode, .core = core_mod, .module = module });
     return module;
 }
 
@@ -3455,6 +3487,50 @@ fn libdeflateFor(b: *std.Build, target: std.Build.ResolvedTarget) ?*std.Build.St
         .flags = flags,
     });
     return lib;
+}
+
+/// zqlite for one optimize mode, over a SQLite that is always `ReleaseFast`
+/// (ADR 249).
+///
+/// zqlite's own `build.zig` takes one `optimize` for its Zig and for the
+/// amalgamation both, so asking it for `ReleaseFast` would also take the
+/// safety checks out of the wrapper in a `ReleaseSafe` program. Only its
+/// files are taken: `src/zqlite.zig` is built here in the program's mode,
+/// and `lib/sqlite3.c` once, with zqlite's own flags, whatever the mode. One
+/// object then serves Debug and `ReleaseSafe` alike, and the `ReleaseSafe`
+/// compile, the slow one (34 s and 1 GB on this machine against 20 s and
+/// 700 MB), never runs. The undefined-behaviour sanitizer a Debug or
+/// `ReleaseSafe` C compile carries is not a check on nilo's code.
+fn zqliteFor(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    mode: std.builtin.OptimizeMode,
+) ?*std.Build.Module {
+    const dep = b.lazyDependency("zqlite", .{ .target = target, .optimize = .ReleaseFast }) orelse return null;
+    const lib = b.addLibrary(.{
+        .name = "nilo-sqlite",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addIncludePath(dep.path("lib"));
+    lib.root_module.addCSourceFile(.{ .file = dep.path("lib/sqlite3.c"), .flags = &.{"-std=c99"} });
+    const c = b.addTranslateC(.{
+        .root_source_file = dep.path("lib/sqlite3.h"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const module = b.createModule(.{
+        .root_source_file = dep.path("src/zqlite.zig"),
+        .target = target,
+        .optimize = mode,
+        .imports = &.{.{ .name = "c", .module = c.createModule() }},
+    });
+    module.linkLibrary(lib);
+    return module;
 }
 
 /// A copy of the server for one optimize mode, for a test root that needs a
@@ -4830,8 +4906,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    proto_made[proto_count] = .{ .mode = optimize, .module = nilo_proto };
-    proto_count += 1;
+    remember(b, &proto_made, .{ .owner = b, .mode = optimize, .module = nilo_proto });
 
     // The first Fitting: it borrows the loop and owns no destination
     // (ADR 061). A program that calls nobody else's API links no HTTP client,
@@ -4847,8 +4922,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "nilo_core", .module = nilo_core }},
     });
-    fetch_made[fetch_count] = .{ .mode = optimize, .core = nilo_core, .module = nilo_fetch };
-    fetch_count += 1;
+    remember(b, &fetch_made, .{ .owner = b, .mode = optimize, .core = nilo_core, .module = nilo_fetch });
 
     // The second Fitting: a queue, and a schedule (ADR 160, ADR 161).
     // Registered rather than bound, like `nilo_fetch`: `nilo_http` never
@@ -4958,8 +5032,8 @@ pub fn build(b: *std.Build) void {
         // program that does not should link none of it. That is an A/B rather
         // than an argument, and `zig build size-sql` is where the number comes
         // from.
-        if (b.lazyDependency("zqlite", .{ .target = target, .optimize = optimize })) |zqlite| {
-            nilo_sql.addImport("zqlite", zqlite.module("zqlite"));
+        if (zqliteFor(b, target, optimize)) |zqlite| {
+            nilo_sql.addImport("zqlite", zqlite);
             nilo_sql.link_libc = true;
         }
     }
@@ -5524,6 +5598,19 @@ pub fn build(b: *std.Build) void {
     // machine had none is worse than no gate.
     FetchCheck.step(b, network);
 
+    // A dependent that asks for nilo in two optimize modes, configured. The
+    // module memo is shared by every instance in a build runner, and a fixed
+    // one overflowed on the second; `bench/two-modes/` says the rest.
+    const two_modes = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-l", "--build-file" });
+    two_modes.addFileArg(b.path("bench/two-modes/build.zig"));
+    two_modes.expectExitCode(0);
+    // Its input is nilo's `build.zig`, which the Run step does not hash, so
+    // it runs every time; configuring both instances takes well under a second.
+    two_modes.has_side_effects = true;
+    const two_modes_step = b.step("two-modes", "Configure a dependent that asks for nilo in Debug and in ReleaseSafe");
+    two_modes_step.dependOn(&two_modes.step);
+    test_step.dependOn(two_modes_step);
+
     // The layering, held by something other than a paragraph (ADR 038).
     test_step.dependOn(Layering.step(b));
 
@@ -5818,8 +5905,8 @@ pub fn build(b: *std.Build) void {
         // The benchmark copy of the module needs both drivers for the same
         // reason the published one does: `sql/sql.zig` names them both, and
         // which one a program *uses* is the thing `size-sql` exists to weigh.
-        if (b.lazyDependency("zqlite", .{ .target = target, .optimize = .ReleaseFast })) |zqlite| {
-            bench_nilo_sql.addImport("zqlite", zqlite.module("zqlite"));
+        if (zqliteFor(b, target, .ReleaseFast)) |zqlite| {
+            bench_nilo_sql.addImport("zqlite", zqlite);
             bench_nilo_sql.link_libc = true;
             // And the root module too, because `bench/sql.zig` names
             // `sql.Sqlite` — the executable is the thing that links the C.
@@ -6176,8 +6263,8 @@ pub fn build(b: *std.Build) void {
             if (b.lazyDependency("pg", .{ .target = target, .optimize = mode })) |pg| {
                 under_test.addImport("pg", pg.module("pg"));
             }
-            if (b.lazyDependency("zqlite", .{ .target = target, .optimize = mode })) |zqlite| {
-                under_test.addImport("zqlite", zqlite.module("zqlite"));
+            if (zqliteFor(b, target, mode)) |zqlite| {
+                under_test.addImport("zqlite", zqlite);
                 under_test.link_libc = true;
             }
         }

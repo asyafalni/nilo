@@ -3886,11 +3886,11 @@ test "HEAD with no HEAD route falls back to the GET one" {
 /// after it. Returned as a path relative to the working directory, which
 /// is what `app.static` takes.
 const TmpFiles = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
+    tmp: nilo_testing.TmpDir,
+    path: [:0]u8,
 
     fn init(gpa: std.mem.Allocator, files: []const [2][]const u8) !TmpFiles {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        var tmp = nilo_testing.tmpDir();
         errdefer tmp.cleanup();
         for (files) |entry| {
             if (std.fs.path.dirname(entry[0])) |sub| try tmp.dir.createDirPath(std.testing.io, sub);
@@ -3898,7 +3898,7 @@ const TmpFiles = struct {
         }
         return .{
             .tmp = tmp,
-            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path}),
+            .path = try tmp.pathAlloc(gpa, ""),
         };
     }
 
@@ -10801,4 +10801,143 @@ test "a tagged union that is the whole body says which variant and which key is 
         },
     };
     for (cases) |case| try expect400(postJson(&h, &app, "/switch", case.body), case.says);
+}
+
+// ---- a body type that answers its wrong shape with a 422 (ADR 251) ----
+
+/// The request a port of an axum server reads: text that is not JSON is a
+/// 400, and JSON that is not this shape a 422, which is what its clients and
+/// its contract tests tell apart.
+const Search = struct {
+    pub const nilo_json = .{ .unknown_fields = .ignore, .misfit = 422 };
+    start: Str,
+    shards: []const u32 = &.{},
+    limit: u32 = 500,
+};
+/// The same fields, saying nothing: every refusal stays the 400 it was.
+const PlainSearch = struct {
+    start: Str,
+    shards: []const u32 = &.{},
+    limit: u32 = 500,
+};
+
+fn takeSearch(incoming: Search) !struct { limit: u32 } {
+    return .{ .limit = incoming.limit };
+}
+fn takePlainSearch(incoming: PlainSearch) !struct { limit: u32 } {
+    return .{ .limit = incoming.limit };
+}
+fn takeSearchBound(b: bound_mod.Bound(Search)) !struct { limit: u32 } {
+    const incoming = b.value() orelse return b.fail();
+    return .{ .limit = incoming.limit };
+}
+
+/// A tagged union as the whole body, read by `Ctx.json`, chooses the same way.
+const Signal = union(enum) {
+    pub const nilo_json = .{ .tag = "kind", .misfit = 422 };
+    pub const jsonParse = @import("jsonmark.zig").parseFor(@This());
+
+    metrics: struct { name: Str },
+    logs,
+};
+fn takeSignal(c: *Ctx) anyerror!void {
+    const incoming = try c.json(Signal);
+    try c.sendJson(200, .{ .kind = @tagName(incoming) });
+}
+
+fn expect422(response: []const u8, says: []const u8) !void {
+    testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 422 Unprocessable Content\r\n")) catch |err| {
+        std.debug.print("wanted 422, got: {s}\n", .{response});
+        return err;
+    };
+    testing.expect(try Harness.saysFailure(response, says)) catch |err| {
+        std.debug.print("  wanted: {s}\n  got:    {s}\n", .{ says, response });
+        return err;
+    };
+}
+
+test "a body type that says .misfit = 422 answers JSON of the wrong shape with a 422 and text that is not JSON with a 400" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/search", takeSearch);
+    var h = Harness.init();
+    defer h.deinit();
+
+    try expectOk(postJson(&h, &app, "/search", "{\"start\":\"0\",\"extra\":1}"));
+
+    // Not JSON, or nothing at all: the request is not a body of any shape.
+    try expect400(postJson(&h, &app, "/search", "{\"start\":"), "the request body is not valid JSON");
+    try expect400(postJson(&h, &app, "/search", "start=0"), "the request body is not valid JSON");
+    try expect400(postJson(&h, &app, "/search", ""), "the request body is empty");
+
+    // JSON, and not this shape: the same sentence the 400 carried, as a 422.
+    const cases = [_]struct { body: []const u8, says: []const u8 }{
+        .{ .body = "{\"limit\":5}", .says = "the request body is missing \"start\"" },
+        .{ .body = "{\"start\":7}", .says = "\"start\" has to be text, not a number" },
+        .{ .body = "{\"start\":\"0\",\"limit\":\"lots\"}", .says = "\"limit\" has to be a whole number" },
+        .{ .body = "{\"start\":\"0\",\"shards\":[1,\"two\"]}", .says = "\"shards[1]\"" },
+        .{ .body = "[]", .says = "the request body has to be a JSON object with: start" },
+        .{ .body = "{\"start\":\"0\",\"start\":\"1\"}", .says = "the key \"start\" twice" },
+    };
+    for (cases) |case| try expect422(postJson(&h, &app, "/search", case.body), case.says);
+}
+
+test "a body type that says nothing still answers every refusal of its shape with a 400" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/search", takePlainSearch);
+    var h = Harness.init();
+    defer h.deinit();
+
+    try expect400(postJson(&h, &app, "/search", "{\"limit\":5}"), "the request body is missing \"start\"");
+    try expect400(postJson(&h, &app, "/search", "{\"start\":7}"), "\"start\" has to be text, not a number");
+    try expect400(postJson(&h, &app, "/search", "[]"), "the request body has to be a JSON object with: start");
+    try expect400(postJson(&h, &app, "/search", "{\"start\":"), "the request body is not valid JSON");
+}
+
+test "a bound body whose type says .misfit = 422 answers the refusals it cannot collect with a 422 too" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/search", takeSearchBound);
+    var h = Harness.init();
+    defer h.deinit();
+
+    // Collected, and answered by the handler's own `b.fail()`, as before.
+    try expect422(postJson(&h, &app, "/search", "{\"start\":7}"), "\"start\" has to be text, not a number");
+    // The hard refusals of the shape: not an object, and a mistake nested
+    // inside a field, now in the status the type chose.
+    try expect422(postJson(&h, &app, "/search", "[1]"), "the request body has to be a JSON object with: start");
+    try expect422(postJson(&h, &app, "/search", "{\"start\":\"0\",\"shards\":[\"x\"]}"), "\"shards[0]\"");
+    // And text that is not JSON stays the 400 it always was.
+    try expect400(postJson(&h, &app, "/search", "nope"), "the request body is not valid JSON");
+}
+
+test "a bound body whose type ignores unknown fields collects its mistakes past a key it does not know" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/search", takeSearchBound);
+    var h = Harness.init();
+    defer h.deinit();
+
+    // `Search` says `.unknown_fields = .ignore`, which the plain read
+    // honoured and the binding's second read did not: it answered "has a
+    // field \"extra\" this endpoint does not know" and never reached `start`.
+    try expect422(postJson(&h, &app, "/search", "{\"start\":7,\"extra\":1}"), "\"start\" has to be text, not a number");
+    try expectOk(postJson(&h, &app, "/search", "{\"start\":\"0\",\"extra\":1}"));
+}
+
+test "a tagged union that says .misfit = 422 answers a variant it does not know with a 422" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/signal", takeSignal);
+    var h = Harness.init();
+    defer h.deinit();
+
+    try expectOk(postJson(&h, &app, "/signal", "{\"kind\":\"logs\"}"));
+    try expect422(
+        postJson(&h, &app, "/signal", "{\"kind\":\"traces\"}"),
+        "\"kind\" is not one of the known variants (metrics, logs): \"traces\"",
+    );
+    try expect422(postJson(&h, &app, "/signal", "{\"kind\":\"metrics\"}"), "the request body is missing \"name\"");
+    try expect400(postJson(&h, &app, "/signal", "{kind}"), "the request body is not valid JSON");
 }

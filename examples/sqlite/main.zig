@@ -380,7 +380,7 @@ pub fn main() !void {
 
 const testing = std.testing;
 
-/// A Db over a shared in-memory file, the App around it, and a client to
+/// A Db over an in-memory database of its own, the App around it, and a client to
 /// drive handlers through. Heap-allocated because the App holds a pointer
 /// to the Db and the Client hands out a Ctx pointing at the App.
 const Stack = struct {
@@ -389,11 +389,13 @@ const Stack = struct {
     app: nilo.App,
     client: nilo.testing.Client,
 
-    fn open(gpa: std.mem.Allocator, comptime name: []const u8) !*Stack {
+    fn open(gpa: std.mem.Allocator) !*Stack {
         const self = try gpa.create(Stack);
         self.* = .{
             .threaded = .init(gpa, .{}),
-            .db = Db.init(gpa, "file:example-" ++ name ++ "?mode=memory&cache=shared", .{ .size = 2 }),
+            // One database the whole pool shares and no other test sees,
+            // gone when the pool closes.
+            .db = Db.init(gpa, ":memory:", .{ .size = 2 }),
             .app = nilo.App.init(gpa),
             .client = try nilo.testing.Client.init(gpa, .{}),
         };
@@ -419,7 +421,7 @@ const Stack = struct {
 
 test "the tables are made at boot and the schema check passes against them" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "boot");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     // The boot seeded two customers and four invoices.
@@ -439,7 +441,7 @@ test "the tables are made at boot and the schema check passes against them" {
 
 test "a customer filter that is absent is no filter, and one that is set narrows the list" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "filter");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const all = try stack.client.get(&stack.app, "/customers");
@@ -454,7 +456,7 @@ test "a customer filter that is absent is no filter, and one that is set narrows
 
 test "a second customer with the same address is a 409, from the unique in the marker" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "unique");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const made = try stack.client.post(&stack.app, "/customers", "{\"name\":\"kid\",\"email\":\"kid@example.dev\"}");
@@ -466,7 +468,7 @@ test "a second customer with the same address is a 409, from the unique in the m
 
 test "the invoice page carries the total its filter matched, and a bad filter is a 400 in a sentence" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "page");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const open = try stack.client.get(&stack.app, "/invoices?status=open");
@@ -487,7 +489,7 @@ test "the invoice page carries the total its filter matched, and a bad filter is
 
 test "the report adds up, and the per-month table has one line per month" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "report");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const answer = try stack.client.get(&stack.app, "/report");
@@ -522,7 +524,7 @@ test "the report adds up, and the per-month table has one line per month" {
 
 test "a customer comes with their invoices, and one nobody has is a 404" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "account");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const answer = try stack.client.get(&stack.app, "/customers/1");
@@ -543,7 +545,7 @@ test "a customer comes with their invoices, and one nobody has is a 404" {
 
 test "paying an invoice is a transaction, and paying it twice is a 409" {
     const gpa = testing.allocator;
-    var stack = try Stack.open(gpa, "pay");
+    var stack = try Stack.open(gpa);
     defer stack.close(gpa);
 
     const paid = try stack.client.post(&stack.app, "/invoices/1/pay", "");

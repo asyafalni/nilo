@@ -1369,17 +1369,17 @@ test "an upload is written under a name the handler chose, and the client's own 
             "Content-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n bits",
     }));
 
-    // `.iterate` because the leftovers are checked below, and a directory
-    // opened without it panics inside the standard library rather than
-    // failing.
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    // nilo's rather than std's because the leftovers are listed below, and
+    // std's directory panics inside the standard library when it is listed
+    // unless it was opened with `.iterate` (ADR 250).
+    var tmp = str_mod.tmpDir();
     defer tmp.cleanup();
     // Something longer already under the name, so a short write that left the
     // tail of it behind would read back wrong.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "avatar-7.png", .data = "an older and much longer avatar" });
 
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = try tmp.path(&path_buf, "");
     const dir = try bulkhead.Dir.open(path);
     defer dir.close();
 

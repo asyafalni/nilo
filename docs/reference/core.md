@@ -177,6 +177,10 @@ These are plain functions, not calls on a `Ctx` or a `Run`: reading the wall clo
 
 **Use `monotonicMicros` for a duration, never the other two.** A wall clock moves when an operator changes it or NTP steps it, so two readings a second apart can come back in either order. It is the clock `db.watching` uses to time a statement ([ADR 108](../adr/108-a-statement-can-be-watched.md)).
 
+## `nilo_core.tmpDir`
+
+**A directory for one test, with the path to a file in it.** It is the declaration [`nilo.testing.tmpDir`](./testing.md#testingtmpdir) re-exports, and it is here so a test in a module that cannot name `nilo_http`, such as `nilo_sql`, has the same one ([ADR 250](../adr/250-a-test-directory-hands-back-its-path.md)). Only a test can call it.
+
 ## A handler that blocks its thread
 
 **nilo warns when a handler waits on the operating system without going through the event loop.** Such a wait holds the thread that every other request on it is being served by. nilo says so, at most once a second:

@@ -235,9 +235,9 @@ Which is the better default has not been measured, and it is an open question in
 
 #### Connections and the file name
 
-Every connection is set up with `journal_mode = WAL` and `foreign_keys = ON`. The first keyword of a statement decides which connection it takes: `SELECT` and `PRAGMA` take a reader, everything else takes the writer. That is exact for everything this module generates, and a **guess for `db.raw`**, whose text is yours. A `raw` that writes but looks like a read lands on a read-only connection and fails loudly. That holds on a file; not in memory, where SQLite's URI `mode=` overrides the open flags and this safety net is missing.
+Every connection is set up with `journal_mode = WAL` and `foreign_keys = ON`. The first keyword of a statement decides which connection it takes: `SELECT` and `PRAGMA` take a reader, everything else takes the writer. That is exact for everything this module generates, and a **guess for `db.raw`**, whose text is yours. A `raw` that writes but looks like a read lands on a read-only connection and fails loudly. That holds in memory too: a reader is opened read-only and with `query_only = ON`, because SQLite's URI `mode=memory` overrides the open flag.
 
-The URL is a path, or SQLite's URI form. **A bare `:memory:` is refused at `open`**, because a pool of them is several separate empty databases. The shared form `file:name?mode=memory&cache=shared` is one database, and lives only as long as a connection to it does.
+The URL is a path, or SQLite's URI form. **`:memory:` is one database for the whole pool and private to it**: `open` gives it a shared-cache name no other pool in the process has, so two tests that both open `:memory:` cannot see each other, and it is gone when the pool closes. The shared form `file:name?mode=memory&cache=shared` is SQLite's own and left as written: one database per name across every pool that opens it, living as long as a connection to it does. **An empty URL is refused at `open`** with `error.EmptyDatabaseUrl`.
 
 `sql.SqliteNamed("cache", .{…})` is the second-database form, just as `sql.Named` is for Postgres. `sql.sqlite.version` is the bundled SQLite's version string. The amalgamation is vendored by the driver, so this is the version the build pinned, not the one on the machine.
 

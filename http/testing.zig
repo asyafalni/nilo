@@ -37,9 +37,14 @@ const str_mod = @import("nilo_core");
 var said_the_mode = false;
 
 pub const Options = struct {
-    /// The response buffer. A request whose answer does not fit gets a
-    /// truncated one rather than a failure, so turn this up for a stream
-    /// that produces a lot.
+    /// The response buffer. An answer that does not fit is
+    /// `error.ResponseTooLarge` from the call that sent the request, so
+    /// turn this up for a stream that produces a lot.
+    ///
+    /// It was a shorter answer, with the status it began with and a
+    /// `WriteFailed` warning: a 200 whose body stopped at 64 KiB, which a
+    /// test reading the status passed and one reading the body failed far
+    /// from the cause.
     response_bytes: usize = 64 * 1024,
 
     /// The address these requests appear to come from — what `c.peer()`
@@ -61,6 +66,15 @@ pub const Options = struct {
     /// A test that wants the jar says so, and says it once.
     cookies: bool = false,
 };
+
+/// Whether the answer ran past `response_bytes`.
+///
+/// The buffer is one byte longer than the room it was asked for, and a fixed
+/// writer fills it to the last byte before it refuses, so a full buffer is an
+/// answer that did not fit and an answer of exactly `response_bytes` is not.
+fn overflowed(out: *std.Io.Writer) bool {
+    return out.end == out.buffer.len;
+}
 
 /// One header to send, for `Client.setHeader` and `Request.headers`.
 ///
@@ -298,6 +312,15 @@ pub fn Shown(comptime T: type) type {
     };
 }
 
+/// A directory for one test, removed by `cleanup`, that hands back its path
+/// for code that opens files by name: `tmp.path(&buf, "app.db")` or
+/// `tmp.pathAlloc(gpa, "app.db")`, and an empty name for the directory
+/// itself. Always iterable. It is `nilo_core`'s, so a test under a Service,
+/// which cannot name `nilo_http`, has the same one
+/// ([ADR 250](../docs/adr/250-a-test-directory-hands-back-its-path.md)).
+pub const tmpDir = str_mod.tmpDir;
+pub const TmpDir = str_mod.TmpDir;
+
 /// What a fail function said, read back where there was no request
 /// ([ADR 129](../docs/adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)).
 pub const Refused = struct {
@@ -412,7 +435,7 @@ pub const Client = struct {
         return .{
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
-            .buffer = try gpa.alloc(u8, options.response_bytes),
+            .buffer = try gpa.alloc(u8, options.response_bytes + 1),
             .peer = try bulkhead.Peer.from(options.client_address),
             .keep_cookies = options.cookies,
         };
@@ -601,6 +624,7 @@ pub const Client = struct {
         // connection does between requests.
         self.lifetime.end();
         defer _ = self.arena.reset(.retain_capacity);
+        if (overflowed(&out)) return error.ResponseTooLarge;
 
         var answer = try parse(out.buffered(), keep_alive);
         self.made += 1;
@@ -949,7 +973,7 @@ pub const Conversation = struct {
         return .{
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
-            .buffer = try gpa.alloc(u8, options.response_bytes),
+            .buffer = try gpa.alloc(u8, options.response_bytes + 1),
             .peer = try bulkhead.Peer.from(options.client_address),
         };
     }
@@ -1058,6 +1082,7 @@ pub const Conversation = struct {
         );
         self.lifetime.end();
         _ = self.arena.reset(.retain_capacity);
+        if (overflowed(&out)) return error.ResponseTooLarge;
 
         return decode(self.arena.allocator(), out.buffered());
     }
@@ -1628,6 +1653,44 @@ test "a client can be used for more than one request" {
     }
 }
 
+test "an answer that does not fit the response buffer is an error, and one that fits exactly is not" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/thing", plain);
+
+    var roomy = try Client.init(testing.allocator, .{});
+    defer roomy.deinit();
+    const whole = (try roomy.get(&app, "/thing")).raw.len;
+
+    var exact = try Client.init(testing.allocator, .{ .response_bytes = whole });
+    defer exact.deinit();
+    const fits = try exact.get(&app, "/thing");
+    try testing.expectEqual(whole, fits.raw.len);
+    try testing.expectEqualStrings("body text", fits.body);
+
+    // One byte short was a 201 with "body tex" and a warning in the log.
+    var short = try Client.init(testing.allocator, .{ .response_bytes = whole - 1 });
+    defer short.deinit();
+    try testing.expectError(error.ResponseTooLarge, short.get(&app, "/thing"));
+}
+
+fn bodyLength(c: *@import("ctx.zig").Ctx) anyerror!void {
+    const b = try c.body();
+    var buf: [16]u8 = undefined;
+    try c.sendText(200, try std.fmt.bufPrint(&buf, "{d}", .{b.view().len}));
+}
+
+test "a test sets the App's limits where listen() would have" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+    // What `listen(.{ .max_body = 8 })` copies onto the App.
+    wired.app.limits.max_body = 8;
+    try wired.app.post("/upload", bodyLength);
+
+    try testing.expectEqual(@as(u16, 200), (try wired.post("/upload", "eight by")).status);
+    try testing.expectEqual(@as(u16, 413), (try wired.post("/upload", "nine bytes")).status);
+}
+
 /// A service function of the kind this repository is written for: no `Ctx`,
 /// refusing four different ways, called by a handler and by a seed alike.
 fn editComment(author_matches: bool, empty: bool) fail.Error!void {
@@ -1811,4 +1874,19 @@ test "nilo.io, c.io() and Wired.io() are one Io when no server is running" {
     const here = @import("http.zig").io();
     try testing.expectEqual(wired.io().userdata, here.userdata);
     try testing.expectEqual(wired.io().userdata, bulkhead.loopIo().userdata);
+}
+
+test "a test directory hands the App a path it can serve files from" {
+    var tmp = tmpDir();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hello.txt", .data = "hi there" });
+
+    var buf: [64]u8 = undefined;
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+    try wired.app.static("/files", try tmp.path(&buf, ""));
+
+    const answer = try wired.get("/files/hello.txt");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqualStrings("hi there", answer.body);
 }

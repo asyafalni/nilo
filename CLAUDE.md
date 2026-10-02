@@ -47,7 +47,7 @@ A request: `readHead` → `parseHead` → the head is *borrowed* from the read b
 
 | flag | brings | ADR |
 |---|---|---|
-| `.sql = true` (`-Dsql`) | pg.zig (with buffer, metrics, xsync, tls) and zqlite (the SQLite amalgamation) | 066 |
+| `.sql = true` (`-Dsql`) | pg.zig (with buffer, metrics, xsync, tls) and zqlite (the SQLite amalgamation, compiled `ReleaseFast` by `zqliteFor` whatever the program's mode; zqlite's Zig keeps the program's) | 066, 249 |
 | `.tls = true` (`-Dtls`) | tls.zig; without it there is no `tls` module and the Engine's every use is under `@import("nilo_build").tls` | 212 |
 | `.grpc = true` (`-Dgrpc`) | nothing: HTTP/2, HPACK and gRPC are `http/h2.zig`, `hpack.zig`, `grpc.zig`. A call becomes an in-memory HTTP/1.1 `POST` to `App.handleRequest`, so a gRPC method is an ordinary route | 220 |
 | `.libdeflate = true` (`-Dlibdeflate`) | libdeflate's compressor, from its release tarball, compiled `ReleaseFast` and `FREESTANDING` by `libdeflateFor` in `build.zig`, never with `lib/utils.c` (whose weak `memcpy` would win the link for the whole program). `compress.backend` picks it for the pool and for static gzip | 248 |
@@ -67,6 +67,7 @@ zig build test-fetch-engine  # an outbound deadline firing against a real port; 
 zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one,
                        #   and a failure without one where $CI is set (-Ddatabase-required=false)
 zig build layering     # no module imports upward or sideways
+zig build two-modes    # configure a dependent asking for nilo in Debug and ReleaseSafe; on test
 zig build adr-check    # ADR files, their Topic lines, and every ADR cited exists; on test
 zig build docs-check   # every doc page's head, prose, links and anchors, the map, the reference's heading list; on test
 zig build docs-index   # rewrite the reference's list of every heading after renaming or adding one

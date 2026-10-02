@@ -262,9 +262,13 @@ rather than a sentence.
 
 What is still unmeasured is the part that is not the binary: **download size
 and build seconds**, both of which every `nilo_sql` user now pays for a driver
-half of them will not use. The amalgamation is the slow half — a cold
-`zig build test-sql` spent about a minute of CPU inside `zig clang` on it. The
-alternative is a build option a `zig fetch` dependent has to thread through,
+half of them will not use. The amalgamation is the slow half: compiled in
+the program's mode, a cold `zig build test-sql` spent about a minute of CPU
+inside `zig clang` on it, 34 seconds of that the `ReleaseSafe` compile alone.
+It is now compiled `ReleaseFast` whatever the program is, once for every
+mode, and zqlite's Zig in the program's mode
+([ADR 249](./249-sqlite-is-compiled-releasefast-whatever-the-program-is.md)).
+What it costs to fetch is unchanged. The alternative is a build option a `zig fetch` dependent has to thread through,
 which is the ergonomic problem
 [ADR 016](./016-the-api-description-comes-from-the-signatures.md) declined to
 take on for `docs()`; the trade is worth revisiting when somebody has both

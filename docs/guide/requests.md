@@ -102,6 +102,8 @@ the request body is empty. This endpoint expects an object whose "kind" is one o
 
 **To accept a body that carries keys your type does not list**, say so on the type with `pub const nilo_json = .{ .unknown_fields = .ignore };`. That is for a webhook or an OTLP/HTTP JSON receiver whose sender adds fields over time; it applies to that struct alone and not to the ones it holds ([reference](../reference/handlers.md#skipping-the-keys-a-body-struct-does-not-know)).
 
+**To answer JSON of the wrong shape with a 422 rather than a 400**, the line an axum server draws and its clients read, say so on the body's type with `pub const nilo_json = .{ .misfit = 422 };`. Text that is not JSON, an empty body and one nested past 64 levels stay a 400, because none of them is a body of any shape. A missing field, a value of the wrong kind, a key the type does not know, a key given twice and a body that is not an object become a 422 with the same sentence. It holds under `Bound(T)` for what the binding cannot collect, and the API document lists the 422 beside the 400 ([reference](../reference/handlers.md#answering-json-of-the-wrong-shape-with-a-422), [ADR 251](../adr/251-json-that-does-not-fit-can-be-a-422.md)).
+
 A struct with many fields lists the first of them and says how many it left out: `It takes: alpha, bravo, charlie, and 9 more`.
 
 That goes eight levels down, the same depth the API description and the staleness check follow. Below that there is no field name left to quote, so the 400 says which limit it hit instead of saying nothing:

@@ -1647,18 +1647,18 @@ const nilo_testing = @import("testing.zig");
 /// The path is relative to the working directory, which is what `load` and
 /// `app.static` both take.
 const TmpTree = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
+    tmp: nilo_testing.TmpDir,
+    path: [:0]u8,
 
     fn init(gpa: std.mem.Allocator, files: []const [2][]const u8) !TmpTree {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        var tmp = nilo_testing.tmpDir();
         errdefer tmp.cleanup();
         for (files) |entry| {
             try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry[0], .data = entry[1] });
         }
         return .{
             .tmp = tmp,
-            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path}),
+            .path = try tmp.pathAlloc(gpa, ""),
         };
     }
 

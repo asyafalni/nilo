@@ -164,6 +164,20 @@ try app.with(nilo.maxBody(50 << 20)).post("/import", importCsv);
 
 It works both ways: a route can also accept *less* than `listen()` allows ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)).
 
+**When the limit is a setting, hand it the address of a `usize`.** An ingest route whose cap differs between staging and production cannot write the number into the program, so it keeps the number in a variable filled from configuration before `listen()`, and the route reads it on each request:
+
+```zig
+var ingest_limit: usize = 16 << 20;
+
+pub fn main() !void {
+    ingest_limit = settings.ingest_max_body;
+    try app.with(nilo.maxBody(&ingest_limit)).post("/v1/logs", ingest);
+    try app.listen(.{});
+}
+```
+
+A setting of `0` leaves `listen()`'s `max_body` in force and logs a warning once, rather than refusing every body.
+
 ## Client IP address behind a proxy
 
 **Use `c.clientIp()` for the client's address, and tell nilo which machines are your proxies.** [`c.peer()`](../reference/ctx.md#reading) is the address the connection came from. It comes from the kernel, so it cannot be forged, but behind a proxy it is the proxy's address, which is the same for every client.

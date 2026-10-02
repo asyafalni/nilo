@@ -101,6 +101,11 @@ pub const Mark = struct {
     /// instead of refusing it (`.unknown_fields = .ignore`, ADR 168). Per type:
     /// a struct nested inside this one still answers for its own keys.
     ignores_unknown: bool = false,
+    /// The status a body read into this type is refused with when it is JSON
+    /// and not this type's shape (`.misfit = 422`), or null for the 400 every
+    /// type answers. Read off the type the body is read into, and only that
+    /// one ([ADR 251](../docs/adr/251-json-that-does-not-fit-can-be-a-422.md)).
+    misfit: ?u16 = null,
 
     /// Whether the marker changes how any field is spelled.
     pub fn renamesFields(self: Mark) bool {
@@ -193,25 +198,33 @@ pub fn of(comptime T: type) ?Mark {
                 mark.renames = renamesOf(T, said.rename);
             } else if (std.mem.eql(u8, f.name, "unknown_fields")) {
                 mark.ignores_unknown = unknownFieldsOf(T, said.unknown_fields);
+            } else if (std.mem.eql(u8, f.name, "misfit")) {
+                mark.misfit = misfitOf(T, said.misfit);
             } else @compileError(
                 "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` has a field `" ++ f.name ++
                     "`, which is not something it can say.\n" ++
-                    "  A marker says four things: `tag`, the key the variant's name goes under; " ++
+                    "  A marker says five things: `tag`, the key the variant's name goes under; " ++
                     "`rename_all`, how every name is spelled on the wire; `rename`, the ones " ++
-                    "spelled on their own; and `unknown_fields`, whether a body key the struct " ++
-                    "has no field for is skipped.\n" ++
+                    "spelled on their own; `unknown_fields`, whether a body key the struct " ++
+                    "has no field for is skipped; and `misfit`, the status of a body that is " ++
+                    "JSON and not this type's shape.\n" ++
                     "    pub const " ++ marker ++ " = .{ .tag = \"signal\", .rename_all = .camelCase, " ++
                     ".rename = .{ .amount_minor = \"amountMinor\" } };",
             );
         }
 
-        if (mark.tag == null and !mark.renamesFields() and !mark.ignores_unknown) @compileError(
+        // Asked once every field is read, because whether a union names its
+        // tag can come after the `misfit` that needs it.
+        if (mark.misfit != null) misfitBelongs(T, mark);
+
+        if (mark.tag == null and !mark.renamesFields() and !mark.ignores_unknown and mark.misfit == null) @compileError(
             "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` is empty, so it says nothing " ++
                 "about this type's JSON and nothing changes.\n" ++
                 "  Either say what it is for, or take the declaration off:\n" ++
                 "    pub const " ++ marker ++ " = .{ .tag = \"signal\" };        // a tagged union\n" ++
                 "    pub const " ++ marker ++ " = .{ .rename_all = .camelCase }; // a cased enum\n" ++
-                "    pub const " ++ marker ++ " = .{ .unknown_fields = .ignore }; // a body struct that skips unknown keys",
+                "    pub const " ++ marker ++ " = .{ .unknown_fields = .ignore }; // a body struct that skips unknown keys\n" ++
+                "    pub const " ++ marker ++ " = .{ .misfit = 422 };              // a body struct whose wrong shape is a 422",
         );
 
         if (mark.tag) |key| checkTag(T, key);
@@ -265,6 +278,81 @@ fn unknownFieldsOf(comptime T: type, comptime said: anytype) bool {
             ),
         }
         return true;
+    }
+}
+
+/// `said.misfit`, which is 422 or it is refused. A body that is JSON and not
+/// this type's shape is a 400 by default, like every other request that does
+/// not fit (ADR 034), and the only other answer for it is the one RFC 9110
+/// §15.5.21 defines for exactly that body: the syntax is right and the content
+/// cannot be processed. So the marker is a number, the one a client contract
+/// states, and it has one value
+/// ([ADR 251](../docs/adr/251-json-that-does-not-fit-can-be-a-422.md)).
+fn misfitOf(comptime T: type, comptime said: anytype) u16 {
+    comptime {
+        const Said = @TypeOf(said);
+        switch (@typeInfo(Said)) {
+            .comptime_int, .int => {},
+            else => @compileError(
+                "nilo: `" ++ naming.of(T) ++ "`'s `misfit` is a " ++ naming.of(Said) ++
+                    ", and it is the status a body that is JSON and not this type's shape is " ++
+                    "refused with, which is written as a number.\n" ++
+                    "    pub const " ++ marker ++ " = .{ .misfit = 422 };",
+            ),
+        }
+        if (said == 400) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.misfit = 400`, which is what every type already " ++
+                "answers for a body that is JSON and not its shape, so it would change nothing.\n" ++
+                "  Take the entry off, or say `.misfit = 422` to answer such a body the way " ++
+                "RFC 9110 names it.",
+        );
+        if (said != 422) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.misfit = " ++ std.fmt.comptimePrint("{d}", .{said}) ++
+                "`, and a body that is JSON and not this type's shape is a 400 or a 422, nothing else.\n" ++
+                "  422 is what RFC 9110 (section 15.5.21) gives content whose syntax is right and which " ++
+                "cannot be processed, and 400, the default, is every other request that does not fit. " ++
+                "Say `.misfit = 422`, or take the entry off.",
+        );
+        return said;
+    }
+}
+
+/// `.misfit` is said by the type a body is read into, so it goes where nilo
+/// reads a body's fields and names what did not fit: a struct, or a union
+/// that names its tag. An externally tagged union is read by `std.json`
+/// itself, which says nothing about why, so nilo never learns whether the
+/// body was JSON of the wrong shape.
+fn misfitBelongs(comptime T: type, comptime mark: Mark) void {
+    comptime switch (@typeInfo(T)) {
+        .@"struct" => {},
+        .@"union" => if (mark.tag == null) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.misfit`, and it is a union with no `.tag`, " ++
+                "which `std.json` reads by itself, so nilo cannot tell JSON of the wrong shape " ++
+                "from anything else it refuses.\n" ++
+                "  Give the union a `.tag`, or read the body into a struct that holds it:\n" ++
+                "    pub const " ++ marker ++ " = .{ .tag = \"kind\", .misfit = 422 };",
+        ),
+        .@"enum" => @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.misfit`, and it is an enum, which is read " ++
+                "from one string and is never a body of its own.\n" ++
+                "  `misfit` belongs on the struct a body is read into.",
+        ),
+        else => @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.misfit`, and it is a " ++
+                @tagName(@typeInfo(T)) ++ ", which a body is never read into.",
+        ),
+    };
+}
+
+/// The status `T` answers a body that is JSON and not its shape with, when it
+/// chose one, or null for the 400 every other type answers. Null for a type
+/// with no marker before anything else is asked, so the reader of a body that
+/// says nothing compiles exactly as it did.
+pub fn misfitStatus(comptime T: type) ?u16 {
+    comptime {
+        if (!marked(T)) return null;
+        @setEvalBranchQuota(20_000);
+        return of(T).?.misfit;
     }
 }
 
@@ -1482,4 +1570,34 @@ test "a type that reaches an ignoring struct is asked to bound what it skips" {
     try testing.expect(!comptime ignoresUnknownWithin(Plain));
     // A type that reaches itself is the walk's own cycle, and ends it.
     try testing.expect(!comptime ignoresUnknownWithin(Node));
+}
+
+test "a type that says .misfit = 422 has a mark that says so, and every other type answers nothing" {
+    const Search = struct {
+        pub const nilo_json = .{ .misfit = 422 };
+        start: []const u8,
+    };
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore, .misfit = 422 };
+        start: []const u8,
+    };
+    const Tagged = union(enum) {
+        pub const nilo_json = .{ .misfit = 422, .tag = "kind" };
+        on: struct { at: u32 },
+        off,
+    };
+    const Renamed = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        full_name: []const u8,
+    };
+    const Plain = struct { start: []const u8 };
+
+    try testing.expectEqual(@as(?u16, 422), comptime misfitStatus(Search));
+    try testing.expectEqual(@as(?u16, 422), comptime misfitStatus(Loose));
+    try testing.expect(comptime of(Loose).?.ignores_unknown);
+    // The tag can come after the `misfit` that needs it.
+    try testing.expectEqual(@as(?u16, 422), comptime misfitStatus(Tagged));
+    try testing.expectEqual(@as(?u16, null), comptime misfitStatus(Renamed));
+    try testing.expectEqual(@as(?u16, null), comptime misfitStatus(Plain));
+    try testing.expectEqual(@as(?u16, null), comptime misfitStatus(u32));
 }

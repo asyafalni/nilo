@@ -436,9 +436,9 @@ test "a TLS listener and a cleartext one answer in one process, over the same ro
     hush();
     const gpa = std.heap.smp_allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = nilo.testing.tmpDir();
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/plain.sock", .{tmp.sub_path});
+    const path = try tmp.pathAlloc(gpa, "plain.sock");
     defer gpa.free(path);
 
     var app = nilo.App.init(gpa);

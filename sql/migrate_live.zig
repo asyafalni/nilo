@@ -6,11 +6,12 @@
 //! that property. So the half that sends statements is tested here, where the
 //! module graph already exists.
 //!
-//! **A file rather than `:memory:`**, and that is not incidental. `db.raw` is
-//! routed by its first keyword and an in-memory database's URI `mode=` beats
-//! the flags a reader was opened with, so a statement that goes the wrong way
-//! quietly succeeds there and fails on a file
+//! **A file rather than `:memory:`**, and that is not incidental. A migration
+//! runs in WAL on a file, and an in-memory database answers `memory` to the
+//! same pragma, so the journal mode production runs in is only met here
 //! ([ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)).
+//! The reader backstop under `db.raw`'s routing used to be a second reason, and
+//! holds in memory now that a reader is `query_only`.
 //! A test that cannot fail the way production does is worse than no test.
 //!
 //! **No Engine anywhere.** `.in_fiber` means a statement runs on the thread it
@@ -53,7 +54,7 @@ const User = struct {
 /// A database in a temporary directory, its pool open, and a Scope to run
 /// through. By pointer, because `db` is handed out by address.
 const Fixture = struct {
-    dir: std.testing.TmpDir,
+    dir: core.TmpDir,
     path: [:0]const u8,
     threaded: std.Io.Threaded,
     db: Db,
@@ -69,15 +70,10 @@ const Fixture = struct {
         const self = try gpa.create(Fixture);
         errdefer gpa.destroy(self);
 
-        var dir = std.testing.tmpDir(.{});
+        var dir = core.tmpDir();
         errdefer dir.cleanup();
 
-        const path = try std.fmt.allocPrintSentinel(
-            gpa,
-            ".zig-cache/tmp/{s}/{s}.db",
-            .{ dir.sub_path, name },
-            0,
-        );
+        const path = try dir.pathAlloc(gpa, name);
         errdefer gpa.free(path);
 
         self.* = .{

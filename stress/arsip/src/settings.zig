@@ -46,9 +46,8 @@ pub const Settings = struct {
 
     log_level: enum { debug, info, warn } = .info,
 
-    /// Where the accounts live. A path, or SQLite's URI form — a bare
-    /// `:memory:` is refused when the pool opens, because a pool of them is
-    /// several separate empty databases.
+    /// Where the accounts live. A path, or SQLite's URI form; `:memory:` is a
+    /// database private to the pool, gone when the process stops.
     ///
     /// It has a default and a database URL normally should not, which is the
     /// point of the milestone: a database that is a file has nothing to run

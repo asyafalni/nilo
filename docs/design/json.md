@@ -9,7 +9,7 @@ The code is `http/json.zig` (`write`, `covers`, `isByteSlice`, `writesItsOwnScal
 ## Overview
 
 ```
-              nilo_json (.tag, .rename_all, .rename, .unknown_fields)
+              nilo_json (.tag, .rename_all, .rename, .unknown_fields, .misfit)
                          |
         Mark.of(T) ── checkTag, checkRenames ── comptime refusal
                          |
@@ -43,6 +43,7 @@ nilo writes a struct with its own generated writer (the struct is "covered") unl
 11. **A body field is read back the same way it is written.** A type with `nilo_parse` adds `pub const jsonParse = nilo.jsonParseFor(@This());` and is read from the single string or number token `nilo_parse` already accepts. A body containing such a type without a reader is rejected, naming the route. [ADR 166](../adr/166-a-body-field-that-parses-itself.md)
 12. **A type can describe what input it expects with `nilo_expects`**, and every place a value can arrive (path, query, form, body) uses it; see [request-input](request-input.md) for the wider conversion rules this is part of. [ADR 166](../adr/166-a-body-field-that-parses-itself.md)
 13. **A struct can skip the keys a body has that it has no field for**, with `.unknown_fields = .ignore`. It is per type, so a strict parent still refuses its own keys and a tolerant one still has its strict child refuse; on a union it goes on the variant's payload. A skipped value is held to 64 levels, a repeated known key is still a 400, the document says `additionalProperties: true` for it and nothing for any other struct, and a payload under an externally tagged union stays strict because `std.json` reads it. [ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)
+14. **A body type can answer JSON of the wrong shape with a 422**, with `.misfit = 422`. Text that is not JSON, an empty body and one nested past 64 levels stay a 400; everything said after the body has been read as JSON (a missing field, a wrong kind, an unknown or repeated key, a body that is not an object) keeps its sentence and takes the 422, under `Bound(T)` too. It is the body type's alone, 422 is the only value, and the document lists the 422 beside the 400. [ADR 251](../adr/251-json-that-does-not-fit-can-be-a-422.md)
 
 ## Decisions
 
@@ -55,6 +56,7 @@ nilo writes a struct with its own generated writer (the struct is "covered") unl
 | [163](../adr/163-a-document-is-its-value.md) | `nilo_json_of`: a type that names a document is written and described as that document |
 | [166](../adr/166-a-body-field-that-parses-itself.md) | A body field is read through `jsonParseFor`, backed by `nilo_parse`; `nilo_expects` |
 | [168](../adr/168-one-field-can-be-spelled-on-its-own.md) | `.rename`: one field named on its own, alongside `.rename_all`; `.unknown_fields = .ignore` |
+| [251](../adr/251-json-that-does-not-fit-can-be-a-422.md) | `.misfit = 422`: a body type answers JSON of the wrong shape with a 422, and text that is not JSON stays a 400 |
 
 Related topics: the tagged-union encoding and the API document built from the same markers are [ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md); the wider conversion rules, including `nilo_parse` and `nilo_expects` outside a JSON body, are [request-input](request-input.md); the response wrappers a JSON value is sent through (`?T`, `Status`, `Response`) and types that write something other than JSON are [responses](responses.md).
 

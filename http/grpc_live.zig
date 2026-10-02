@@ -78,15 +78,15 @@ const Serving = struct {
 };
 
 const SocketDir = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
+    tmp: nilo.testing.TmpDir,
+    path: [:0]u8,
 
     fn init(gpa: std.mem.Allocator, name: []const u8) !SocketDir {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = nilo.testing.tmpDir();
         errdefer tmp.cleanup();
         return .{
             .tmp = tmp,
-            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name }),
+            .path = try tmp.pathAlloc(gpa, name),
         };
     }
 

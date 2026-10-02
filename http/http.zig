@@ -726,8 +726,10 @@ pub const deadline = @import("deadline.zig").with;
 ///
 /// `listen()`'s `max_body` is one number for every route, and an import and
 /// a sign-in do not have the same budget. Bounds every read into the arena
-/// and not `c.bodyStream()`, which has its own
-/// ([ADR 155](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
+/// and not `c.bodyStream()`, which has its own. Handed `&limit`, the address
+/// of a `usize` filled before `listen()`, it reads the number from there on
+/// each request, for a cap that comes from configuration
+/// ([ADR 156](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
 pub const maxBody = @import("maxbody.zig").with;
 
 /// Static files, held in memory (ADR 009). Used through `app.static()`;
