@@ -153,12 +153,14 @@ Requests are counted per **route**, not per path: `/users/1` and `/users/2` both
 | | Default |
 |---|---|
 | `min_bytes` | `1024`: bodies shorter than this are sent uncompressed |
-| `max_bytes` | `1048576`: bodies longer than this are sent uncompressed, because gzipping runs whole on the executor thread (about 7 ms a megabyte at `.default`). `0` means no limit |
-| `level` | `.default`, zlib's level 6. `.fastest` is level 1, `.best` is level 9 |
+| `max_bytes` | `1048576`: bodies longer than this are sent uncompressed, because gzipping runs whole on the executor thread (about 7 ms a megabyte at `.default`, 2.4 ms in a libdeflate build). `0` means no limit |
+| `level` | `.default`, zlib's level 6. `.fastest` is level 1, `.best` is level 9; in a libdeflate build, levels 1, 6 and 7 |
 
 A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never compressed, and a strong `ETag` becomes weak when the body is ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 **What it costs:** one compressor per thread, about 288 KB each, created when the middleware chains are resolved; one arena allocation for each compressed response; and tens of microseconds of gzip per body (`zig build bench-compress` has the table). Nothing per connection, and nothing on a response that is not compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+
+**Which deflate** is the build's: the standard library's by default, and [libdeflate](https://github.com/ebiggers/libdeflate) when the dependency is given `.libdeflate = true` (`-Dlibdeflate` in this repository), for responses and static files alike. The options, their defaults and which bodies are compressed are the same in both; the libdeflate build gzips in a quarter to a third of the time, holds a compressor in one mapping kept off huge pages (8 KB resident until it is first used, about 229 KB after), and costs about 42 KB of binary. It links no libc ([ADR 248](../adr/248-gzip-is-libdeflate-when-a-build-asks-for-it.md)).
 
 ### `trace` options
 

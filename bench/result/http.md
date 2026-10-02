@@ -3186,6 +3186,121 @@ On 1 MB, `std.flate` 6 is 106,428 bytes in 21.8 ms, libdeflate 6 is 80,635 in 10
 
 **Can it be pushed further.** Yes, three ways. Run it again on a quiet machine and on a Zen 5, since the ratios have been measured only on this one. Measure the RSS libdeflate actually touches on a small body, which is bounded by the 668 KB above and not yet known. And the memset fix goes upstream to Zig, which every nilo build would get for nothing.
 
+## libdeflate against `std.flate` on a quiet Zen 5, and what it keeps resident
+
+**What was run.** `bench/compare-compress/run_all.sh` as it stands, with HttpArena's `data/` at `484dea6`, and the new `rss.zig` beside it: each compressor alone in an anonymous mapping under `MADV_NOHUGEPAGE`, its resident pages counted with `mincore` after the allocation, after one 4 KB body (`arena-25`), after ten more small bodies, and after a 1 MB one (`arenalarge-all`). The std.flate slot is built the way `Pool.init` builds it, `Compress.init` once and the in-place `reset` before each body. libdeflate 1.26 (`92e6a0d`), the same flags as the run above.
+
+**Machine and commit.** AMD Ryzen 7 9700X (Zen 5, eight cores and sixteen threads), Linux 7.2.5, Zig 0.16.0, nilo `bb0f859`. **The machine was quiet**: load 0.3 when it started, and thread CPU time and wall-clock medians agree to 0.2% (`arena-25` at libdeflate 6, 10.11 against 10.13 µs), so here the figures are what a server pays. Seven interleaved repetitions, spread under 5% on every row quoted. Every output is the same byte count as on the Xeon, so both runs timed the same work.
+
+Median a body, and the ratio beside the Xeon's:
+
+| body | `std.flate` 6 | libdeflate 6 | × `std.flate` 6 | on the Xeon |
+|---|---|---|---|---|
+| arena-25 (4,190 B) | 946 B, 40.3 µs | 937 B, 10.1 µs | 0.25 | 0.32 |
+| arena-40 (6,707 B) | 1,299 B, 53.6 µs | 1,270 B, 14.7 µs | 0.27 | 0.41 |
+| arena-50 (8,397 B) | 1,521 B, 63.2 µs | 1,478 B, 18.0 µs | 0.28 | 0.44 |
+| bench-400 (65,705 B) | 7,191 B, 420 µs | 5,891 B, 144 µs | 0.34 | |
+| bench-6400 (1,057,992 B) | 106,428 B, 6.96 ms | 80,635 B, 2.52 ms | 0.36 | 0.49 |
+| arenalarge-all (1,070,913 B) | 152,254 B, 9.26 ms | 140,345 B, 5.85 ms | 0.63 | |
+
+Bytes resident, per compressor:
+
+| | allocated | after the allocation | one 4 KB body | ten more small | one 1 MB body |
+|---|---|---|---|---|---|
+| `std.flate` slot, any level | 295,640 | 172,032 | 184,320 | 196,608 | 299,008 |
+| libdeflate 1 | 202,759 | 8,192 | 143,360 | 143,360 | 176,128 |
+| libdeflate 6 | 668,295 | 8,192 | 217,088 | 229,376 | 376,832 |
+| libdeflate 9 | 668,295 | 8,192 | 217,088 | 229,376 | 368,640 |
+
+Two runs of `rss` gave the same pages to the byte. The size probes match the run above: libdeflate with no libc is 69,352 bytes against 4,840 for the empty program, the same +64.5 KB.
+
+Stack one call writes below its caller (`stack.zig`: the thread's stack painted, one call, the deepest changed byte), the same on every body from 4 KB to 1 MB to within 304 bytes, and the same over three runs:
+
+| | libdeflate 1 | libdeflate 6 and 9 | `std.flate` 1 and 6 (reset, write, finish) |
+|---|---|---|---|
+| stack | 2,768 B | 3,120 B | 7,416 to 7,720 B |
+
+**Built with no libc.** The plain nilo build links no libc, so the library was also compiled for `x86_64-linux-none` with `-DFREESTANDING -ffreestanding -fbuiltin -mevex512 -O2` (`-mevex512` because LLVM refuses the AVX-512 CRC path without it, which is why `build_libs.sh` passes it too). Linked with `utils.c`, the program's `memcpy` was libdeflate's: a 288-byte byte loop that `utils.c` defines weak under `FREESTANDING`, and that won the link over compiler_rt's for every caller in the program, Zig's own included. Linked without `utils.c`, and with its four other symbols (`libdeflate_aligned_malloc`, `libdeflate_aligned_free` and the two default allocator pointers, left null) written in Zig, `memcpy` was compiler_rt's and the output the same. Freestanding against the glibc build, best of seven, three interleaved runs on one pinned core: `arena-25` 10.02 to 10.04 µs against 9.99 to 10.04, `bench-400` 141.3 to 141.6 µs against 140.9 to 141.0, so no difference on the small body and under 0.5% on the larger.
+
+**What it showed.**
+
+- **On Zen 5 libdeflate 6 takes a quarter of `std.flate` 6's time on the arena's bodies**, 0.25 to 0.28 against 0.32 to 0.44 on the busy Xeon, and 0.36 on 1 MB against 0.49. The ratios did not carry between machines; they moved in libdeflate's favour. The margin is narrowest on the 1 MB body made of HttpArena's large dataset, 0.63, and why was not looked into.
+- **The cost in memory is +32 KB a thread, not +373 KB.** libdeflate allocates 668 KB and writes 229 KB of it on small bodies, against 197 KB for today's slot; a body at the default `max_bytes` takes it to 377 KB against 299 KB, +78 KB. On sixteen threads that is half a megabyte steady and 1.2 MB at the ceiling. The 373 KB on the roadmap was the allocation, which no page fault ever reaches in full below the largest bodies.
+- **That holds only off huge pages.** The first `rss` run had no `madvise` and reported 2 MB resident for every compressor, because this host runs transparent huge pages as `always`. `Pool.init` takes every slot in one `gpa.alloc`, so sixteen 668 KB compressors in one mapping would be backed by 2 MB pages and resident whole, 10.7 MB. A libdeflate pool wants `MADV_NOHUGEPAGE` on its mapping, or one mapping a compressor too small to hold a huge page. Read from `Pool.init` and the probe, not measured through nilo's pool.
+- **It is the cheaper of the two on the stack**: 3.1 KB, under a page, against 7.4 KB for today's path. A fiber that compresses holds one page fewer at its high-water mark (ADR 062).
+- **`.best` cannot become libdeflate 9.** On 1 MB libdeflate 9 is 17.5 ms against 12.8 for `std.flate` 9, and on 65 KB it is six times libdeflate 6 for 0.4% fewer bytes, so the time `max_bytes` was sized against would not hold.
+- Both 1 MB bodies are just over the default `max_bytes` (1,048,576), so under the default they go out plain; they are here as the ceiling.
+
+**The decision it moved.** The roadmap's question had three parts that wanted numbers, and this run answers them: the ratio on a quiet machine and a Zen 5, and the pages a small body touches. The fourth, whether HttpArena's `standard` mode counts a C library behind a flag, does not decide it: the time is what any JSON API pays. The entry moves from *Open questions* to *Next* as a build behind `-Dcompress=libdeflate`.
+
+**Can it be pushed further.** Yes. Measure the resident pages through nilo's own `Pool` on a running server, with and without huge pages, rather than through the probe. Time levels 7 and 8 on the 1 MB bodies, which is what choosing `.best` needs. And take the ratio on aarch64, where libdeflate has its own NEON and PMULL paths and nothing here has been run.
+
+## libdeflate behind `-Dlibdeflate`, measured through nilo
+
+Taken for [ADR 248](../../docs/adr/248-gzip-is-libdeflate-when-a-build-asks-for-it.md), on the build that ships it rather than on the copies in `bench/compare-compress/`. AMD Ryzen 7 9700X, Linux 7.2.5 with transparent huge pages `always` (defrag `madvise`), Zig 0.16.0, libdeflate 1.26 from the release tarball, against nilo `bb0f859` as the before (`git archive HEAD`, same flags, same afternoon). Every build `-Dtarget=x86_64-linux-gnu`, so baseline x86-64 with the AVX-512 and PCLMUL paths taken at run time. Another user's benchmark held seven cores for part of the afternoon; the timings below were taken after it had finished, with load under 2, pinned to one core.
+
+**`zig build bench-compress`, through `Pool.gzip`**, `std` and `-Dlibdeflate` interleaved, two runs each, which agree to 0.5%. The standard library's rows are ADR 211's table to the tenth of a microsecond.
+
+| body | `.fastest` std / libdeflate | `.default` std / libdeflate | `.best` std / libdeflate |
+|---|---|---|---|
+| 25 items, 4,091 B | 873 B, 35.0 µs / 813 B, 5.3 µs | 748 B, 37.5 µs / 727 B, 9.4 µs | 744 B, 38.1 µs / 727 B, 9.7 µs |
+| 40 items, 6,553 B | 1,252 B, 44.2 µs / 1,184 B, 6.8 µs | 1,041 B, 49.8 µs / 1,000 B, 13.5 µs | 1,036 B, 51.4 µs / 999 B, 16.3 µs |
+| 50 items, 8,178 B | 1,483 B, 50.2 µs / 1,411 B, 7.9 µs | 1,225 B, 58.3 µs / 1,180 B, 16.5 µs | 1,218 B, 62.8 µs / 1,177 B, 21.5 µs |
+| 991,794 B | 145,619 B, 4.15 ms / 133,248 B, 1.01 ms | 99,794 B, 6.48 ms / 75,665 B, 2.39 ms | |
+| 19,986,580 B | 2,916,434 B, 82.9 ms / 2,662,816 B, 20.2 ms | 1,991,571 B, 129.8 ms / 1,501,171 B, 47.2 ms | |
+
+**Which libdeflate level `.best` should be**, `bench/compare-compress` bodies, thread CPU time, median of seven (taken while the other benchmark was running, so the spread is the figure to trust: under 3% on every row):
+
+| body | 6 | 7 | 8 | 9 | `std.flate` 9 |
+|---|---|---|---|---|---|
+| arena-50 (8,397 B) | 1,478 B, 18.2 µs | 1,466 B, 23.2 µs | 1,459 B, 30.4 µs | 1,459 B, 30.3 µs | 1,507 B, 68.9 µs |
+| bench-400 (65,705 B) | 5,891 B, 147 µs | 5,882 B, 249 µs | 5,870 B, 640 µs | 5,867 B, 901 µs | 6,482 B, 706 µs |
+| bench-6400 (1,057,992 B) | 80,635 B, 2.58 ms | 80,506 B, 4.18 ms | 80,302 B, 11.5 ms | 80,262 B, 17.7 ms | 89,442 B, 12.8 ms |
+| arenalarge-all (1,070,913 B) | 140,345 B, 5.92 ms | 138,051 B, 9.40 ms | 135,611 B, 22.6 ms | 134,881 B, 31.1 ms | 145,790 B, 24.2 ms |
+
+**Stack one `Pool.gzip` writes below its caller**, `zig build bench-compress-stack -Dlibdeflate`, every level, bodies of 3.9 KB, 58 KB and 888 KB:
+
+| mode | `std.flate` | libdeflate |
+|---|---|---|
+| Debug | 13,216 to 14,112 B | 5,720 to 6,496 B |
+| ReleaseSafe | 7,488 to 7,968 B | 2,272 to 2,624 B |
+| ReleaseFast | 7,432 to 7,720 B | 2,272 to 2,624 B |
+
+**Resident memory on a running server**, `bench/compress_rss.py` against `bench/compress_server.zig` on sixteen threads, an 8 KB JSON answer, 128 keep-alive connections of 200 requests each, first without `Accept-Encoding` and then with it. Three builds interleaved, two runs each: the standard library's, libdeflate's, and libdeflate's with the `madvise` taken out (a one-line edit for the measurement, reverted). Bytes:
+
+| | idle | after the plain load | after the gzip load | AnonHugePages | pool mapping, idle / after gzip |
+|---|---|---|---|---|---|
+| `std.flate` | 12,337,152 | 14,446,592 to 14,462,976 | 16,666,624 to 16,781,312 | 2,097,152 | (in the heap) |
+| libdeflate | 8,765,440 to 8,777,728 | 10,854,400 to 10,993,664 | 12,963,840 to 13,037,568 | 0 | 131,072 / 794,624 to 1,236,992 |
+| libdeflate, no advice | 17,055,744 to 19,124,224 | 19,275,776 to 21,299,200 | 20,635,648 to 22,786,048 | 8,388,608 to 10,485,760 | |
+
+**Binary size**, `zig build examples -Doptimize=ReleaseFast -Dstrip=true`:
+
+| | `hello` | `rest` |
+|---|---|---|
+| before (`bb0f859`) | 1,011,504 | 1,248,568 |
+| after, default build | 1,011,504 | 1,248,568 |
+| after, `-Dlibdeflate` | 1,053,200 (+41,696) | 1,290,672 (+42,104) |
+
+The same two builds unstripped: `memcpy` is 524 bytes in both, compiler_rt's, and the libdeflate build has no symbol under `flate.Compress` where the default one has nine.
+
+**Other targets.** `bench-compress-server -Dlibdeflate` cross-builds and links for `aarch64-linux-gnu`, `aarch64-macos` and `x86_64-macos`. Built for `aarch64-linux-musl` and run under `qemu-aarch64-static`, `bench-compress -Dlibdeflate` gave every byte count of the x86 run above, and `zig build test` passed, with one test skipped: qemu's user mode answers `MADV_NOHUGEPAGE` with `EINVAL`, as a kernel built without transparent huge pages does, so the check that the pool's mapping carries `nh` now skips where the advice is refused rather than failing. No timing was taken under the emulator.
+
+**What a dependent fetches.** `zig build fetch-check -Dnetwork` fails on this host before it counts, at the link of the dependent, which builds native and meets the GCC 16 `crt1.o` relocation; the tree before this change fails the same way. The fetch it exists to watch had already happened: `bench/dependent/zig-pkg/` held `zio` and nothing else after the run.
+
+**What it showed.**
+
+- **Through nilo the ratio is the one the copies measured**: 0.25, 0.27 and 0.28 of `std.flate`'s time at `.default` on the arena's bodies, 0.37 on a megabyte, 0.36 on twenty.
+- **`.best` is level 7.** It is smaller than `std.flate` 9 on every body, faster than `std.flate` 6 on `bench-6400` and level with it on `arenalarge-all` (9.40 against 9.26 ms); 8 and 9 buy at most 2.3% for up to four times the time, and 9 on a megabyte is slower than the standard library's own `.best`.
+- **A libdeflate server holds less, not more.** Idle, 8.8 MB against 12.3, because `Compress.init` writes 172 KB of every standard-library slot at startup and libdeflate writes 8 KB of a compressor until it is used; after the gzip load 13.0 MB against 16.7. The pool mapping held 0.8 to 1.2 MB, about three to five compressors' worth past the 8 KB each starts with: a borrow takes the lowest free slot and this client never kept more busy at once, so the rest were never touched. Sixteen in use would be 3.7 MB on the probe's 229 KB each.
+- **The advice is worth 8 to 10 MB here.** Without it the pool mapping, 10.7 MB, was backed by four or five huge pages before a request arrived.
+- **The standard library's build has huge pages too**: 2 MB of AnonHugePages, which its slots, one `gpa.alloc` of 4.7 MB, are the likely owner of; which mapping it is was not looked at. Most of each slot is written at startup anyway, so the advice would save less there; not changed here, and not measured.
+- **The default build is unchanged to the byte**, and the libdeflate build is +41.7 KB and +42.1 KB, not the +64.5 KB of the probe, because the standard library's compressor leaves it.
+
+**The decision it moved.** ADR 248 as written: the flag, level 7 for `.best`, one mapping under `MADV_NOHUGEPAGE`, and the size row in ADR 017.
+
+**Can it be pushed further.** The resident figure with sixteen compressors busy at once wants a load generator that keeps sixteen requests compressing, which a Python client does not. aarch64 has been run, not timed. And the standard library's pool could take the same advice, worth a run of its own.
+
 ## What a route deadline's write clamp costs
 
 **What was not run.** No throughput benchmark: the change is one indirect call and the stores it makes into the Engine's `Clocks` per request (`serve.handleConnection` re-arms the write limit before each request), and, for a route with a deadline, the same again where its answer is written. `test "the request path stays inside its allocation budget"` passes unchanged, nothing is held per connection (the `Deadlines` the connection already carries is read, not grown), and the test that found the defect (`a route deadline shortens the write to a client that reads nothing`, a 96 MB answer to a client that reads nothing, 200 ms against a 30,000 ms write limit) returns in about the deadline instead of failing at its six-second bound. A figure for the per-request re-arm belongs here the next time the paced benchmark is run on this path.

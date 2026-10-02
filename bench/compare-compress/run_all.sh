@@ -28,6 +28,15 @@ zig cc $T -O3 -DNDEBUG -fno-sanitize=all -Izlib-ng -Ilibdeflate zng_bench.c zlib
 taskset -c 1 ./harness    > run.csv   2>&1
 taskset -c 1 ./sweep      > sweep.csv 2>&1
 taskset -c 1 ./zng_bench  > zng.csv   2>&1
+
+# Resident memory: the pages each compressor touches, by mincore.
+zig build-exe rss.zig        -O ReleaseFast $T -lc $G/libdeflate.a -femit-bin=rss
+./rss
+
+# Stack: the deepest byte one compression call writes below its caller.
+zig build-exe stack.zig      -O ReleaseFast $T -lc $G/libdeflate.a -femit-bin=stack
+./stack
+
 python3 analyze.py run.csv            # per body: median, min, max, spread
 python3 score.py sweep.csv zng.csv    # HttpArena json-comp score model
 

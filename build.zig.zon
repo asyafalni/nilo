@@ -64,6 +64,16 @@
             .hash = "tls-0.1.0-ER2e0kvdBgABZ6SYdVWmbLYIb-42yDaDpz9nIzA2OXTB",
             .lazy = true,
         },
+        // libdeflate's compressor behind `-Dlibdeflate` (ADR 248), lazy and
+        // behind its flag for the reason the drivers are. The upstream
+        // release tarball, compiled by `build.zig` itself rather than through
+        // a Zig wrapper package, so a Zig release changes nothing here: the
+        // one wrapper that exists pinned 1.18 and left `crc32.c` out.
+        .libdeflate = .{
+            .url = "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz",
+            .hash = "N-V-__8AAEaRCwCsYb_rSsH72Pb6DNFQLSjdRzTFOVsJWcoB",
+            .lazy = true,
+        },
         // Node's HTTP parser, as a second reading of RFC 9112 for
         // `zig build fuzz-llhttp` (ADR 231), and linked into nothing else.
         // C, so it waits behind `-Dllhttp` as well as `.lazy`. A release

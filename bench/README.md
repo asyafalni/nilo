@@ -44,7 +44,8 @@ Each ref is exported into a tree of its own and built pinned, and `bench/release
 ```
 zig build bench-cache          # what a cache operation costs, and what an entry weighs
 zig build bench-cache-hitrate  # what fraction of lookups it answers, against the best it could
-zig build bench-compress       # what gzipping a JSON answer costs at each level, in µs and bytes
+zig build bench-compress       # what gzipping a JSON answer costs at each level, in µs and bytes; -Dlibdeflate for the other backend
+zig build bench-compress-stack # the stack one gzip writes below its caller, per backend, in the -Doptimize asked for
 zig build bench-sql            # what a prepared statement is worth: SQLite always, Postgres if reachable
 zig build bench-job            # what a claim and a push cost on job.Memory, SQLite, and Postgres if reachable
 zig build bench-proto          # protobuf decode and encode, against a decoder written by hand; pin it with taskset
@@ -60,6 +61,7 @@ zig build bench-sql-server     # every request reads Postgres
 zig build bench-fetch-server   # every request calls out
 zig build bench-s3-server      # every request reads an object store
 zig build bench-body-server    # every request reads a body
+zig build bench-compress-server # every answer gzipped on sixteen threads; -Dlibdeflate for the other backend
 zig build bench-ws-server      # idle WebSockets, for what one costs
 zig build bench-stream-server  # held-open streams, for what one costs
 zig build bench-tls-server -Dtls   # the benchmark server over TLS; absent without the flag
@@ -74,6 +76,7 @@ python3 bench/mem.py --port … --path …          # memory per idle connection
 python3 bench/mem.py --port … --path … --hold   # the same for a stream nobody closes
 python3 bench/mem.py --port … --path … --tls    # the same through TLS 1.3, against bench-tls-server
 python3 bench/slowloris.py --port … --path …    # what a body that never finishes holds (VmData, not just VmRSS)
+python3 bench/compress_rss.py ./zig-out/bin/nilo-bench-compress-server  # what the compressor pool keeps resident (ADR 248)
 python3 bench/ws_idle.py both                   # memory per idle WebSocket, nilo and gws
 python3 bench/paced.py --pid … --port … --rate …  # µs of CPU a request at a fixed rate: a server that is not busy (ADR 199)
 python3 bench/shutdown.py --cmd … --port …      # does SIGTERM come back? (ADR 077)

@@ -320,7 +320,7 @@ From then on, every answer that is text, at least a kilobyte long, and going to 
 |---|---|
 | `min_bytes` | `1024`: shorter bodies go out as they are; compressing a hundred bytes makes them longer |
 | `max_bytes` | `1048576` (1 MiB): longer bodies go out as they are, because gzipping one holds its thread for the whole of it, about 7 ms a megabyte at `.default` and 130 ms for 20 MB. `0` means no limit |
-| `level` | `.default`, zlib's level 6. `.fastest` is level 1, roughly a fifth larger and a little quicker; `.best` is level 9, under one percent smaller and five to nine percent slower |
+| `level` | `.default`, zlib's level 6. `.fastest` is level 1, roughly a fifth larger and a little quicker; `.best` is level 9, under one percent smaller and five to nine percent slower. In a libdeflate build (below) they are levels 1, 6 and 7 |
 
 The options are in [the reference](../reference/app.md#compress-options).
 
@@ -329,6 +329,15 @@ Text means the same list static files use: `text/*`, JSON, JavaScript, XML, WASM
 **Three things are never compressed here.** A static file, because it was gzipped once when the App was built and that copy costs nothing per request ([Static files](./static-files.md#compression)). A stream, because it has no whole body to compress and would hold a compressor across every write. An event stream, because it must never be buffered at all ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 **What it costs.** One compressor per thread, about 288 KB each, allocated once when the chains are resolved and never on a connection's stack: 4.6 MB on sixteen threads. One arena allocation on a compressed request, for the compressed body, and none on a request that is not compressed. And the gzip itself: for a 4 KB JSON answer at `.default`, about 37 µs on one core, of which 6 µs is resetting the compressor. `zig build bench-compress` prints the table for your machine. Nothing per connection, and nothing on a request under the threshold, which a test checks.
+
+**A build can gzip in a quarter of the time.** The default compressor is the standard library's; passing `.libdeflate = true` to the dependency gzips with [libdeflate](https://github.com/ebiggers/libdeflate) instead, for answers and for static files alike ([ADR 248](../adr/248-gzip-is-libdeflate-when-a-build-asks-for-it.md)):
+
+```zig
+// build.zig
+const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .libdeflate = true });
+```
+
+Nothing in your code changes, and the same bodies go out gzipped. A 4 KB JSON answer takes about 9 µs rather than 37 and comes out a little smaller, a megabyte about 2.4 ms rather than 7, and a server on sixteen threads holds less memory than the default build, because a libdeflate compressor costs nothing resident until it is used. What you pay is about 42 KB of binary and a C library compiled into it, with no libc needed; a build without the flag fetches and compiles none of it.
 
 ## Content types
 

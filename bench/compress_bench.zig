@@ -3,7 +3,12 @@
 //!
 //! ```
 //! zig build bench-compress
+//! zig build bench-compress -Dlibdeflate
 //! ```
+//!
+//! `-Dlibdeflate` times libdeflate through the same `Pool` (ADR 248); the
+//! two builds' tables side by side are the comparison, on the same machine
+//! the same afternoon.
 //!
 //! Always `ReleaseFast`: a Debug deflate is a different program. No server
 //! and no socket, because the number wanted is the compressor's alone: the

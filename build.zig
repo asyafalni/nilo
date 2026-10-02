@@ -3356,7 +3356,7 @@ fn s3For(
 }
 
 /// `-Dtls`, and whether this is the repository building itself. Read by
-/// `wireTls` below, which every instance of the http module goes through.
+/// `wireOptions` below, which every instance of the http module goes through.
 var want_tls: bool = false;
 var in_repo: bool = false;
 /// `-Dgrpc` (ADR 220). No dependency behind it, unlike `-Dtls`: what it
@@ -3364,9 +3364,14 @@ var in_repo: bool = false;
 /// counts, rather than a fetch.
 var want_grpc: bool = false;
 
+/// `-Dlibdeflate` (ADR 248): gzip through libdeflate rather than
+/// `std.flate`, for a response and for a static file gzipped at load.
+var want_libdeflate: bool = false;
+
 /// What every instance of the http module is given so that
 /// `http/engine/zio.zig` can ask `@import("nilo_build").tls` and, when the
-/// answer is yes, `@import("tls")` (ADR 212).
+/// answer is yes, `@import("tls")` (ADR 212), and `http/compress.zig` can
+/// ask which deflate it gzips with (ADR 248).
 ///
 /// `on` decides both. The library is reached through `lazyDependency`
 /// **inside** the `if`, which is what makes the manifest's `.lazy = true`
@@ -3375,18 +3380,81 @@ var want_grpc: bool = false;
 /// carries no import named `tls`, so a `@import("tls")` reached from it is a
 /// compile error rather than a link, and the comptime `if` in the Engine is
 /// what keeps it from being reached.
-fn wireTls(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, mode: std.builtin.OptimizeMode, on: bool, grpc: bool) void {
+///
+/// libdeflate is the same shape with one difference: `link_libdeflate` can
+/// be true while `want_libdeflate` is not. That is this repository's own
+/// http test root, which links the library whatever the flag says so that
+/// `compress.zig`'s tests hold both backends in one run, while the App
+/// under test keeps the backend a dependent gets by default.
+fn wireOptions(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, mode: std.builtin.OptimizeMode, on: bool, grpc: bool, link_libdeflate: bool) void {
     const opts = b.addOptions();
     opts.addOption(bool, "tls", on);
     // gRPC rides the same options module. It has no library to fetch, so
     // there is nothing to wire beyond the flag (ADR 220).
     opts.addOption(bool, "grpc", grpc);
+    const linked = link_libdeflate or want_libdeflate;
+    opts.addOption(bool, "libdeflate", want_libdeflate);
+    opts.addOption(bool, "libdeflate_linked", linked);
     module.addImport("nilo_build", opts.createModule());
     if (on) {
         if (b.lazyDependency("tls", .{ .target = target, .optimize = mode })) |dep| {
             module.addImport("tls", dep.module("tls"));
         }
     }
+    if (linked) {
+        if (libdeflateFor(b, target)) |lib| module.linkLibrary(lib);
+    }
+}
+
+/// libdeflate's compressor as a static library, from the upstream release
+/// tarball (ADR 248). Nothing of it but compression: no decompressor, no
+/// zlib or raw-deflate wrapper beyond what gzip calls, and **not
+/// `lib/utils.c`**, whose freestanding `memcpy` and `memset` are weak byte
+/// loops that won the link for the whole program when it was in.
+/// `http/libdeflate.zig` provides the four symbols the rest needs from it.
+///
+/// Always `ReleaseFast`, whatever the program is built as, the way
+/// `bench-compress` is: a Debug deflate is a different program, and C at
+/// `-O0` under the undefined-behaviour sanitizer is not the library that
+/// was measured. `FREESTANDING` with `-fbuiltin` because nilo's plain build
+/// links no libc: the macro keeps libdeflate from naming `malloc`, and the
+/// builtins keep `memcpy` of a constant size a load rather than a call.
+///
+/// On x86 the target gains `evex512`, because LLVM refuses the AVX-512
+/// CRC path without it and refuses `-mevex512` as a flag. It enables no
+/// instruction by itself: the AVX-512 code is in functions that switch the
+/// features on by attribute and are chosen at run time from `cpuid`, so a
+/// baseline x86_64 build runs on any x86_64 and takes the wide path where
+/// there is one.
+fn libdeflateFor(b: *std.Build, target: std.Build.ResolvedTarget) ?*std.Build.Step.Compile {
+    const dep = b.lazyDependency("libdeflate", .{}) orelse return null;
+    const c_target = if (target.result.cpu.arch.isX86()) blk: {
+        var query = target.query;
+        query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.evex512));
+        break :blk b.resolveTargetQuery(query);
+    } else target;
+    const lib = b.addLibrary(.{
+        .name = "nilo-libdeflate",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = c_target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const flags: []const []const u8 = &.{ "-std=c99", "-DFREESTANDING", "-ffreestanding", "-fbuiltin", "-DNDEBUG", "-fno-sanitize=all" };
+    lib.root_module.addIncludePath(dep.path("."));
+    lib.root_module.addCSourceFiles(.{
+        .root = dep.path("lib"),
+        .files = &.{
+            "deflate_compress.c",
+            "gzip_compress.c",
+            "crc32.c",
+            "x86/cpu_features.c",
+            "arm/cpu_features.c",
+        },
+        .flags = flags,
+    });
+    return lib;
 }
 
 /// A copy of the server for one optimize mode, for a test root that needs a
@@ -3415,7 +3483,7 @@ fn httpFor(
             .{ .name = "nilo_pw", .module = pwFor(b, target, mode) },
         },
     });
-    wireTls(b, module, target, mode, want_tls, want_grpc);
+    wireOptions(b, module, target, mode, want_tls, want_grpc, false);
     return module;
 }
 
@@ -4668,6 +4736,16 @@ pub fn build(b: *std.Build) void {
         "grpc",
         "Build the gRPC listener into nilo_http: unary calls over h2c (ADR 220). Off until a dependent passes `.grpc = true`",
     ) orelse false;
+    // Whether gzip is libdeflate's (ADR 248). Off until asked, the way TLS
+    // is: the C is fetched and compiled only behind this flag, and a build
+    // without it gzips with `std.flate` exactly as before. What is always
+    // on, in this repository, is the test of it: the http test root links
+    // the library whatever the flag says, as it builds TLS in.
+    want_libdeflate = b.option(
+        bool,
+        "libdeflate",
+        "Gzip responses and static files with libdeflate instead of std.flate, and fetch it (ADR 248). Off until a dependent passes `.libdeflate = true`",
+    ) orelse false;
 
     // The bottom layer: what every other one agrees about, and nothing else
     // (ADR 038). It names no Engine and does no IO, which is why it is the
@@ -4828,7 +4906,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_pw", .module = nilo_pw },
         },
     });
-    wireTls(b, nilo_http, target, optimize, want_tls, want_grpc);
+    wireOptions(b, nilo_http, target, optimize, want_tls, want_grpc, false);
 
     // The SQL module: a second module beside the library rather than inside
     // it (ADR 036). It lives in `sql/` rather than under `src/` so that the
@@ -5577,7 +5655,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_fetch", .module = fetchFor(b, target, .ReleaseFast, bench_core) },
         },
     });
-    wireTls(b, bench_http, target, .ReleaseFast, want_tls, want_grpc);
+    wireOptions(b, bench_http, target, .ReleaseFast, want_tls, want_grpc, false);
     const bench_nilo_sql = b.createModule(.{
         .root_source_file = b.path("sql/sql.zig"),
         .target = target,
@@ -5686,6 +5764,37 @@ pub fn build(b: *std.Build) void {
     });
     b.step("bench-compress", "Time gzipping a JSON answer at each level, and weigh the result")
         .dependOn(&b.addRunArtifact(bench_compress).step);
+
+    // The pool as `listen()` builds it, for what its compressors keep
+    // resident once every thread has gzipped (ADR 248). Installed rather
+    // than run: `bench/compress_rss.py` starts it and reads its smaps.
+    const bench_compress_server = b.addExecutable(.{
+        .name = "nilo-bench-compress-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/compress_server.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = stripMeasured(strip, .ReleaseFast),
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        }),
+    });
+    b.step("bench-compress-server", "A server gzipping every answer on sixteen threads, for what the pool keeps resident")
+        .dependOn(&b.addInstallArtifact(bench_compress_server, .{}).step);
+
+    // The stack one `Pool.gzip` writes, in the mode asked for rather than
+    // `ReleaseFast`, because what each mode costs a fiber is the question
+    // (ADR 062, ADR 248).
+    const bench_compress_stack = b.addExecutable(.{
+        .name = "nilo-bench-compress-stack",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/compress_stack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nilo_http", .module = httpFor(b, target, optimize, coreFor(b, target, optimize)) }},
+        }),
+    });
+    b.step("bench-compress-stack", "The stack one gzip writes below its caller, per backend, in the mode asked for")
+        .dependOn(&b.addRunArtifact(bench_compress_stack).step);
 
     const bench_sql_module = b.createModule(.{
         .root_source_file = b.path("bench/sql.zig"),
@@ -6044,7 +6153,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_fetch", .module = fetchFor(b, target, mode, core_mod) },
             },
         });
-        wireTls(b, framework, target, mode, want_tls, want_grpc);
+        wireOptions(b, framework, target, mode, want_tls, want_grpc, false);
 
         // The test build is the one place this module names an App, and it
         // gets both: `nilo_core` for the module itself, `nilo` for the tests
@@ -6197,7 +6306,7 @@ pub fn build(b: *std.Build) void {
         // feature that is not tested (ADR 032). In-repo only: a dependent
         // running its own tests against nilo is not made to fetch the
         // library for a listener it never asked for.
-        wireTls(b, lib_tests, target, mode, want_tls or in_repo, want_grpc or in_repo);
+        wireOptions(b, lib_tests, target, mode, want_tls or in_repo, want_grpc or in_repo, in_repo);
 
         const library = b.createModule(.{
             .root_source_file = b.path("http/http.zig"),
@@ -6211,7 +6320,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });
-        wireTls(b, library, target, mode, want_tls, want_grpc);
+        wireOptions(b, library, target, mode, want_tls, want_grpc, false);
 
         const bench_tests = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),

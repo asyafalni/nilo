@@ -38,6 +38,7 @@ repository.
   is what using it would cost, so that cost is counted on purpose.
 - **zstd's context grows** to the largest body it has seen, so its memory
   figure depends on the order the bodies came in.
+- **Resident memory is counted per compressor**, `rss.zig`: each one alone in an anonymous mapping kept off transparent huge pages, pages counted with `mincore`. A nilo pool is one allocation of every slot, which this does not reproduce.
 - **The size probes are static musl programs**, `size/build_probes.sh`, and
   measure what a codec adds to a program that already has an allocator, not to
   a nilo server.

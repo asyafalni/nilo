@@ -1208,37 +1208,16 @@ fn hasDotSegment(rel_path: []const u8) bool {
 const compressible = compress_mod.compressible;
 
 /// Gzip `bytes`, or null if the result is not smaller than what went in.
+/// A file that does not shrink is a file served as it is: keeping the copy
+/// would cost memory to send more bytes than the original.
 ///
-/// The 64 KB window lives on this function's stack and is gone before the
-/// server starts. That is the whole reason compression can be here at all
-/// and not on the request path.
+/// Whatever the compressor needs lives for the length of this call and is
+/// gone before the server starts. That is the whole reason compression can
+/// be here at all and not on the request path. Which compressor is the
+/// build's, through `compress.gzipOnce`, so a build with libdeflate in it
+/// does not carry the standard library's for this alone (ADR 248).
 fn gzipped(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?[]const u8 {
-    // `Compress.init` asserts its output has somewhere to write, and an
-    // `Allocating` starts with a buffer of nothing at all. Half the input
-    // is roughly where text lands, so this is also the size that usually
-    // means the output is never grown.
-    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, bytes.len / 2 + 64);
-    errdefer out.deinit();
-
-    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
-    defer gpa.free(window);
-
-    var compressor = std.compress.flate.Compress.init(
-        &out.writer,
-        window,
-        .gzip,
-        .default,
-    ) catch return error.OutOfMemory;
-    compressor.writer.writeAll(bytes) catch return error.OutOfMemory;
-    compressor.finish() catch return error.OutOfMemory;
-
-    // A file that does not shrink is a file served as it is. Keeping the
-    // copy would cost memory to send more bytes than the original.
-    if (out.written().len >= bytes.len) {
-        out.deinit();
-        return null;
-    }
-    return try out.toOwnedSlice();
+    return compress_mod.gzipOnce(gpa, bytes);
 }
 
 /// A strong ETag: the contents hashed, so it changes exactly when the file

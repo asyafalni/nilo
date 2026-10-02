@@ -8,6 +8,8 @@ bodies/
 harness
 sweep
 zng_bench
+rss
+stack
 *.csv
 size/*/probe
 size/*/codec.zig

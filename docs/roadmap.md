@@ -491,10 +491,6 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 
 ### `nilo_http`
 
-**Whether gzip should be libdeflate behind a build flag.** On the arena's `json-comp` bodies libdeflate at level 6 takes 0.40 of `std.flate`'s time at level 6 and is 2% smaller; on 1 MB it is twice as fast and 24% smaller ([`http.md`](../bench/result/http.md#which-deflate-is-fastest-and-whether-brotli-or-zstd-would-beat-it)). Its output is gzip, its compressor is one allocation that can be reused, so it drops into ADR 211's pool unchanged, and it needs no libc. A buffer of `body.len - 1` for its output gives nilo's rule for free: libdeflate returns 0 when the result does not fit, and nilo sends a body plainly when gzip does not make it smaller. The shape is `-Dcompress=libdeflate`, the way `-Dtls` brings tls.zig ([ADR 212](./adr/212-tls-is-an-option-a-build-asks-for.md)), with the default build unchanged. It costs +64.5 KB stripped in a build that asks, and 373 KB more per thread than today's 289 KB slot. Two questions are open. Does HttpArena's `standard` mode, which requires "the framework or engine's built-in response compression", accept a C library behind a framework flag? And are the ratios the same off this busy 2-core Xeon?
-
-**What would settle it:** the ratio measured on a quiet machine and on a Zen 5 with `bench/compare-compress/run_all.sh`, the RSS a compressor touches on a 4 KB body, and HttpArena's maintainers reading the `standard` rule.
-
 **Multipart, streamed.** `Form(T)` reads a multipart body whole, bounded by `max_body` ([ADR 030](./adr/030-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. The streaming version wants a parser that resumes across reads and an `Upload` that is a reader rather than bytes; it inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
 **What would settle it:** somebody designing it. Until then the answer is `c.bodyStream()`, which holds nothing and makes the framing the handler's problem.

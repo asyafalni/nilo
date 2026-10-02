@@ -108,6 +108,14 @@ same way. It depends on the fields `Compress` has in the pinned Zig, and
 it byte for byte against `init`'s own output, twice over on one slot, so
 the second use sees what the first left behind.
 
+**The compressor is the standard library's unless the build chose
+libdeflate** ([ADR 248](./248-gzip-is-libdeflate-when-a-build-asks-for-it.md)).
+`.libdeflate = true` keeps everything above (the pool, the borrow, what
+qualifies, `max_bytes`) and changes what a slot is: a libdeflate compressor
+in one mapping kept off huge pages, with no reset to hold, because it keeps
+no state between bodies. Every figure below is the standard library's;
+ADR 248 has libdeflate's.
+
 **The roadmap's other two questions are answered by leaving both out.** A
 stream is written in pieces to the socket, so it has no whole body to
 compress into the arena and its compressor would be held across every
@@ -139,7 +147,7 @@ it are 4.9 KB each), which ADR 062's release hands back once the
 connection is idle. Nothing per connection is held that was not held
 before.
 
-**CPU: `zig build bench-compress` is the number**, on the three bodies
+**CPU: `zig build bench-compress` is the number** (`-Dlibdeflate` for the other backend), on the three bodies
 the arena rotates through, one thread, `ReleaseFast`, this machine
 (Ryzen 7 9700X, eight cores and sixteen threads, Zig 0.16.0):
 

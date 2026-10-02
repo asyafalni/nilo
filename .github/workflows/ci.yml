@@ -78,6 +78,15 @@ jobs:
       - name: zig build test-all
         run: zig build test-all
 
+      # The suite again with gzip on libdeflate (ADR 248). `test-all` already
+      # holds both backends' pools, because the http test root links the
+      # library whatever the flag says; this is the App's own path through
+      # it, which only a build that chose it takes. Debug only: both pools
+      # already run in ReleaseSafe under `test-all`, and what is left to the
+      # App's path is wiring, which does not differ by mode.
+      - name: zig build test -Dlibdeflate
+        run: zig build test -Dlibdeflate
+
       # An example that stops compiling is a failed build rather than a
       # surprise for the first person who copies it.
       - name: zig build examples
