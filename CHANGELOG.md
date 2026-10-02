@@ -8,7 +8,18 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 [`docs/roadmap.md`](./docs/roadmap.md), and what was refused or answered is in
 [`docs/decided.md`](./docs/decided.md).
 
-## Unreleased
+## 0.7.0
+
+**0.7.0 is the release where every module was read for the answer it gives without an error, and where porting a real log server onto nilo filled in what it was missing.** The audit is most of it: a statement that kept nothing and said it had, a delete a search box could empty a table with, a page that repeated rows, a cache hit an old slot could forge, a job a lapsed lease let two workers run. Each is now refused or made right, and each refusal is an entry below.
+
+**Needs Zig 0.16**, as 0.6.0 does. Four things in it, in the order you will meet them:
+
+- **Wrong answers, closed.** `nilo_sql`, `http/`, `nilo_cache`, `nilo_job`, `nilo_s3` and `nilo_fetch` were read line by line. A failed statement no longer commits as success, an `update` or `delete` that would match every row is refused, a cut order ends in the key, a number is range-checked on the way in and out, the HTTP/1.1 parser refuses what a front end could frame differently, and a WebSocket buffer is no longer written after it was given back.
+- **What a port needed.** A route that belongs to one listener, a body limit read from configuration, a 422 for JSON of the wrong shape, OpenTelemetry tracing over OTLP with `nilo_proto` (a sixth tool module: protobuf as plain structs), security headers as one middleware, gzip through libdeflate behind a flag, a real server in a test with `testing.Live`, S3 multipart upload and `presignPut`, and a short `nilo.blocking` call that no longer waits out a long one.
+- **Rooms for every kind of connection.** A WebSocket and an event stream sit in the same Room, a Room is lent to a key such as `"user:42"` so every tab is reached at once, and a Room with history catches a returning stream up from `Last-Event-ID`. An event stream fed by Rooms costs what an idle connection does.
+- **A Row that reads more.** `db.feed` and an `.after` cursor an index seeks on, a column of another table read flat with `nilo_through`, ordered, filtered and counted children, an aggregate with its own `.where`, `.unread` columns, `db.explain`, a PATCH in one `.set`, and a raw statement held against its Row the first time it runs.
+
+**Seventy-one entries ask something of you**, under Breaking with the fix beside each. The two most programs meet first change what a running program does rather than what compiles: the session cookie is now `__Host-session`, so a program upgrading passes `.session_plain_name = true` for as long as its longest `max_age`, and a Postgres URL to another machine with no `sslmode` now requires TLS.
 
 ### Breaking
 

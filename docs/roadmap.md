@@ -23,7 +23,7 @@ Inside the first four, entries are grouped by module, because **two modules touc
 
 **A `Waiting on upstream` row is the line to distrust.** This repository has been wrong about a blocker seven times, and each time the code it was waiting for already did the thing ([history](./history.md)): the latest was the pg.zig pin, whose two commits had reached lalinsky's `master` while the pull request that asked for them sat open. Nothing downstream ever re-tests a blocker, so re-test it before repeating it.
 
-**0.6.0 needs Zig 0.16.** The latest stable release only, on one branch: the people this is aimed at download Zig, run `zig build`, and give up if it fails, and they are not going to go hunting for the right branch. Every new Zig release brings a few awkward weeks, made worse by zio following a branch-per-version pattern too.
+**0.7.0 needs Zig 0.16.** The latest stable release only, on one branch: the people this is aimed at download Zig, run `zig build`, and give up if it fails, and they are not going to go hunting for the right branch. Every new Zig release brings a few awkward weeks, made worse by zio following a branch-per-version pattern too.
 
 ---
 
