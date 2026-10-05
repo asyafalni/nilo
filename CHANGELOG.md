@@ -14,6 +14,10 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 - **`bucket.copy` and `bucket.compose`**: copy an object to another key, and join objects into one (a multipart upload whose parts are copies), inside the store, with no byte passing through the caller. A copy keeps its source's type; a join takes `.content_type` the way `putMultipart` does. Both read the answer for a 200 that carries an error ([ADR 058](./docs/adr/058-most-of-an-s3-client-is-not-s3.md)).
 
+### Fixed
+
+- **A spawned fiber whose `nilo.sleep` follows a swallowed cancel no longer keeps the server up.** The first wait it reached spent the stop's one cancel, its next `nilo.sleep` slept on, and `listen()` waited for it forever. `nilo.sleep` in spawned work now answers `error.Canceled` for as long as the server is cancelling it. Other waits are not covered: work that swallows a cancel puts it back with `nilo.io().recancel()` ([ADR 028](./docs/adr/028-a-spawned-fiber-belongs-to-the-server.md#a-swallowed-cancel-does-not-keep-the-server)).
+
 ## Released
 
 Every tagged release has a page of its own, written for the person upgrading: what to do before deploying, and what is new. Every entry of a release, the whole account, is that tag's own `CHANGELOG.md`, which the page links to.
