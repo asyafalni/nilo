@@ -10,7 +10,9 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Nothing yet. Work lands here under `### Breaking`, `### Added`, `### Changed` and `### Fixed`, newest first.
+### Added
+
+- **`bucket.copy` and `bucket.compose`**: copy an object to another key, and join objects into one (a multipart upload whose parts are copies), inside the store, with no byte passing through the caller. A copy keeps its source's type; a join takes `.content_type` the way `putMultipart` does. Both read the answer for a 200 that carries an error ([ADR 058](./docs/adr/058-most-of-an-s3-client-is-not-s3.md)).
 
 ## Released
 
