@@ -375,12 +375,6 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** a caller who has written those four lines twice.
 
-### `nilo_s3`
-
-**`COPY`.** Where S3 stops being bytes at a key and starts being a document format, and it carries its own trap for whoever adds it: S3 can answer a copy with **200 and an error in the body**, so a client that checks the status is wrong.
-
-**Needs:** a caller who wants it enough to hold the XML.
-
 ### `nilo_http`
 
 **A TLS listener that reloads its certificate without a restart.** `listen(.{ .tls = … })` reads the two files once ([ADR 212](./adr/212-tls-is-an-option-a-build-asks-for.md)), and a certificate that renews every sixty days is a restart every sixty days. The shape that costs nothing per connection is a second `CertKeyPair` swapped in under the acceptors on a signal or a file's mtime, with the old one freed once the last handshake that took it is over, which is a count the Engine does not keep yet.
