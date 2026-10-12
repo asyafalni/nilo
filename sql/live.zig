@@ -5500,6 +5500,57 @@ test "a raw statement is held against its Row the first time it runs" {
     try testing.expectEqual(@as(i64, 0), left_over);
 }
 
+test "an anti join read through db.raw is refused for a field that is not optional, on a plan Postgres wrote" {
+    // `plan.zig` flags the inner side of an `Anti` join, and its unit tests
+    // run over plans written by hand. This is the plan Postgres writes: a
+    // `WHERE s.person_id IS NULL` on a column in the join's own condition is
+    // turned into an anti join (a column outside the condition stays a
+    // `Right` join with a filter) whose output still lists the nulled side's
+    // columns. Over these small tables Postgres 16 and later write it as a
+    // `Right Anti`, the inputs swapped, which the hand-written plans missed
+    // until this test ran (ADR 233).
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const Bare = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        session: i64,
+        person: i64,
+    };
+    const Maybe = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        session: ?i64,
+        person: ?i64,
+    };
+
+    const text = "SELECT p.id, s.id AS session, s.person_id AS person FROM " ++ table ++
+        " p LEFT JOIN " ++ session_table ++ " s ON s.person_id = p.id WHERE s.person_id IS NULL";
+
+    // The Wire's own answer, held against the Row the way `db.raw` holds it,
+    // names both inner-side fields and not the outer one.
+    const arena = run.arena();
+    const described = (try stack.db.wire.?.describe(arena, text, true)).?;
+    try testing.expectEqual(false, described[0].outer_null);
+    try testing.expectEqual(true, described[1].outer_null);
+    try testing.expectEqual(true, described[2].outer_null);
+    var misfits: std.ArrayList(schema.Misfit) = .empty;
+    try schema.fit(comptime schema.readingsOf(dialect.Postgres, Bare, false, false), described, &misfits, arena);
+    try testing.expectEqual(@as(usize, 2), misfits.items.len);
+    try testing.expectEqualStrings("session", misfits.items[0].field);
+    try testing.expectEqualStrings("person", misfits.items[1].field);
+    try testing.expect(misfits.items[0].kind == .outer_null);
+
+    // And through the door a program uses, outside a transaction.
+    try testing.expectError(error.QueryFailed, stack.db.raw(Bare, &run, text, .{}));
+    _ = try stack.db.raw(Maybe, &run, text, .{});
+}
+
 test "a raw statement whose first run found no table is held against its Row once the table is there" {
     // The check's flag used to be spent before `describe` answered, so a
     // first run that met a table a migration had not made yet left the

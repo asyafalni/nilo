@@ -113,7 +113,8 @@ computes and every join's type, so a column the top of the plan hands on from
 the inner side of a `Left` join, the outer side of a `Right`, either side of a
 `Full`, or the inner side of an `Anti` join (`LEFT JOIN … WHERE o.id IS NULL`,
 which the planner turns into one) may be NULL, and on an `Anti` join is NULL on
-every row. `sql/plan.zig` reads it, and
+every row. Postgres 16 and later also write that join as a `Right Anti`, its
+inputs swapped, where the outer side is the one never answered. `sql/plan.zig` reads it, and
 is tested on plans a server answered.
 
 The plan has to be one that holds for every value. So the statement is

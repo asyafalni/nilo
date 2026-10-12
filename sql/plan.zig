@@ -148,11 +148,13 @@ fn collectKept(arena: std.mem.Allocator, node: Value, far: bool, into: *Names) s
 /// the inner input of a `Left`, the outer of a `Right`, either of a `Full`.
 /// An `Anti` join is a `Left` whose `WHERE` kept only the rows that found
 /// nothing: its inner input is never in the answer, so a column named from
-/// it is NULL on every row.
+/// it is NULL on every row. A `Right Anti`, which Postgres 16 and later write
+/// when it hashes the side that keeps its rows, is the same join with the
+/// inputs swapped: there the outer input is the one never in the answer.
 fn farSide(node: Value, child: Value) bool {
     const join = text(node, "Join Type") orelse return false;
     if (std.mem.eql(u8, join, "Left") or std.mem.eql(u8, join, "Anti")) return relationIs(child, "Inner");
-    if (std.mem.eql(u8, join, "Right")) return relationIs(child, "Outer");
+    if (std.mem.eql(u8, join, "Right") or std.mem.eql(u8, join, "Right Anti")) return relationIs(child, "Outer");
     if (std.mem.eql(u8, join, "Full")) return relationIs(child, "Inner") or relationIs(child, "Outer");
     return false;
 }
@@ -481,6 +483,20 @@ test "an Anti join, LEFT JOIN … WHERE o.id IS NULL, has its inner side NULL on
         \\    {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["e.id", "e.item_id"]},
         \\    {"Node Type": "Hash", "Parent Relationship": "Inner", "Output": ["i.id"]}]}}]
     , &.{ false, true });
+}
+
+test "a Right Anti join, the same anti join with its inputs swapped, has its outer side NULL on every row" {
+    // SELECT p.id, s.id AS session FROM people p
+    //   LEFT JOIN sessions s ON s.person_id = p.id WHERE s.person_id IS NULL
+    // as Postgres 17 planned it over a small `people`: the side that keeps its
+    // rows is hashed, so the sessions are the outer input and never answered.
+    try expectNulls(
+        \\[{"Plan": {"Node Type": "Hash Join", "Join Type": "Right Anti", "Output": ["p.id", "s.id", "s.person_id"],
+        \\  "Plans": [
+        \\    {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["s.id", "s.person_id", "s.token"]},
+        \\    {"Node Type": "Hash", "Parent Relationship": "Inner", "Output": ["p.id"],
+        \\     "Plans": [{"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["p.id"]}]}]}}]
+    , &.{ false, true, true });
 }
 
 test "a Left join the planner kept is reported as it stands, though a NOT NULL key finds a row every time" {
