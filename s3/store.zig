@@ -237,6 +237,20 @@ pub const Store = struct {
     /// The shared/exclusive `lock` is never held across one, so the requests
     /// that can still sign with the old key do not wait for it.
     gate: std.Io.Mutex = .init,
+    /// Counts the refreshes that have finished, and is what a request with a
+    /// route deadline waits on (ADR 105): it is woken by a refresh ending, and
+    /// leaves at its own deadline whether or not one has.
+    settled: std.atomic.Value(u32) = .init(0),
+    /// What the last finished refresh failed with, as an error code, or zero.
+    /// Written before `settled` moves, so a waiter that sees it move reads
+    /// the outcome of the refresh it waited for.
+    refresh_err: std.atomic.Value(u32) = .init(0),
+    /// The refresh a request with a route deadline started, which outlives
+    /// that request. Written only by the holder of `gate`, awaited by the
+    /// next holder and cancelled by `deinit`, which is why it also keeps the
+    /// `Io` it was started on.
+    task: ?std.Io.Future(void) = null,
+    task_io: std.Io = undefined,
     keyed: sign.Keyed = undefined,
     /// The date the key in hand was derived for. A key changes once a day.
     key_date: [8]u8 = @splat(0),
@@ -322,6 +336,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        if (self.task) |*t| _ = t.cancel(self.task_io);
         self.client.deinit();
         std.crypto.secureZero(u8, &self.keyed.key);
         wipeAndFree(self.gpa, self.creds_owned);
@@ -387,19 +402,37 @@ pub const Store = struct {
     /// signs with the key in hand, which is good until `expires_at`. A fetch
     /// that failed is not retried for `retry_after_s`, and only credentials
     /// past `expires_at` turn its error into a failed request (ADR 060).
+    ///
+    /// **`left_ms` is the route's time** (`core.timeLeftOf`, ADR 105), and a
+    /// request that has some stops waiting for a refresh when it runs out,
+    /// with `error.TimedOut`, or signs with the key in hand when it has one.
+    /// The refresh itself is not cut short: it runs as a task of the `Io`
+    /// under the Store's own `fetch_timeout_ms`, one for every request that
+    /// waits on it, and its result is kept for the next caller. Cutting it by
+    /// one request's deadline would fail it for all of them. Null waits as
+    /// long as it always did, and a single-threaded `Io`, which cannot start
+    /// the task, does the same.
     pub fn keyFor(
         self: *Store,
         io: std.Io,
         now_ms: i64,
         token_buf: []u8,
+        left_ms: ?u32,
     ) !Signing {
         const now_s = @divFloor(now_ms, 1000);
+        const deadline_us: i64 = if (left_ms) |left|
+            core.monotonicMicros() + @as(i64, left) * std.time.us_per_ms
+        else
+            0;
 
         // Three rounds at most: a refresh by another fiber with a later clock
         // can leave a key for the next day, and a request is not worth a
         // fourth look at it.
         var round: u8 = 0;
         while (round < 3) : (round += 1) {
+            // Read before the state is, so a refresh that ends after the look
+            // below moves it and is not waited for in vain.
+            const seen = self.settled.load(.acquire);
             var hold_gate = false;
             {
                 try self.lock.lockShared(io);
@@ -411,9 +444,29 @@ pub const Store = struct {
                     hold_gate = true;
                 }
             }
-            if (hold_gate) {
-                defer self.gate.unlock(io);
-                try self.refreshHeld(io, now_s);
+            if (left_ms != null) {
+                if (!hold_gate) hold_gate = self.gate.tryLock();
+                if (hold_gate) self.startRefresh(io, now_s);
+                self.awaitSettled(io, seen, deadline_us) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.TimedOut => {
+                        try self.lock.lockShared(io);
+                        defer self.lock.unlockShared(io);
+                        if (self.keeps(now_s)) return self.snapshot(token_buf);
+                        return error.TimedOut;
+                    },
+                };
+                try self.lock.lockShared(io);
+                defer self.lock.unlockShared(io);
+                if (!self.keeps(now_s)) {
+                    const code = self.refresh_err.load(.acquire);
+                    if (code != 0) return @errorFromInt(@as(@Int(.unsigned, @bitSizeOf(anyerror)), @intCast(code)));
+                }
+            } else if (hold_gate) {
+                const result = self.refreshHeld(io, now_s);
+                self.gate.unlock(io);
+                self.settle(io, result);
+                try result;
             } else {
                 try self.refresh(io, now_s);
             }
@@ -422,6 +475,56 @@ pub const Store = struct {
         try self.lock.lockShared(io);
         defer self.lock.unlockShared(io);
         return self.snapshot(token_buf);
+    }
+
+    /// With the gate held, start a refresh that carries on whatever becomes of
+    /// the request that asked for it. The task lets go of the gate itself.
+    fn startRefresh(self: *Store, io: std.Io, now_s: i64) void {
+        // The last one has let go of the gate to be here, and is at its last
+        // lines; this returns at once.
+        if (self.task) |*t| {
+            _ = t.await(self.task_io);
+            self.task = null;
+        }
+        self.task_io = io;
+        self.task = io.concurrent(refreshTask, .{ self, io, now_s }) catch {
+            const result = self.refreshHeld(io, now_s);
+            self.gate.unlock(io);
+            self.settle(io, result);
+            return;
+        };
+    }
+
+    fn refreshTask(self: *Store, io: std.Io, now_s: i64) void {
+        const result = self.refreshHeld(io, now_s);
+        self.gate.unlock(io);
+        self.settle(io, result);
+    }
+
+    /// A refresh has ended, and `result` is how: say so, and wake whoever is
+    /// waiting. After the gate is let go, so that a waiter that wakes and
+    /// finds nothing usable can take it. A cancellation is the shutdown's, not
+    /// the credential source's, and is not handed to other requests.
+    fn settle(self: *Store, io: std.Io, result: anyerror!void) void {
+        const code: u32 = if (result) |_| 0 else |err| if (err == error.Canceled) 0 else @intFromError(err);
+        self.refresh_err.store(code, .release);
+        _ = self.settled.fetchAdd(1, .release);
+        io.futexWake(u32, &self.settled.raw, std.math.maxInt(u32));
+    }
+
+    /// Wait until a refresh ends or `deadline_us` (Core's monotonic clock)
+    /// passes. A park the watchdog is told about, like the permit's (ADR 210).
+    fn awaitSettled(self: *Store, io: std.Io, seen: u32, deadline_us: i64) error{ TimedOut, Canceled }!void {
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
+        while (self.settled.load(.acquire) == seen) {
+            const left = deadline_us - core.monotonicMicros();
+            if (left <= 0) return error.TimedOut;
+            io.futexWaitTimeout(u32, &self.settled.raw, seen, .{ .duration = .{
+                .raw = .fromMicroseconds(left),
+                .clock = .awake,
+            } }) catch return error.Canceled;
+        }
     }
 
     /// What one request holds: a key, the token to send beside it, and when
@@ -491,8 +594,10 @@ pub const Store = struct {
     /// with, which waits its turn behind whoever is already refreshing.
     fn refresh(self: *Store, io: std.Io, now_s: i64) !void {
         try self.gate.lock(io);
-        defer self.gate.unlock(io);
-        try self.refreshHeld(io, now_s);
+        const result = self.refreshHeld(io, now_s);
+        self.gate.unlock(io);
+        self.settle(io, result);
+        return result;
     }
 
     /// Take the credentials again if they need taking, and derive today's key.
@@ -933,7 +1038,7 @@ const t0: i64 = 1_700_000_000;
 
 fn keyAt(store: *Store, io: std.Io, now_s: i64) !Store.Signing {
     var buf: [0]u8 = undefined;
-    return store.keyFor(io, now_s * 1000, &buf);
+    return store.keyFor(io, now_s * 1000, &buf, null);
 }
 
 test "credentials near their end are replaced, and the new ones sign" {
@@ -1068,6 +1173,69 @@ test "a credential fetch that hangs does not hold up a request that can sign wit
     try testing.expectEqual(@as(usize, 2), Script.calls);
 }
 
+/// `keyAt` for a request whose route has `left_ms` (ADR 105), on its own task.
+fn keyWithin(store: *Store, io: std.Io, left_ms: u32) anyerror!Store.Signing {
+    var buf: [0]u8 = undefined;
+    return store.keyFor(io, t0 * 1000, &buf, left_ms);
+}
+
+test "a request waiting on a credential refresh gives up at its own deadline while the refresh runs on" {
+    testing.log_level = .err;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Script.reset(t0, 3600);
+    // The credential service answers after 600 ms, under a `fetch_timeout_ms`
+    // of ten seconds.
+    Script.sleep_ms = 600;
+
+    var store = try fetching(testing.allocator);
+    defer store.deinit();
+
+    // The long request starts the refresh and waits for it...
+    var long = try io.concurrent(keyWithin, .{ &store, io, @as(u32, 5_000) });
+    defer _ = long.cancel(io) catch {};
+    try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+
+    // ...and the short one, behind it, leaves at its own deadline, well
+    // before the refresh ends.
+    const began = core.monotonicMicros();
+    try testing.expectError(error.TimedOut, keyWithin(&store, io, 150));
+    try testing.expect(elapsedMs(began) >= 100);
+    try testing.expect(elapsedMs(began) < 450);
+
+    // The refresh was not cut short for the one that left: the other gets
+    // the credentials from the one request the service saw.
+    const got = try long.await(io);
+    try testing.expectEqualStrings("AKIDODD", got.keyed.akid());
+    try testing.expectEqual(@as(usize, 1), Script.calls);
+}
+
+test "the request that started a credential refresh gives up at its deadline and the refresh is kept for the next" {
+    testing.log_level = .err;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Script.reset(t0, 3600);
+    Script.sleep_ms = 600;
+
+    var store = try fetching(testing.allocator);
+    defer store.deinit();
+
+    var short = try io.concurrent(keyWithin, .{ &store, io, @as(u32, 150) });
+    defer _ = short.cancel(io) catch {};
+    try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+
+    // Waits on the refresh the short request started, for as long as it takes.
+    const got = try keyWithin(&store, io, 5_000);
+    try testing.expectEqualStrings("AKIDODD", got.keyed.akid());
+    try testing.expectError(error.TimedOut, short.await(io));
+
+    // Kept: the next caller signs without asking the service again.
+    _ = try keyWithin(&store, io, 5_000);
+    try testing.expectEqual(@as(usize, 1), Script.calls);
+}
+
 test "an option that cannot work is refused at open" {
     try testing.expectError(error.BadStreams, Store.open(testing.allocator, .{
         .endpoint = "https://s3.example.com",
@@ -1196,7 +1364,7 @@ test "a store keeps its own copy of static credentials, and signs after the call
     defer threaded.deinit();
     var token: [8]u8 = undefined;
     const now_ms = core.nowMillis();
-    const signing = try store.keyFor(threaded.io(), now_ms, &token);
+    const signing = try store.keyFor(threaded.io(), now_ms, &token, null);
     try testing.expectEqualStrings("AKIAEXAMPLE", signing.keyed.akid());
 
     var stamp: sign.Stamp = .at(@divFloor(now_ms, 1000));

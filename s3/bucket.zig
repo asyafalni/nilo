@@ -469,6 +469,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .payload = self.store.payloadNoBody(),
                 .range = range_header,
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             // A slot of the stream share before a permit of the whole, so a
@@ -570,6 +571,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .cache_control = optional(value, "cache_control"),
                 .content_disposition = optional(value, "content_disposition"),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -618,6 +620,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .payload = sign.unsigned_payload,
                 .content_type = contentTypeOf(source.content_type),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             // The stream share first, the permit second, and both given back
@@ -787,6 +790,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .cache_control = cache_control,
                 .content_disposition = content_disposition,
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -850,6 +854,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .query = query,
                 .payload = self.store.payloadFor(bytes, &hash_buf),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -912,6 +917,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .query = query,
                 .payload = self.store.payloadFor(body_bytes, &hash_buf),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -975,6 +981,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .query = query,
                 .payload = self.store.payloadNoBody(),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             }) catch return;
 
             var ex: fetch.Exchange = .idle;
@@ -1026,6 +1033,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .key = key,
                 .payload = self.store.payloadNoBody(),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -1141,6 +1149,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .payload = self.store.payloadNoBody(),
                 .copy_source = source,
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -1207,6 +1216,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .key = key,
                 .payload = self.store.payloadNoBody(),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -1327,6 +1337,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .query = query,
                 .payload = self.store.payloadNoBody(),
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
@@ -1448,7 +1459,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             const now_s = @divFloor(now_ms, 1000);
 
             var token_buf: [settings.session_token_max]u8 = undefined;
-            const signing = self.store.keyFor(io, now_ms, &token_buf) catch |err|
+            const signing = self.store.keyFor(io, now_ms, &token_buf, core.timeLeftOf(c)) catch |err|
                 return self.blame(err);
 
             const expires = try life(wanted_seconds, signing, now_s);
@@ -1541,7 +1552,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             const now_s = @divFloor(now_ms, 1000);
 
             var token_buf: [settings.session_token_max]u8 = undefined;
-            const signing = self.store.keyFor(io, now_ms, &token_buf) catch |err|
+            const signing = self.store.keyFor(io, now_ms, &token_buf, core.timeLeftOf(c)) catch |err|
                 return self.blame(err);
 
             const expires = try life(post.seconds, signing, now_s);
@@ -1695,6 +1706,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             /// to the bucket itself, so the one call whose key is empty.
             root: bool = false,
             token_buf: []u8,
+            /// The route's time (`core.timeLeftOf`), which bounds a wait for
+            /// the credentials to be refreshed (ADR 105).
+            route_left_ms: ?u32 = null,
         };
 
         /// An empty key is not an object, it is the bucket: `GET` on it is a
@@ -1746,7 +1760,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
             const io = self.store.client.inner.io;
             const now_ms = core.nowMillis();
-            const signing = self.store.keyFor(io, now_ms, req.token_buf) catch |err|
+            const signing = self.store.keyFor(io, now_ms, req.token_buf, req.route_left_ms) catch |err|
                 return self.blame(err);
 
             sig.stamp = .at(@divFloor(now_ms, 1000));
@@ -1825,6 +1839,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .range = range,
                 .if_none_match = if_none_match,
                 .token_buf = &token_buf,
+                .route_left_ms = core.timeLeftOf(c),
             });
 
             var ex: fetch.Exchange = .idle;
