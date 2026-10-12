@@ -328,7 +328,7 @@ This was built and run once with `examples/hello` (`zig build examples -Doptimiz
 | Linux x86-64 | `zig build test-all`, `test -Dlibdeflate`, `examples`, the fuzzer, on `ubuntu-latest` | The supported one. Every benchmark is here. |
 | Linux aarch64 | `zig build test` on `ubuntu-24.04-arm` | The suite is run there. `test-all`, the fuzzer and the benchmarks are x86-64 only, and `park-check` skips off x86-64 ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). |
 | macOS | `zig build test` on `macos-latest` | The suite passes. `park-check` (memory per idle connection) and the benchmarks are Linux only. |
-| Windows | nothing | Not tested. The Engine and `listen()` have `.windows` branches, `config.Env` is POSIX only ([`decided.md`](../decided.md)), and nothing has been run. |
+| Windows | `zig build test-core test-id test-pw test-cache test-jwt test-proto` on `windows-latest` | The loop-free modules only. The framework and the modules that borrow a loop are not supported on Windows; a server there runs under WSL2 ([`decided.md`](../decided.md)). `config.Env` is POSIX only. |
 
 Anything marked "Not tested" is untested, not unsupported: a report with a failing case is welcome.
 

@@ -129,8 +129,6 @@ jobs:
   # Ampere, a Raspberry Pi at the edge. `test` rather than `test-all` for the
   # same reason as macOS above; no Postgres or object store, so those skip.
   # `park-check` is x86-64 only and names itself skipped here (ADR 062).
-  # Windows is not here: whether it is supported at all is still open
-  # (docs/todo.md).
   linux-arm64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -141,6 +139,25 @@ jobs:
 
       - name: zig build test
         run: zig build test
+
+  # Windows, for the modules that need no event loop and so are meant to run
+  # anywhere Zig does. The framework and the modules that borrow a loop are
+  # not supported on Windows (docs/decided.md): a server there runs under
+  # WSL2. `nilo_config` is left out because `config.Env` is POSIX only and
+  # its tests read it; `config.Map` is the portable half.
+  windows-tools:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/zig
+
+      - name: zig build test for the loop-free modules
+        run: zig build test-core test-id test-pw test-cache test-jwt test-proto
 
   # The guide is published only when a tag is pushed (docs.yml), so a page
   # link or a heading anchor broken on main would otherwise be found by the

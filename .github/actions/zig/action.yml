@@ -17,6 +17,7 @@ runs:
       run: |
         set -euo pipefail
         version=0.17.0
+        ext=tar.xz
         case "$RUNNER_OS-$RUNNER_ARCH" in
           Linux-X64)
             name=zig-x86_64-linux-$version
@@ -27,16 +28,28 @@ runs:
           macOS-ARM64)
             name=zig-aarch64-macos-$version
             sum=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a ;;
+          Windows-X64)
+            name=zig-x86_64-windows-$version
+            ext=zip
+            sum=b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428 ;;
           *)
             echo "no Zig is pinned for $RUNNER_OS-$RUNNER_ARCH" >&2
             exit 1 ;;
         esac
-        curl -fsSL --retry 3 -o zig.tar.xz "https://ziglang.org/download/$version/$name.tar.xz"
-        echo "$sum  zig.tar.xz" | shasum -a 256 -c -
+        curl -fsSL --retry 3 -o "zig.$ext" "https://ziglang.org/download/$version/$name.$ext"
+        echo "$sum  zig.$ext" | shasum -a 256 -c -
         mkdir -p "$HOME/zig"
-        tar -xf zig.tar.xz -C "$HOME/zig" --strip-components=1
-        rm zig.tar.xz
-        echo "$HOME/zig" >> "$GITHUB_PATH"
+        if [ "$ext" = zip ]; then
+          # Windows ships a zip, which Git Bash's tar cannot read.
+          unzip -q zig.zip -d "$HOME/zig-unpacked"
+          mv "$HOME/zig-unpacked/$name"/* "$HOME/zig/"
+        else
+          tar -xf "zig.$ext" -C "$HOME/zig" --strip-components=1
+        fi
+        rm "zig.$ext"
+        # GITHUB_PATH wants the runner's own path form, which on Windows is not
+        # Git Bash's /c/... one.
+        if command -v cygpath >/dev/null; then cygpath -w "$HOME/zig"; else echo "$HOME/zig"; fi >> "$GITHUB_PATH"
         echo "ZIG_VERSION=$version" >> "$GITHUB_ENV"
 
     - name: Cache Zig's global cache
