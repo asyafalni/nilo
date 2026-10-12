@@ -243,9 +243,11 @@ Nothing is open at this tier.
 
 **Direction:** [A stream is one shape](./roadmap.md#a-stream-is-one-shape)
 
-**Server reflection, which `grpcurl` wants, is not served and not decided either way.** It is a bidirectional stream, so it waits on the stream direction; until then `grpcurl` is given the `.proto` with `-proto`, as the gRPC guide's health section says.
+**Server reflection, which `grpcurl` wants, is not served yet; it is decided that it will be, as an option.** It is a bidirectional stream, so it waits on the stream direction; until then `grpcurl` is given the `.proto` with `-proto`, as the gRPC guide's health section says.
 
-**What would settle it:** a decision once a gRPC listener takes streams: served, or refused in `decided.md` with its reason.
+**Needs:** a gRPC listener that takes streams first; then `app.reflection()`, opt-in so nothing is paid until it is asked for, answering from descriptors built while compiling from the structs `app.rpc` already serves. A struct written by hand names no `.proto` package, so the descriptor says what nilo knows of it and no more.
+
+**Direction:** [A stream is one shape](./roadmap.md#a-stream-is-one-shape)
 
 **Multipart, streamed: an upload holds the whole body in the arena, so a route raised to `maxBody(50 << 20)` holds up to 50 MB for each upload in flight.** `Form(T)` reads a multipart body whole, bounded only by `max_body` ([ADR 030](./adr/030-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. Every Go and Rust framework compared bounds the memory instead (read in each one's source): Go's `ReadForm`, and so Gin and Echo, keeps a file in memory up to 32 MB and writes the rest to a temp file, Fiber through fasthttp at 16 MB; actix-multipart's and Rocket's `TempFile` stream a file to disk as it arrives, actix under two budgets, a total and a memory one (50 MiB and 2 MiB); axum hands each field to the handler as a stream; poem spools every upload to disk however small. actix declares a limit per field on the type (`#[multipart(limit = "2 KiB")]`) and Rocket per extension (`file/jpg`). The streaming version wants a parser that resumes across reads; an `Upload` that is bytes in the arena up to a threshold and a file past it; `saveTo` a rename where it can be, because Rocket's `persist_to` fails across filesystems and falls back to a copy; a limit per field declared on the field; and every limit counted on the bytes that arrive, not on `Content-Length`, since poem's `SizeLimit` reads only the header and refuses a chunked body. It inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
@@ -327,9 +329,9 @@ Nothing is open at this tier.
 
 **Direction:** [A developer from Go or Node meets no silent trap in the first week](./roadmap.md#a-developer-from-go-or-node-meets-no-silent-trap-in-the-first-week)
 
-**No CI job runs on Windows, and the Linux aarch64 job (`ubuntu-24.04-arm`) has not had its first run**, so the deploying guide's platforms table rests on a job nobody has seen pass on ARM.
+**The Linux aarch64 job (`ubuntu-24.04-arm`) and the Windows job for the loop-free modules (`windows-tools`) have not had their first run**, so the deploying guide's platforms table rests on two jobs nobody has seen pass.
 
-**What would settle it:** the aarch64 job green on its first push, or each failure it finds filed here; and a decision on whether Windows is supported at all.
+**What would settle it:** both jobs green on their first push, or each failure they find filed here.
 
 **A security scheme or a path parameter's type that a resolver or a middleware needs does not reach the API description.** A route whose handler takes `Bearer(T)` is described with `bearerAuth`, and one whose resolver takes it is not; a resolver's `Path(T)` field types do not refine the parameter's schema, which stays text unless the handler's own argument types it.
 
@@ -344,10 +346,6 @@ Nothing is open at this tier.
 **`nilo_fetch` speaks HTTP/1.1 only, so a nilo service can answer gRPC and cannot call it.** The server half of HTTP/2 is built ([ADR 259](./adr/259-http2-is-a-framing-of-every-request.md)), and a service between other gRPC services, which is where most gRPC servers sit, needs both halves; a client connection carrying many calls is on the record nowhere. grpc-go and connect-go do both.
 
 **Needs:** a design for an outbound connection carrying many calls, and where its framing comes from: `nilo_fetch` may not import `nilo_http` ([ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md)), so `h2.zig` and `hpack.zig` move down a layer or are written again; then the idle bytes of an outbound HTTP/2 connection measured before it ships.
-
-**A route's deadline does not bound the credential source's `fetch_timeout_ms`.** A permit wait now gives up at the route's deadline (ADR 105), but the credential refresh in `s3/store.zig` (`fetchBounded`) is shared by every request waiting on it, so one request's deadline cutting it short would fail the refresh for the others, and ADR 105 leaves it unnarrowed on purpose.
-
-**What would settle it:** whether a waiter can stop waiting at its own deadline while the shared refresh runs on to its own bound, held by a test with two requests whose deadlines differ.
 
 **What a handler parked in `fetch.WebSocket.receive` holds per inbound connection is not measured.** A `fetch.WebSocket` is 1,200 bytes on the frame of the fiber that uses it, and a fiber holds its stack at its high-water mark for as long as it is parked ([ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md)), so a route that opens a feed and waits on it costs every connection it serves the deepest frame the open reached, the TLS handshake included on `wss://`. ADR 281 does not state that number, which ADR 017 asks of a feature that costs per-connection memory.
 

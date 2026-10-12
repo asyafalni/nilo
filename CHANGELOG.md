@@ -21,7 +21,9 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Changed
 
-- **The `db.raw` first-run check says an outer-join column "may be NULL"**, and also flags a column read through an anti join (`LEFT JOIN … WHERE o.id IS NULL`), which is NULL on every row. A field it refuses over a `NOT NULL` key is fixed as before, with an optional field or a `coalesce` ([ADR 233](docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+- **A `nilo_s3` request waiting on a credential refresh stops at its route's deadline**, with `error.TimedOut`, or signs with the key it already holds if that is still good, while the refresh runs on to its own `fetch_timeout_ms` and is kept for the requests after it. Before, it waited out the whole fetch. Nothing to change ([ADR 105](docs/adr/105-a-route-can-say-how-long-it-has.md)).
+- **CI runs the loop-free modules' tests on Windows**, and Windows is now on record as supported for those modules only; a server there runs under WSL2 ([`decided.md`](docs/decided.md)).
+- **The `db.raw` first-run check says an outer-join column "may be NULL"**, and also flags a column read through an anti join (`LEFT JOIN … WHERE o.id IS NULL`), which is NULL on every row, including the `Right Anti` Postgres 16 and later write for it. A field it refuses over a `NOT NULL` key is fixed as before, with an optional field or a `coalesce` ([ADR 233](docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
 - **A SQLite migration step that times out on a lock names `busy_timeout_ms`**, the setting that applied, where it named `.lock_timeout_ms` and 5000 ms ([ADR 240](docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
 
 ### Fixed
