@@ -102,6 +102,45 @@ A path no route answers is `UNIMPLEMENTED`, and a message larger than its route'
 
 The same connection serves any other request, a `GET` or a `POST` with a JSON body, through the router, middleware and handler as HTTP/1.1 does. **A handler runs when the headers are in**, as it does on HTTP/1.1, and what the client sends after them is read through `c.body()` or `c.bodyStream()` the same way: `c.body()` waits for the whole of it, `c.bodyStream()` reads it in pieces and the client sends no faster than the handler reads, and `Expect: 100-continue` is answered when the handler first reads a body that has not arrived. **A handler writes its answer in pieces too**: `c.stream()`, `c.events()` and `c.sendFile` (a file is read into frames, a range request included, and a `HEAD` is its head with no `DATA`) work as they do on HTTP/1.1, the client's windows deciding how fast, and a client that stops reading is reset at the write deadline and its handler's next write fails. A connection takes turns between its streams, so a small answer is not held behind a large one. What a handler cannot do on HTTP/2 yet is refused by name with a 500 that says so: `c.eventsFrom` and `c.upgrade` (a WebSocket is HTTP/1.1). `CONNECT` is answered 501.
 
+## A health check
+
+**`grpc.health.v1.Health/Check` is an ordinary method, and nilo does not register it for you.** Kubernetes' gRPC probe and most load balancers call it, so a program behind either one writes the four types of `health.proto` and serves them as any service. The service name is the package's, `grpc.health.v1.Health`, and the method is served at `/grpc.health.v1.Health/Check`:
+
+<!-- compiles -->
+```zig
+const ServingStatus = enum(i32) { unknown = 0, serving = 1, not_serving = 2, service_unknown = 3, _ };
+
+const HealthCheckRequest = struct {
+    pub const wire = .{ .service = 1 };
+    service: []const u8 = "",
+};
+
+const HealthCheckResponse = struct {
+    pub const wire = .{ .status = 1 };
+    status: ServingStatus = .unknown,
+};
+
+const Health = struct {
+    pub const nilo_service = "grpc.health.v1.Health";
+
+    pub fn check(in: HealthCheckRequest) !HealthCheckResponse {
+        // An empty name asks about the server as a whole; the others are the
+        // services you list here.
+        if (in.service.len != 0 and !std.mem.eql(u8, in.service, "helloworld.Greeter"))
+            return nilo.fail.notFound("no service {s}", .{in.service});
+        return .{ .status = .serving };
+    }
+};
+
+fn mountHealth(app: *nilo.App) !void {
+    try app.rpc(Health);
+}
+```
+
+An unknown service name is `NOT_FOUND`, which is what the protocol asks. To make the answer follow the program's state, take a service as an argument like any route does, and return `.not_serving` while it is not ready (the ordinary `/health` route does the same, see [Health checks](./deploying.md#health-checks)). `Health/Watch`, which streams a status each time it changes, is a streaming call and so is not served ([What it does not do](#what-it-does-not-do)). Point the probe at the same port as the rest, since one listener answers both protocols.
+
+**Server reflection is not served.** It is a streaming call, which this listener does not take, so `grpcurl` needs the `.proto` file (`-proto`) until a decision on streaming and on reflection is made.
+
 ## Deadlines
 
 **A client's `grpc-timeout` becomes the request's deadline**, the same one `nilo.deadline(ms)` gives a route ([deadlines](./deploying.md#deadlines)), counted from when the call's headers arrived and not from when its message was whole. Every wait nilo owns is cut short by it, and `c.overdue()` tells a loop of your own when time is up. A route that fails after the client's time is up is answered `DEADLINE_EXCEEDED` whatever it failed with, because that is what happened as far as the client can tell. `limits.request_deadline_ms` does not extend a deadline a call brought with it; a route's own `nilo.deadline` replaces it.

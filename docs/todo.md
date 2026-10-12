@@ -47,7 +47,7 @@ Nothing is open at this tier.
 
 **What would settle it:** a decision on extending ADR 111 to the code flow, and if so a start route and a callback argument whose state lives in a short-lived sealed cookie.
 
-**The live test that crosses a Room post with a WebSocket frame waits past its five-second bound in 3 to 5 runs of 12 or 14, so a frame or a post may be lost since frames were received in the peek wait.** "a post that crosses a frame arriving loses neither, however often they cross" (`http/live.zig`) panicked with `programmer bug caused syscall error: AGAIN` in `Io.Threaded.netReadPosix` on 2026-10-10: when its test binary was run directly beside eight busy loops, before and after the `.follow` fix, in three Debug runs of another change, and as the one failure of 3,865 in a `zig build test-all`; it crashed the same way on an untouched `git archive HEAD` export of `0bcc0e3`, so no change in flight brought it. The client's socket carries a 5 s `SO_RCVTIMEO`, and std's `Threaded` reads the `EAGAIN` that bound returns as a programmer bug (`errnoBug`), so every panic is the client having waited five seconds for a frame or a post that did not come. Losing one is what the test exists to catch, and `2622234` moved a WebSocket's next frame into the peek wait ([ADR 284](./adr/284-a-connection-in-conversation-waits-by-receiving.md)); one executor starved for five seconds by the busy loops is the other reading. Ranked here and not P0 until it is known which. The bound panicking is a defect of its own: the same `SO_RCVTIMEO` is set by three helpers in `live.zig`, two in `grpc_live.zig` and one in `grpc_tls_live.zig`, and none of them can fail with a sentence.
+**The live test that crosses a Room post with a WebSocket frame waits past its five-second bound in 3 to 5 runs of 12 or 14, so a frame or a post may be lost since frames were received in the peek wait.** "a post that crosses a frame arriving loses neither, however often they cross" (`http/live.zig`) panicked with `programmer bug caused syscall error: AGAIN` in `Io.Threaded.netReadPosix` on 2026-10-10: when its test binary was run directly beside eight busy loops, before and after the `.follow` fix, in three Debug runs of another change, as the one failure of 3,865 in a `zig build test-all`, and again in a `zig build test` on 2026-10-12; it crashed the same way on an untouched `git archive HEAD` export of `0bcc0e3`, so no change in flight brought it. The client's socket carries a 5 s `SO_RCVTIMEO`, and std's `Threaded` reads the `EAGAIN` that bound returns as a programmer bug (`errnoBug`), so every panic is the client having waited five seconds for a frame or a post that did not come. Losing one is what the test exists to catch, and `2622234` moved a WebSocket's next frame into the peek wait ([ADR 284](./adr/284-a-connection-in-conversation-waits-by-receiving.md)); one executor starved for five seconds by the busy loops is the other reading. Ranked here and not P0 until it is known which. The bound panicking is a defect of its own: the same `SO_RCVTIMEO` is set by three helpers in `live.zig`, two in `grpc_live.zig` and one in `grpc_tls_live.zig`, and none of them can fail with a sentence.
 
 **What would settle it:** the test binary run in the same loop under the same load at `2622234` and at its parent, interleaved, which says whether the change brought it; and each client bound made one that returns an error naming what was waited for, so the next stall is a failed test that says so.
 
@@ -75,9 +75,9 @@ Nothing is open at this tier.
 
 **Direction:** [Defects are caught by a build step before a reader](./roadmap.md#defects-are-caught-by-a-build-step-before-a-reader)
 
-**Four pages say what the code no longer does.** `docs/design/id-clock-entropy.md` rule 6 says a `Run` gets no entropy call of its own, and its rule 8 and `core/scope.zig:177` give it two. `docs/design/deadlines.md` rule 5 says a WebSocket has no read deadline and that a ping is not part of it, where `idle_ms` pings after thirty seconds and closes ([ADR 021](./adr/021-a-websocket-is-a-handler-that-does-not-return.md)). `docs/comparison.md` gives 8,767 bytes and two pages of stack for an idle connection (lines 140 to 171), from before [ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md) brought it to 4,669 and one page. `CLAUDE.md`'s layout table says path params match by position, which [ADR 002](./adr/002-typed-handlers-are-a-thin-layer-over-ctx.md) narrowed to a route with one param.
+**`docs/comparison.md` gives 8,767 bytes and two pages of stack for an idle nilo connection**, from before [ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md) brought it to 4,669 and one page (lines 140 to 171).
 
-**Needs:** each sentence made true, and `comparison.md`'s table run again rather than edited, because its other columns were measured on the same day.
+**Needs:** the table run again rather than edited, because its other columns were measured on the same day.
 
 **Direction:** [Defects are caught by a build step before a reader](./roadmap.md#defects-are-caught-by-a-build-step-before-a-reader)
 
@@ -127,20 +127,6 @@ Nothing is open at this tier.
 
 **Needs:** a harness — a build step that stands up a second writer, which here is a second process on the same file rather than a socket.
 
-**A `Date` read through `db.raw` or a composed statement checks only that the value is four bytes wide.** A typed read knows its column is a `date` from the schema, but `tx.raw(Row, "SELECT n FROM t")` with `n int4` into a `Date` field reads the integer as a count of days since 2000, and says nothing. Checking the column's type OID (1082) would refuse it, and would also refuse a domain over `date`, which reaches the client under its own OID.
-
-**Needs:** the OID checked with domains resolved to their base type, or the gap written into `db.raw`'s reference as the caller's to hold.
-
-**The plan check calls a column certainly NULL where it cannot be, and misses one that always is.** Postgres keeps `Left` for a `LEFT JOIN` through a `NOT NULL REFERENCES` key and under a filter that is not strict, such as `coalesce(o.name, '') <> ''`, and `plan.zig` refuses both, where [ADR 233](./adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md) promises only what is certain; an `Anti` join, `LEFT JOIN … WHERE o.id IS NULL`, outputs NULL on every row and is not flagged.
-
-**Needs:** the wording made "may", or those cases recognised, and `Anti` handled.
-
-**Migration steps and their words disagree with what runs.** ADR 240 calls five seconds the longest a migration can stall a table; `lock_timeout` bounds each acquisition, so a version over ten tables can hold the first for the sum of the rest. On SQLite a `Locked` version names `.lock_timeout_ms` and 5000 ms (`migrate.zig:2436`), where `busy_timeout_ms` is what applied. `expect` is called one query (`migrate.zig:26`, ADR 123) and is `ensureLedger`'s four round trips and a lock before it. `Kind.data`'s comment (`migrate.zig:574`) places a backfill between two steps `generate` never writes as a pair. An `ADD COLUMN` with an enum's `CHECK` reads every row under `ACCESS EXCLUSIVE` and its `why` does not say so (`migrate.zig:1001`).
-
-**Needs:** each sentence made true, and the enum check's `why` saying what it reads.
-
-**Direction:** [A migration history a project can keep for years](./roadmap.md#a-migration-history-a-project-can-keep-for-years)
-
 **`reset` and `squash` are missing from the migrations, and they are the debt that forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify` ship ([ADR 123](./adr/123-a-migration-is-a-diff-against-a-snapshot.md)); `push` and `pull` — the SQLite and the rescue cases — are the other two that do not. There is no `down`, so a developer whose laptop database is in a state no version describes has nothing to type, and a project three years in has four hundred version files every CI run reads. Skipping them does not remove that pain, it moves it onto somebody's laptop and into somebody's build. `squash` is the harder half: it has to leave the ledger of every database that already ran the old versions alone, which means writing a new first version that is only ever applied to a database that has applied nothing.
 
 **Needs:** what `squash` writes into the ledger of a database that is already past it. Rewriting rows is out — that is the thing `verify` exists to catch.
@@ -189,10 +175,6 @@ Nothing is open at this tier.
 
 **Direction:** [A migration history a project can keep for years](./roadmap.md#a-migration-history-a-project-can-keep-for-years)
 
-**`.min` and `.max` over an enum column that is a Postgres `ENUM` answer differently on the two databases.** An enum that names no database type is `text` on both, ordered by its text (`dialect.zig`, ADR 181); one declared with `nilo_column` as a Postgres `ENUM`, or a column somebody else made one, is ordered by its declaration there and by its text on SQLite, so the same grouped Row names a different label on each, with no error.
-
-**Needs:** a refusal on SQLite, or the SQLite column ordered by the enum's position.
-
 **Case folding outside ASCII differs between the two databases.** SQLite's `LIKE` and `NOCASE` fold ASCII only (`dialect.zig:1110`, `:1199`); Postgres's `ILIKE` and `lower()` fold Unicode (`:613`). `.ieq = "ÉLISE@x.id"` matches `élise@x.id` on Postgres and not on SQLite, and a `NOCASE` unique keeps both. ADR 055 asks for a difference like this to be refused or written down, and the reference says only that SQLite folds ASCII.
 
 **Needs:** whether the SQLite half is refused for non-ASCII text or the difference is written on both pages.
@@ -216,10 +198,6 @@ Nothing is open at this tier.
 **An upsert cannot target a partial unique index, so a table that soft-deletes cannot upsert on the column that is unique among its live rows.** `ON CONFLICT (email) WHERE deleted_at IS NULL` is the statement; `db.raw` cannot put `RETURNING` into a Row beside a conflict target without giving up the column check, and a constraint name is a string the module would take on trust.
 
 **Needs:** the conflict target named by a unique the Row's table already declares, its predicate included, so nothing is taken on trust; and whether `nilo_table` can declare a partial unique yet.
-
-**A key moved onto a new column, with the old key column dropped in the same change, is added as a plain column and the table is left with no key, with no Problem raised.** `diffTable` raises "the key moved" when a column that is still there stops or starts being the key (`migrate.zig`, `c.key != was.key`), but a column that is new goes to `add_column` without its `key` being read, and `ddl.addColumn` writes it `NOT NULL` and no more, where `columnClause` would have written `PRIMARY KEY`. The drop needs `--drop`, so nothing is lost; the table that results has no primary key, and the startup check, which reads columns only, does not see it. Found by reading, not reproduced.
-
-**Needs:** the same Problem raised for a new column that is the key, and a test that drops the old key column and adds a new one in one change, failing before the fix on both databases.
 
 ### `nilo_http`
 
@@ -265,9 +243,9 @@ Nothing is open at this tier.
 
 **Direction:** [A stream is one shape](./roadmap.md#a-stream-is-one-shape)
 
-**A gRPC listener has no health service, and the guide does not say how to write one.** Kubernetes' gRPC probe and most load balancers call `grpc.health.v1.Health/Check`, which is an ordinary route under [ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md) and nothing documents; server reflection, which `grpcurl` wants, is not on record either way.
+**Server reflection, which `grpcurl` wants, is not served and not decided either way.** It is a bidirectional stream, so it waits on the stream direction; until then `grpcurl` is given the `.proto` with `-proto`, as the gRPC guide's health section says.
 
-**Needs:** a guide section showing `grpc.health.v1.Health/Check` as an ordinary route, and a decision on server reflection.
+**What would settle it:** a decision once a gRPC listener takes streams: served, or refused in `decided.md` with its reason.
 
 **Multipart, streamed: an upload holds the whole body in the arena, so a route raised to `maxBody(50 << 20)` holds up to 50 MB for each upload in flight.** `Form(T)` reads a multipart body whole, bounded only by `max_body` ([ADR 030](./adr/030-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. Every Go and Rust framework compared bounds the memory instead (read in each one's source): Go's `ReadForm`, and so Gin and Echo, keeps a file in memory up to 32 MB and writes the rest to a temp file, Fiber through fasthttp at 16 MB; actix-multipart's and Rocket's `TempFile` stream a file to disk as it arrives, actix under two budgets, a total and a memory one (50 MiB and 2 MiB); axum hands each field to the handler as a stream; poem spools every upload to disk however small. actix declares a limit per field on the type (`#[multipart(limit = "2 KiB")]`) and Rocket per extension (`file/jpg`). The streaming version wants a parser that resumes across reads; an `Upload` that is bytes in the arena up to a threshold and a file past it; `saveTo` a rename where it can be, because Rocket's `persist_to` fails across filesystems and falls back to a copy; a limit per field declared on the field; and every limit counted on the bytes that arrive, not on `Content-Length`, since poem's `SizeLimit` reads only the header and refuses a chunked body. It inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
@@ -349,13 +327,9 @@ Nothing is open at this tier.
 
 **Direction:** [A developer from Go or Node meets no silent trap in the first week](./roadmap.md#a-developer-from-go-or-node-meets-no-silent-trap-in-the-first-week)
 
-**A session cookie that does not open reads as no session, and nothing is logged, so a wrong `session_secret` after a deploy signs everybody out with no sign of why.** `session.open` returns null for a cookie that fails to decode, unseal or parse (`http/session.zig:444`, `:479` to `:508`), the same null an anonymous visitor gives, and the guide's answer to a leaked secret is to rotate it ([ADR 033](./adr/033-a-session-is-sealed-into-the-cookie.md)). An operator who rotated it wrong finds out from support tickets.
+**No CI job runs on Windows, and the Linux aarch64 job (`ubuntu-24.04-arm`) has not had its first run**, so the deploying guide's platforms table rests on a job nobody has seen pass on ARM.
 
-**Needs:** the two told apart where an operator looks: a count of cookies that failed to open on `/metrics`, or one `warn` line an interval while it keeps happening.
-
-**No CI job runs on Linux aarch64 or on Windows**, so the platforms table in the deploying guide calls both untested, and an ARM server (Graviton, Ampere, a Raspberry Pi at the edge) is a deploy target nilo has never been run on; CI runs `zig build test` on Linux x86-64 and macOS.
-
-**What would settle it:** a job on an aarch64 runner running `zig build test`, and a decision on whether Windows is supported at all.
+**What would settle it:** the aarch64 job green on its first push, or each failure it finds filed here; and a decision on whether Windows is supported at all.
 
 **A security scheme or a path parameter's type that a resolver or a middleware needs does not reach the API description.** A route whose handler takes `Bearer(T)` is described with `bearerAuth`, and one whose resolver takes it is not; a resolver's `Path(T)` field types do not refine the parameter's schema, which stays text unless the handler's own argument types it.
 
@@ -371,9 +345,9 @@ Nothing is open at this tier.
 
 **Needs:** a design for an outbound connection carrying many calls, and where its framing comes from: `nilo_fetch` may not import `nilo_http` ([ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md)), so `h2.zig` and `hpack.zig` move down a layer or are written again; then the idle bytes of an outbound HTTP/2 connection measured before it ships.
 
-**A route's deadline does not bound the wait for a `nilo_fetch` permit, nor the credential source's `fetch_timeout_ms`.** A call's own timeout and its dial take the shorter of their bound and the route's (ADR 105), but `client.gate.wait` queues before either, so a saturated client holds a request past its deadline.
+**A route's deadline does not bound the credential source's `fetch_timeout_ms`.** A permit wait now gives up at the route's deadline (ADR 105), but the credential refresh in `s3/store.zig` (`fetchBounded`) is shared by every request waiting on it, so one request's deadline cutting it short would fail the refresh for the others, and ADR 105 leaves it unnarrowed on purpose.
 
-**What would settle it:** a test with a client whose permits are all taken, under a route deadline shorter than the queue's wait.
+**What would settle it:** whether a waiter can stop waiting at its own deadline while the shared refresh runs on to its own bound, held by a test with two requests whose deadlines differ.
 
 **What a handler parked in `fetch.WebSocket.receive` holds per inbound connection is not measured.** A `fetch.WebSocket` is 1,200 bytes on the frame of the fiber that uses it, and a fiber holds its stack at its high-water mark for as long as it is parked ([ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md)), so a route that opens a feed and waits on it costs every connection it serves the deepest frame the open reached, the TLS handshake included on `wss://`. ADR 281 does not state that number, which ADR 017 asks of a feature that costs per-connection memory.
 

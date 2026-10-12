@@ -45,7 +45,7 @@ The repository is written to be worked on by somebody who did not write it, a pe
 | **Bulkhead** | `http/bulkhead.zig` | the whole contract nilo asks of an Engine, listed in its header. `Options` lives here so swapping engines cannot change what a user writes. |
 | **HTTP + App** | `http/http1.zig`, `http/router.zig`, `http/app.zig` | parse, match, dispatch. `App.handleRequest` takes only a `*std.Io.Reader` and `*std.Io.Writer`, so almost every HTTP behaviour is tested on in-memory buffers. |
 | **Ctx** | `http/ctx.zig` | one request in flight, and nilo's real API. |
-| **Typed** | `http/typed.zig` | the compile-time engine: turns a typed handler into a Ctx handler. **A pointer is a service, a value is request data.** Path params match by position, because Zig keeps no argument names. |
+| **Typed** | `http/typed.zig` | the compile-time engine: turns a typed handler into a Ctx handler. **A pointer is a service, a value is request data.** Zig keeps no argument names, so a route with one path param takes it as a bare argument and one with two or more reads them by name through `nilo.Path(T)` (ADR 002). |
 
 **The layering rule is a build step**, and like `adr-check`, `docs-check` and `fetch-check` it is a subcommand of the one program in `checks/`, which `build.zig` runs because Zig 0.17 has no step with a function of its own: `zig build layering` reads the `@import`s of every module but `http/` and refuses one missing from that module's row of `layers` in `build.zig`. Adding a module means a row there, in `shipped_roots`, and in `.paths` in `build.zig.zon`, and a program in `bench/release/`, which `bench/release.py` refuses to run without.
 

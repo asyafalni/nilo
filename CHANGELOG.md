@@ -10,7 +10,24 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Nothing yet. Work lands here under `### Breaking`, `### Added`, `### Changed` and `### Fixed`, newest first.
+### Breaking
+
+- **`.min` and `.max` over an enum that sets `nilo_column` (a Postgres `ENUM`) are a compile error on the SQLite dialect**, because SQLite orders the column by the label's spelling and Postgres by the enum's declaration, so the same grouped Row named a different label on each with no error. Drop `nilo_column` from the enum so both store text, or read the first row with `.order` and `.limit = 1` ([ADR 181](docs/adr/181-the-marker-has-two-kinds-of-word.md)).
+- **A `sql.Date` field refuses a column that does not arrive as `date` on a raw read inside a transaction and on a composed statement**, where an `int4` was read as a count of days since 2000. A domain over `date` still reads. Cast the column to `date` in the statement ([ADR 233](docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+
+### Added
+
+- **`/metrics` publishes `nilo_session_rejected_total`**: session cookies and Bearer tokens that were sent and failed to open, so a wrong `session_secret` after a deploy shows as a climb rather than as a quiet hour. An expired one and a request that sent none are not counted, and the series appears once the first is seen. Nothing to change ([ADR 033](docs/adr/033-a-session-is-sealed-into-the-cookie.md)).
+
+### Changed
+
+- **The `db.raw` first-run check says an outer-join column "may be NULL"**, and also flags a column read through an anti join (`LEFT JOIN … WHERE o.id IS NULL`), which is NULL on every row. A field it refuses over a `NOT NULL` key is fixed as before, with an optional field or a `coalesce` ([ADR 233](docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+- **A SQLite migration step that times out on a lock names `busy_timeout_ms`**, the setting that applied, where it named `.lock_timeout_ms` and 5000 ms ([ADR 240](docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
+
+### Fixed
+
+- **`db generate` raises a Problem when the key moves onto a new column and the old key column is dropped in the same change**, where it added the new column as a plain one and left the table with no primary key. Write the key move as a step of its own ([ADR 123](docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+- **A `nilo_fetch` call under a route deadline stops queueing for a permit when the route's time runs out**, failing with `error.TimedOut` without dialling, where it waited for the permit and only then saw the deadline had passed. Nothing to change ([ADR 105](docs/adr/105-a-route-can-say-how-long-it-has.md)).
 
 ## Released
 

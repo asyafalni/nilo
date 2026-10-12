@@ -25,7 +25,7 @@ Independent of the order: each touches files no stage of the direction above doe
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · Every module · The public surface has not been read back against the reference, except for `nilo_fetch`'s.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · Every module · A limit is named, and defaulted, differently in each module, and 1.0 freezes the names.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · Every module · Two public types are called `Bound`.
-- [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · Every module · Four pages say what the code no longer does.
+- [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · Every module · `docs/comparison.md` gives 8,767 bytes and two pages of stack for an idle nilo connection
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · A module header's code example is not compiled, so one can rot.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · A rule a build step holds against the patterns the audit kept finding.
@@ -57,7 +57,6 @@ Independent of the order: each touches files no stage of the direction above doe
 
 <!-- gathered: `zig build docs-index` writes this list from the Direction lines in docs/todo.md -->
 
-- [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_sql` · Migration steps and their words disagree with what runs.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_sql` · `reset` and `squash` are missing from the migrations, and they are the debt that forward-only creates.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_sql` · A case-folding unique made before `text_pattern_ops` keeps the index `istarts_with` cannot read.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_sql` · A table cannot be renamed, and a foreign key has no `ON UPDATE`.
