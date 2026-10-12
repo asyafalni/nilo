@@ -3303,7 +3303,10 @@ const Snippets = struct {
             if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.fmt("docs/{s}", .{entry.path})));
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.path, ".md")) continue;
-            candidates.append(b.allocator, b.fmt("docs/{s}", .{entry.path})) catch @panic("OOM");
+            // The walker joins with the host's separator, and `pages` is
+            // written with `/`: on Windows every page read as unlisted.
+            const slashed = std.mem.replaceOwned(u8, b.allocator, entry.path, "\\", "/") catch @panic("OOM");
+            candidates.append(b.allocator, b.fmt("docs/{s}", .{slashed})) catch @panic("OOM");
         }
 
         for (candidates.items) |path| {
