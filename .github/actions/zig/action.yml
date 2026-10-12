@@ -21,6 +21,9 @@ runs:
           Linux-X64)
             name=zig-x86_64-linux-$version
             sum=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 ;;
+          Linux-ARM64)
+            name=zig-aarch64-linux-$version
+            sum=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 ;;
           macOS-ARM64)
             name=zig-aarch64-macos-$version
             sum=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a ;;
