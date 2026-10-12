@@ -52,7 +52,7 @@ pub fn before(self: *App, comptime func: anytype, args: BeforeArgs(func)) !void
 
 ### `db.expecting(version)` is the version guard alone
 
-The commonest use of the boot phase is one integer against one query, and it needs no `before` call at all: `db.expecting(manifest.head)` installs a guard `nilo_check` runs on the pool `nilo_start` already opened. A database behind is refused with the sentence naming which migrations are missing; a database ahead is allowed and logged, because that is the middle of an expand-and-contract deploy. A database that cannot be asked starts with a warning, the way the schema check does ([ADR 036](./036-the-shape-of-a-query-is-settled-while-compiling.md)).
+The commonest use of the boot phase is one integer against the ledger's head, two short queries, and it needs no `before` call at all: `db.expecting(manifest.head)` installs a guard `nilo_check` runs on the pool `nilo_start` already opened. A database behind is refused with the sentence naming which migrations are missing; a database ahead is allowed and logged, because that is the middle of an expand-and-contract deploy. A database that cannot be asked starts with a warning, the way the schema check does ([ADR 036](./036-the-shape-of-a-query-is-settled-while-compiling.md)).
 
 ## What was rejected
 

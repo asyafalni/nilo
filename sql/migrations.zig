@@ -1221,8 +1221,8 @@ pub fn renderManifest(gpa: std.mem.Allocator, entries: []const Entry, opts: Opti
         \\// Written by `db generate`, and committed.
         \\//
         \\// The version list this binary is built with. `head` is a constant, so
-        \\// `db.expecting(manifest.head)` costs one query at boot and refuses to
-        \\// serve a database the migrations have not reached.
+        \\// `db.expecting(manifest.head)` costs two short queries at boot and
+        \\// refuses to serve a database the migrations have not reached.
         \\
         \\const std = @import("std");
         \\const migrate = @import("{s}").migrate;
