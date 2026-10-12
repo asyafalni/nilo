@@ -867,7 +867,7 @@ test "the head version is zero on a database nothing has migrated" {
 
 test "a binary built for a version the database has not reached refuses to serve" {
     // The incident with one shape: the code went out before the migration did.
-    // `expect` is one integer against one query, and it is the only thing in
+    // `expect` is one integer against two cheap queries, and it is the only thing in
     // this module that stops a process rather than a statement.
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "expect");

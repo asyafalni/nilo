@@ -376,6 +376,14 @@ pub fn aggregateCall(
     comptime aggregate: row_mod.Aggregate,
 ) []const u8 {
     return comptime blk: {
+        if (aggregate.column) |c| if (aggregate.kind == .min or aggregate.kind == .max)
+            dialect_mod.assertEnumOrders(
+                D,
+                Shape,
+                c,
+                row_mod.ColumnType(row_mod.ownerOf(Shape), c),
+                "`" ++ @tagName(aggregate.kind) ++ "` (field `." ++ aggregate.field ++ "`)",
+            );
         if (aggregate.column) |c| switch (aggregate.kind) {
             .sum, .avg, .min, .max => dialect_mod.assertDecimalCompares(
                 D,

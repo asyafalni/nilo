@@ -1046,6 +1046,19 @@ pub const Wire = struct {
         // the same way — so this is a seam the driver has rather than a hole
         // being poked in it.
         if (comptime types.isDate(T)) {
+            // **The column's own OID is held to `date`**, because four bytes
+            // are all the bytes below look at: an `int4` read into a `Date`
+            // was a count of days since 2000, and said nothing. A domain over
+            // `date` passes, since the server's RowDescription names the type
+            // under a domain, so no catalog query is needed (ADR 233).
+            if (row.oids[col] != date_oid) {
+                std.log.warn(
+                    "nilo_sql: column {d} arrived as type {d}, which a Date does not read. " ++
+                        "Cast the column to date in the statement, or change the field's type.",
+                    .{ col, @as(u32, @bitCast(row.oids[col])) },
+                );
+                return error.QueryFailed;
+            }
             const raw = row.values[col];
             if (raw.is_null) {
                 if (comptime @typeInfo(T) == .optional) return null;
@@ -1193,6 +1206,9 @@ pub const Wire = struct {
         );
         return error.QueryFailed;
     }
+
+    /// `date`'s type OID, which pg.zig has no name for.
+    const date_oid: i32 = 1082;
 
     /// 2000-01-01 as microseconds since the epoch: where Postgres counts a
     /// `timestamp` from, and the number pg.zig's own decoder adds.

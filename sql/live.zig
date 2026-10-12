@@ -1700,12 +1700,17 @@ test "a column that is not four bytes wide, read into a Date nothing checked fir
     defer run.deinit();
 
     // `tx.raw` is not held against its Row on its first run (ADR 233), so
-    // the width is what stands between a timestamp's eight bytes and a day
-    // made of the first four of them.
+    // the read itself holds the column's OID (`date`) and its width.
     var tx = try stack.db.begin(&run, .{});
     defer tx.deinit();
     try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT now() AS day", .{}));
     try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT 1::int8 AS day", .{}));
+    // Four bytes wide and still not a day: the column's OID is what says so.
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT 1::int4 AS day", .{}));
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT 1::float4 AS day", .{}));
+    // A `date` itself is read.
+    const ok = try tx.raw(Dated, &run, "SELECT DATE '2000-01-02' AS day", .{});
+    try testing.expectEqual(@as(usize, 1), ok.len);
 }
 
 test "a date goes out as ten characters and comes back as the same day" {

@@ -40,7 +40,7 @@ Every call after that costs one atomic load.
 ```
 nilo_sql: `db.raw` into feed.Card does not fit what the statement answers:
   column 3 fills `title`, which is not optional, and comes from the side of an
-  outer join that may find nothing, where it is NULL. Make the field optional,
+  outer join that may find nothing, where it may be NULL. Make the field optional,
   or `coalesce` the column.
   column 5 fills `n`, which reads int4, and the statement answers int8 there.
   Cast the column in the statement, or change the field's type.
@@ -110,8 +110,10 @@ has a type and a source column, and a `NOT NULL` column read through the far
 side of a `LEFT JOIN` still names its table. **The plan says it.** `EXPLAIN
 (VERBOSE, FORMAT JSON)` lists every node's output as the expressions it
 computes and every join's type, so a column the top of the plan hands on from
-the inner side of a `Left` join, the outer side of a `Right`, or either side of
-a `Full` is NULL on the rows that found nothing. `sql/plan.zig` reads it, and
+the inner side of a `Left` join, the outer side of a `Right`, either side of a
+`Full`, or the inner side of an `Anti` join (`LEFT JOIN … WHERE o.id IS NULL`,
+which the planner turns into one) may be NULL, and on an `Anti` join is NULL on
+every row. `sql/plan.zig` reads it, and
 is tested on plans a server answered.
 
 The plan has to be one that holds for every value. So the statement is
@@ -125,17 +127,24 @@ name behind. A transaction the `EXPLAIN` aborted refuses the `DEALLOCATE`, and
 it is sent again after the `ROLLBACK`, on the same connection. Five round
 trips, planning only, once.
 
-**Only what is certain is said.** The planner has already turned an outer join
-into an inner one wherever a condition throws the NULLs away (`WHERE s.id >
-$1`), so a join still `Left` in the plan is one whose NULLs reach the answer,
-and `($1 IS NULL OR s.id = $1)`, which keeps them, stays `Left`. An expression
+**Only what the plan shows is said, and what it says is "may".** The planner has
+already turned an outer join into an inner one wherever a condition throws the
+NULLs away (`WHERE s.id > $1`), so a join still `Left` in the plan is one whose
+NULLs can reach the answer, and `($1 IS NULL OR s.id = $1)`, which keeps them,
+stays `Left`. It can also stay `Left` where no NULL ever comes: a join through
+a `NOT NULL REFERENCES` key always finds its row, and under a filter that is
+not strict (`coalesce(o.name, '') <> ''`) the planner cannot prove the join
+inner. The check does not follow the schema or the filter that far, so it
+refuses those too, and the message says "may be NULL" for that reason. The
+way out is always the same, an optional field or a `coalesce`. An expression
 is not judged, and `coalesce` is one. A column renamed by a subquery or a CTE
 scan is not followed. A `UNION` is read by position, because an `Append` names
 its columns after its first branch. A column a `LATERAL` repeats from its outer
 row (`e.kind` inside it, the same `e.kind` beside it) is judged by the side
 that always has a row. In every doubtful case the answer is "cannot say", which
-is read as "not NULL": a column missed is a check that did less, and a column
-wrongly called NULL fails a statement that works.
+is read as "not NULL": a column missed is a check that did less. The one
+direction it errs the other way is the `Left` that finds a row every time,
+named above, and it costs a field made optional.
 
 ### What is not checked
 

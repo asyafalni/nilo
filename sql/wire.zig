@@ -524,9 +524,10 @@ pub const Described = struct {
     /// every string type a database can have is not something to keep.
     textual: bool = false,
     /// Whether the column is NULL on some row because the side of an outer
-    /// join it comes from may find nothing. **True only when that is
-    /// certain**: false is "cannot say" as much as "no", because a column
-    /// wrongly called NULL fails a statement that works.
+    /// join it comes from may find nothing. **True only when the plan
+    /// shows it**: false is "cannot say" as much as "no". The plan keeps a
+    /// `Left` where the key is `NOT NULL` and no NULL comes, so true is
+    /// "may", and the way out is an optional field.
     outer_null: bool = false,
 };
 

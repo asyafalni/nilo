@@ -1219,6 +1219,10 @@ const sql_refusals = [_]Refusal{
         .says = "`sum` (field `.billed`) on sqlite_decimal_summed.Billed's `amount` would run as text on the sqlite dialect.",
     },
     .{
+        .name = "sqlite_enum_max",
+        .says = "`max` (field `.top`) on sqlite_enum_max.Peak's `level` would order by the label's spelling on the sqlite dialect.",
+    },
+    .{
         .name = "sqlite_case_sensitive_pattern",
         .says = "the sqlite dialect has no `contains`, asked for on column `email`.",
     },

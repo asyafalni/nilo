@@ -36,7 +36,7 @@ const tally = try db.raw(Tally, c,
 ```
 column 2 fills `n`, which reads int4, and the statement answers int8 there.
 column 3 fills `title`, which is not optional, and comes from the side of an
-outer join that may find nothing, where it is NULL.
+outer join that may find nothing, where it may be NULL.
 ```
 
 `count(*)` is `int8`, so read it into an `i64` or cast it. A column read through a `LEFT JOIN` or a `LEFT JOIN LATERAL` goes into an optional field, or is wrapped in `coalesce`. The check reads the planner's view, so a `WHERE` that throws the join's NULLs away is taken into account and the column is not reported as NULL. This means a test that reaches a raw statement also checks it against its Row. A statement inside a transaction is not checked; the same statement outside one is.

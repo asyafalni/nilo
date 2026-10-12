@@ -268,6 +268,12 @@ pub const Postgres = struct {
     /// to it (`bindAs`), so `"100.00" > "9.99"` (ADR 049).
     pub const decimal_compares = true;
 
+    /// Whether `min` and `max` over an enum column that names a database type
+    /// (`nilo_column`, a Postgres `ENUM`) answer by the order the type was
+    /// declared in. Here they do. An enum that names none is `text` and is
+    /// ordered by its text on both (`assertEnumOrders`, ADR 181).
+    pub const enum_orders_by_position = true;
+
     /// `LIMIT`/`OFFSET`, which most dialects agree on and one day one will not.
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
@@ -1266,6 +1272,11 @@ pub const SQLite = struct {
     /// writes the digits they stored.
     pub const decimal_compares = false;
 
+    /// No. A Zig enum is its name in a `TEXT` column here, so `min` and `max`
+    /// over one that Postgres would order by declaration answer by the
+    /// spelling (`assertEnumOrders`, ADR 181).
+    pub const enum_orders_by_position = false;
+
     /// None. SQLite has no enum type — a Zig enum is stored as its name in a
     /// TEXT column, and there is no list in the database to hold it against.
     pub const enum_values: ?[]const u8 = null;
@@ -2006,6 +2017,7 @@ pub fn assertDialect(comptime D: type) void {
             "pattern",
             "like_folds",
             "decimal_compares",
+            "enum_orders_by_position",
             "enum_values",
             "now_default",
             "now_text",
@@ -2157,6 +2169,44 @@ pub fn assertDecimalCompares(
                 "\"100.00\" comes before \"9.99\" and a sum is added in floating point (`0.30000000000000004`). " ++
                 "`.eq`, `.ne` and `.in` are still fine.\n" ++
                 "  Store the amount as an integer of its smallest unit (cents in an `i64`), or use Postgres.",
+        );
+    }
+}
+
+/// The Refusal for a `min` or `max` over an enum that Postgres orders by its
+/// declaration and a Dialect with `enum_orders_by_position` false orders by
+/// its text (ADR 181). `T` is the column's type; only an enum that names a
+/// database type other than a text one is refused, because an enum that names
+/// none is `text` on both and answers alike. **Refused rather than emulated**:
+/// ordering by a `CASE` over the labels would cost the index and would have to
+/// track the declaration, and a different label on each database with no
+/// error is the lie ADR 055 exists not to tell.
+pub fn assertEnumOrders(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime T: type,
+    comptime what: []const u8,
+) void {
+    comptime {
+        if (D.enum_orders_by_position) return;
+        const Bare = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        if (@typeInfo(Bare) != .@"enum") return;
+        const named = types.declaredColumn(Bare) orelse return;
+        for (Postgres.text_accepts) |text| {
+            if (std.mem.eql(u8, named, text)) return;
+        }
+        @compileError(
+            "nilo: " ++ what ++ " on " ++ @typeName(Row) ++ "'s `" ++ column ++ "` would order by the label's " ++
+                "spelling on the " ++ D.name ++ " dialect.\n" ++
+                "  `" ++ @typeName(Bare) ++ "` names the database type `" ++ named ++ "`, which Postgres orders by " ++
+                "the position its labels were declared in, so the same Row would name a different label on each " ++
+                "database, with no error.\n" ++
+                "  Drop `nilo_column` from the enum to make it a `text` column ordered by its text on both, or " ++
+                "read the first row in the order you mean with `.order` and a limit of one.",
         );
     }
 }

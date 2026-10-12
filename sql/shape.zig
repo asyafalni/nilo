@@ -654,6 +654,13 @@ pub fn overChildrenCall(comptime D: type, comptime Row: type, comptime field: []
             row_mod.ColumnType(row_mod.ownerOf(over.Child), c),
             "`" ++ over.word ++ "` (field `." ++ field ++ "`)",
         );
+        if (over.column) |c| dialect_mod.assertEnumOrders(
+            D,
+            over.Child,
+            c,
+            row_mod.ColumnType(row_mod.ownerOf(over.Child), c),
+            "`" ++ over.word ++ "` (field `." ++ field ++ "`)",
+        );
         const link = backLink(Row, field, over.Child, overHow(over));
         const alias = D.quote(counted_alias);
         var joined: []const u8 = "";
@@ -998,9 +1005,11 @@ fn assertChildRow(comptime Row: type) void {
 /// reading one compiled and failed on the first request; and SQLite would
 /// answer for all of them, by its storage class's order, which is not an order
 /// anybody asked for and is not the one Postgres would give. So the four are
-/// refused on both (ADR 055). An enum is not in the four: Postgres orders it
-/// by declaration and SQLite by its name as text, which is a difference this
-/// does not close.
+/// refused on both (ADR 055). An enum is not in the four: it is fine on
+/// Postgres. One that names a database type is ordered there by declaration
+/// and on SQLite by its text, which this cannot see because it does not know
+/// the database; `dialect.assertEnumOrders` refuses it on SQLite where the
+/// statement is written.
 ///
 /// `over_children` (`word` is `max` or `min`) is asked the same, so both places
 /// a `min` or `max` is read say the same words.

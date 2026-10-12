@@ -23,8 +23,11 @@
 //!   what it reads first is the columns of a table that has an index.
 //!   That is the whole of what a SQLite application needs at startup, and it
 //!   is what `stress/arsip` writes by hand today.
-//! - **`expect` costs one query and allocates nothing when it passes**, which
-//!   is every boot after the first. It is the check that stops a binary built
+//! - **`expect` costs two queries when it passes**, which is every boot after
+//!   the first: one asks whether the ledger table is there (the catalog, on
+//!   Postgres, whose answer is cut into the Scope's arena), the other reads the
+//!   highest version. A database with no ledger yet pays more once, behind the
+//!   advisory lock (`ensureLedger`). It is the check that stops a binary built
 //!   for schema version 9 from serving a database that is still at 7.
 //!
 //! ## The create order is worked out while compiling
@@ -350,7 +353,7 @@ fn sendRepeatable(
     stored: *Stored,
     comptime r: Repeatable,
 ) !void {
-    if (comptime !@hasDecl(D, "stored_definitions")) return sendBounded(tx, scope, r.sql, "createMissing");
+    if (comptime !@hasDecl(D, "stored_definitions")) return sendBounded(D, tx, scope, r.sql, "createMissing");
     if (!stored.read) {
         stored.entries = try tx.raw([]const u8, scope, D.stored_definitions, .{});
         stored.read = true;
@@ -360,10 +363,10 @@ fn sendRepeatable(
         const split = std.mem.indexOfScalar(u8, entry, 31) orelse continue;
         if (!std.ascii.eqlIgnoreCase(entry[0..split], key)) continue;
         if (std.mem.eql(u8, entry[split + 1 ..], r.plain)) return;
-        try sendBounded(tx, scope, r.drop, "createMissing");
+        try sendBounded(D, tx, scope, r.drop, "createMissing");
         break;
     }
-    try sendBounded(tx, scope, r.sql, "createMissing");
+    try sendBounded(D, tx, scope, r.sql, "createMissing");
 }
 
 /// The views, each after every view it reads.
@@ -760,10 +763,13 @@ pub const Kind = enum {
     ///
     /// **This is the variant that makes expand and contract expressible**, and
     /// it is why a version is a list of steps rather than one statement: the
-    /// backfill that fills a new column goes between the `add_column` that made
-    /// it and the `change_null` that tightens it, in one transaction, in one
-    /// version. `up`/`down` cannot say that, and neither can a tool whose unit
-    /// is a single generated statement.
+    /// backfill that fills a new column goes after the `add_column` that made
+    /// it and before the `change_null` that tightens it, in one transaction, in
+    /// one version. `generate` never writes those two as a pair: the column
+    /// comes in one diff and the tightening in a later one, so a person joins
+    /// them into one version and puts this step between. `up`/`down` cannot
+    /// say that, and neither can a tool whose unit is a single generated
+    /// statement.
     data,
 };
 
@@ -1300,6 +1306,27 @@ fn diffTable(
 
     for (t.desc.columns) |c| {
         const was = columnBefore(old, c.name, renamed.items) orelse {
+            // **A new column that is the key is the key moving**, the same
+            // Problem as a column the table already had becoming it below.
+            // `ddl.addColumn` writes `NOT NULL` and no `PRIMARY KEY`, so without
+            // this a change that drops the old key column and adds the new one
+            // came out as two plain steps and a table with no key, which the
+            // startup check (columns only) does not see.
+            if (c.key) {
+                try problems.append(gpa, .{
+                    .table = t.desc.table,
+                    .column = c.name,
+                    .text = try std.fmt.allocPrint(
+                        gpa,
+                        "the key moved: {s} is a new column and the key. Neither database adds " ++
+                            "a primary key to a table that exists, and the column would be added " ++
+                            "as a plain one, leaving the table with no key and rows nothing can " ++
+                            "address. Write it as a step.",
+                        .{c.name},
+                    ),
+                });
+                continue;
+            }
             // **A Problem on SQLite rather than a step that fails at the
             // deploy.** `ADD COLUMN … NOT NULL` with no default is refused on
             // a table with rows, and a plan cannot see the rows. The same
@@ -2154,18 +2181,25 @@ fn findNamed(list: []const table_mod.NamedText, name: []const u8) ?table_mod.Nam
     return null;
 }
 
-/// What an added column says about itself. **A key on it is checked against
-/// every row on Postgres**, which are all NULL and still all read, under the lock
-/// the `ADD COLUMN` holds until the version ends (ADR 240). A table big enough
-/// for that to matter writes the column and the key as two versions, the key
-/// `NOT VALID` first.
+/// What an added column says about itself. **A key on it, and the `CHECK` over
+/// an enum's words, are each checked against every row on Postgres**, which
+/// are all NULL and still all read, under the lock the `ADD COLUMN` holds until
+/// the version ends (ADR 240). A table big enough for that to matter writes the
+/// column and the key or the check as two versions, `NOT VALID` first.
 fn addedWhy(gpa: std.mem.Allocator, desc: Desc, c: Column) ![]const u8 {
-    if (newColumnKey(desc, c.name) == null)
+    const key = newColumnKey(desc, c.name) != null;
+    const check = c.values.len > 0;
+    if (!key and !check)
         return std.fmt.allocPrint(gpa, "add {s}.{s}", .{ desc.table, c.name });
     return std.fmt.allocPrint(
         gpa,
-        "add {s}.{s} with its foreign key" ++ reads_all ++ "{s} wait",
-        .{ desc.table, c.name, desc.table },
+        "add {s}.{s} with {s}" ++ reads_all ++ "{s} wait",
+        .{
+            desc.table,
+            c.name,
+            if (key and check) "its foreign key and its check over its words" else if (key) "its foreign key" else "its check over its words",
+            desc.table,
+        },
     );
 }
 
@@ -2405,9 +2439,10 @@ pub const Version = struct {
     ///
     /// **An `ALTER` waiting for its lock stops every read and write to the
     /// table behind it**, because Postgres queues a request behind a waiting
-    /// stronger one. So this is the longest a migration can stall a table
-    /// before it has done anything, not how long it runs: once a step holds
-    /// its lock, it keeps it to the commit. Not part of the hash, which
+    /// stronger one. This bounds each wait, one lock at a time: it is not how
+    /// long a table is held. Once a step holds its lock it keeps it to the
+    /// commit, and a version over ten tables can hold the first while it
+    /// waits up to this long for each of the other nine. Not part of the hash, which
     /// covers the statements alone, so moving it after a version ran is
     /// not drift ([ADR 240](../docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
     lock_timeout_ms: u32 = default_lock_timeout_ms,
@@ -2578,16 +2613,16 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
     // A view or trigger goes through `sendRepeatable`, which on SQLite reads
     // the stored definitions once and sends only those that changed.
     var stored: Stored = .{};
-    for (comptime leadingOf(D, schema)) |sql| try sendBounded(&tx, scope, sql, "createMissing");
+    for (comptime leadingOf(D, schema)) |sql| try sendBounded(D, &tx, scope, sql, "createMissing");
     inline for (ordered, 0..) |R, i| {
         if (comptime row_mod.managedOf(R)) {
             const made = comptime ddl.createdIfMissing(D, R);
             const t = comptime tableOf(D, R);
-            try sendBounded(&tx, scope, made.table, "createMissing");
+            try sendBounded(D, &tx, scope, made.table, "createMissing");
             for (made.indexes) |ix| {
                 // A table that was not there has every column now.
                 if (live[i].len == 0 or !overMissing(D, t.desc, ix.name, live[i]))
-                    try sendBounded(&tx, scope, ix.sql, "createMissing");
+                    try sendBounded(D, &tx, scope, ix.sql, "createMissing");
             }
             inline for (comptime triggersRepeatable(D, t.desc)) |tr| try sendRepeatable(D, &tx, scope, &stored, tr);
         }
@@ -2660,16 +2695,27 @@ fn boundTableWaits(comptime D: type, tx: anytype, scope: anytype, lock_timeout_m
 
 /// One statement of `createMissing` or `addMissingColumns`, with the line an
 /// operator needs when the table lock it waited for never came.
-fn sendBounded(tx: anytype, scope: anytype, sql: []const u8, comptime who: []const u8) !void {
+fn sendBounded(comptime D: type, tx: anytype, scope: anytype, sql: []const u8, comptime who: []const u8) !void {
     _ = tx.exec(scope, sql, .{}) catch |err| {
+        var buf: [64]u8 = undefined;
         if (err == error.Locked) std.log.warn(
-            "nilo_sql: " ++ who ++ " waited {d} ms for a lock on a table at `{s}`, and gave up. " ++
+            "nilo_sql: " ++ who ++ " waited {s} for a lock on a table at `{s}`, and gave up. " ++
                 "Nothing was kept. A transaction open on that table is in the way; run it " ++
                 "again once that transaction ends.",
-            .{ default_lock_timeout_ms, sql },
+            .{ waitedText(D, &buf, default_lock_timeout_ms), sql },
         );
         return err;
     };
+}
+
+/// How long a `Locked` step waited, in words. **Postgres waited the
+/// `lock_timeout` the migrator set; SQLite has none** (`Dialect.lock_timeout`
+/// is `null`) and waited the connection's `busy_timeout_ms`, which this file
+/// does not know, so naming `lock_timeout_ms` and 5000 there would be wrong
+/// (ADR 240).
+fn waitedText(comptime D: type, buf: []u8, lock_timeout_ms: u32) []const u8 {
+    if (comptime D.lock_timeout == null) return "the connection's `busy_timeout_ms`";
+    return std.fmt.bufPrint(buf, "{d} ms", .{lock_timeout_ms}) catch unreachable;
 }
 
 /// Whether the index or unique called `name` names a column `live` lacks,
@@ -2766,11 +2812,12 @@ pub fn addMissingColumns(db: anytype, scope: anytype, comptime schema: Schema) !
                                 );
                                 return Error.NeedsVersion;
                             }
+                            var waited: [64]u8 = undefined;
                             if (err == error.Locked) std.log.warn(
-                                "nilo_sql: addMissingColumns waited {d} ms for a lock on {s} at `{s}`, and gave up. " ++
+                                "nilo_sql: addMissingColumns waited {s} for a lock on {s} at `{s}`, and gave up. " ++
                                     "Nothing was kept. A transaction open on that table is in the way; run it " ++
                                     "again once that transaction ends.",
-                                .{ default_lock_timeout_ms, t.desc.table, sql },
+                                .{ waitedText(D, &waited, default_lock_timeout_ms), t.desc.table, sql },
                             );
                             return err;
                         };
@@ -3056,13 +3103,22 @@ pub fn apply(
     for (v.steps) |s| _ = tx.exec(scope, s.sql, .{}) catch |err| {
         // `warn`, as `expect`'s refusal is: the error is the refusal, and
         // this is the sentence an operator needs to act on it (ADR 145).
+        var waited: [64]u8 = undefined;
         if (err == error.Locked) std.log.warn(
-            "nilo_sql: version {d} ({s}) waited {d} ms for a lock on a table at the step " ++
+            "nilo_sql: version {d} ({s}) waited {s} for a lock on a table at the step " ++
                 "\"{s}\", and gave up. Nothing was applied. A transaction open on that table " ++
                 "is in the way, and every read and write to it was queued behind this step " ++
-                "while it waited. Run it again once that transaction ends, or set " ++
-                "`.lock_timeout_ms` in the version file (0 waits for good).",
-            .{ v.number, v.name, v.lock_timeout_ms, s.why },
+                "while it waited. Run it again once that transaction ends, or {s}",
+            .{
+                v.number,
+                v.name,
+                waitedText(D, &waited, v.lock_timeout_ms),
+                s.why,
+                if (comptime D.lock_timeout == null)
+                    "raise `busy_timeout_ms` in the SQLite options."
+                else
+                    "set `.lock_timeout_ms` in the version file (0 waits for good).",
+            },
         );
         return err;
     };
@@ -4319,6 +4375,37 @@ test "a new column with a foreign key is one ALTER on each database, the key wri
         // what a generated version moves it to.
         const moved = try plan(a, D, comptime desiredOf(D, .{ .tables = &.{ Org, After } }), try snapshotFrom(a, D, &.{ Org, After }));
         try testing.expect(moved.isEmpty());
+    }
+}
+
+test "a key moved onto a new column, with the old key column dropped in the same change, is a Problem and not a table with no key" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "tags", .key = .id };
+        id: i64,
+        label: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "tags", .key = .uid };
+        uid: i64,
+        label: []const u8,
+    };
+
+    // Plain `plan` runs on both dialects with no database, so this is held in
+    // the ordinary suite for Postgres and SQLite alike.
+    inline for (.{ Pg, Lite }) |D| {
+        const before = try snapshotFrom(a, D, &.{Before});
+        const change = try plan(a, D, comptime desiredOf(D, .{ .tables = &.{After} }), before);
+
+        try testing.expectEqual(@as(usize, 1), change.problems.len);
+        try testing.expectEqualStrings("tags", change.problems[0].table);
+        try testing.expectEqualStrings("uid", change.problems[0].column);
+        try testing.expect(std.mem.indexOf(u8, change.problems[0].text, "the key moved") != null);
+        // And the new column is not added as a plain one beside it.
+        for (change.steps) |s| try testing.expect(s.kind != .add_column);
     }
 }
 

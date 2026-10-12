@@ -532,7 +532,7 @@ pub const Misfit = struct {
             ),
             .outer_null => try w.print(
                 "  column {d} fills `{s}`, which is not optional, and comes from the side of an " ++
-                    "outer join that may find nothing, where it is NULL. Make the field optional, " ++
+                    "outer join that may find nothing, where it may be NULL. Make the field optional, " ++
                     "or `coalesce` the column.\n",
                 .{ self.column, self.field },
             ),

@@ -11,18 +11,23 @@
 //! its table. **The plan does say it.** `EXPLAIN (VERBOSE, FORMAT JSON)`
 //! lists every node's output as the expressions it computes, and every
 //! join's type; a column the top of the plan passes through unchanged from
-//! the side of a `Left`, `Right` or `Full` join that may find nothing is
-//! NULL on the rows that found nothing.
+//! the side of a `Left`, `Right` or `Full` join that may find nothing may be
+//! NULL on the rows that found nothing, and the inner side of an `Anti` join
+//! (`LEFT JOIN … WHERE o.id IS NULL`) is NULL on every row.
 //!
-//! **Only what is certain is said.** The planner has already turned an outer
-//! join into an inner one wherever a condition throws away the NULLs
-//! (`WHERE i.title IS NOT NULL`, `i.title = $1`), so a join still marked
-//! `Left` in the plan is one whose NULLs reach the answer. An expression
+//! **Only what the plan shows is said, and it says "may".** The planner has
+//! already turned an outer join into an inner one wherever a condition throws
+//! away the NULLs (`WHERE i.title IS NOT NULL`, `i.title = $1`), so a join
+//! still marked `Left` in the plan is one whose NULLs can reach the answer.
+//! It can stay `Left` where none ever does (a `NOT NULL REFERENCES` key finds
+//! its row every time, and a filter that is not strict, such as
+//! `coalesce(o.name, '') <> ''`, does not let the planner prove it), which
+//! this does not follow: the Row's field goes optional there too. An expression
 //! (`COALESCE(i.title, '')`, a function, an aggregate) is not judged, and a
 //! column renamed by a subquery or a CTE scan (`s.b`, `x.title`) is not
 //! followed: in both cases the answer is "cannot say", which the caller reads
-//! as "not NULL". A column missed is a check that did less; a column wrongly
-//! called NULL would fail a statement that works.
+//! as "not NULL". A column missed is a check that did less; the one wrong
+//! way is the `Left` above, and it costs a field made optional.
 //!
 //! EXPLAIN's names are unique across the whole plan (`e`, `e_1`), which is
 //! what lets an output be matched to the join it came out of by its text.
@@ -42,7 +47,7 @@
 const std = @import("std");
 
 /// For each of the first `width` columns of the statement `json` is the plan
-/// of, whether it is certainly NULL on some row because of an outer join.
+/// of, whether it may be NULL on some row because of an outer join.
 /// `json` is what `EXPLAIN (VERBOSE, FORMAT JSON)` answered. A plan this does
 /// not understand answers false for every column.
 pub fn outerNullable(arena: std.mem.Allocator, json: []const u8, width: usize) ![]bool {
@@ -67,7 +72,7 @@ pub fn outerNullable(arena: std.mem.Allocator, json: []const u8, width: usize) !
     return out;
 }
 
-/// The node's outputs by position: which are certainly NULL on some row, or
+/// The node's outputs by position: which may be NULL on some row, or
 /// null when this cannot say anything about the node. `kept` is every column
 /// a table scan reads outside the far side of any outer join: a name in it
 /// also comes from a side that always has a row, which is how a `LATERAL`
@@ -141,9 +146,12 @@ fn collectKept(arena: std.mem.Allocator, node: Value, far: bool, into: *Names) s
 
 /// Whether `child` is the side of the join `node` that may find nothing:
 /// the inner input of a `Left`, the outer of a `Right`, either of a `Full`.
+/// An `Anti` join is a `Left` whose `WHERE` kept only the rows that found
+/// nothing: its inner input is never in the answer, so a column named from
+/// it is NULL on every row.
 fn farSide(node: Value, child: Value) bool {
     const join = text(node, "Join Type") orelse return false;
-    if (std.mem.eql(u8, join, "Left")) return relationIs(child, "Inner");
+    if (std.mem.eql(u8, join, "Left") or std.mem.eql(u8, join, "Anti")) return relationIs(child, "Inner");
     if (std.mem.eql(u8, join, "Right")) return relationIs(child, "Outer");
     if (std.mem.eql(u8, join, "Full")) return relationIs(child, "Inner") or relationIs(child, "Outer");
     return false;
@@ -460,6 +468,33 @@ test "a join a condition turned inner has no NULL to report" {
         \\    {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["e.id", "e.item_id"]},
         \\    {"Node Type": "Index Scan", "Parent Relationship": "Inner", "Output": ["i.id", "i.title"]}]}}]
     , &.{ false, false });
+}
+
+test "an Anti join, LEFT JOIN … WHERE o.id IS NULL, has its inner side NULL on every row" {
+    // SELECT e.id, i.id AS item FROM events e
+    //   LEFT JOIN items i ON i.id = e.item_id WHERE i.id IS NULL
+    // The planner turns it into an `Anti` join, which hands on no row of the
+    // inner side; the column named from it is NULL on every row.
+    try expectNulls(
+        \\[{"Plan": {"Node Type": "Hash Join", "Join Type": "Anti", "Output": ["e.id", "i.id"],
+        \\  "Plans": [
+        \\    {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["e.id", "e.item_id"]},
+        \\    {"Node Type": "Hash", "Parent Relationship": "Inner", "Output": ["i.id"]}]}}]
+    , &.{ false, true });
+}
+
+test "a Left join the planner kept is reported as it stands, though a NOT NULL key finds a row every time" {
+    // SELECT e.id, i.title FROM events e LEFT JOIN items i ON i.id = e.item_id
+    //   WHERE coalesce(i.title, '') <> '', with `item_id` NOT NULL REFERENCES
+    // items: the filter is not strict, so the join stays `Left`, and the
+    // check does not read the schema. It says "may", not "is" (ADR 233).
+    try expectNulls(
+        \\[{"Plan": {"Node Type": "Nested Loop", "Join Type": "Left", "Output": ["e.id", "i.title"],
+        \\  "Filter": "(COALESCE(i.title, ''::text) <> ''::text)",
+        \\  "Plans": [
+        \\    {"Node Type": "Seq Scan", "Parent Relationship": "Outer", "Output": ["e.id", "e.item_id"]},
+        \\    {"Node Type": "Index Scan", "Parent Relationship": "Inner", "Output": ["i.id", "i.title"]}]}}]
+    , &.{ false, true });
 }
 
 test "a LATERAL the planner could not flatten is still the join's far side" {
