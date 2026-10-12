@@ -33,6 +33,7 @@ const std = @import("std");
 const Ctx = @import("ctx.zig").Ctx;
 const naming = @import("names.zig");
 const bulkhead = @import("bulkhead.zig");
+const session = @import("session.zig");
 
 /// The latency boundaries a server gets without asking, in microseconds.
 ///
@@ -302,6 +303,19 @@ pub const Table = struct {
                 \\
             );
             try w.print("nilo_requests_in_flight {d}\n", .{gauge.load(.monotonic)});
+        }
+
+        // A session cookie or Bearer token that failed to open (ADR 033): a
+        // wrong `session_secret` after a deploy shows here. Like a route, it
+        // prints once it has happened.
+        const rejected = session.rejectedCount();
+        if (rejected > 0) {
+            try w.print(
+                \\# HELP nilo_session_rejected_total Session cookies and Bearer tokens sent that failed to open (expired ones are not counted).
+                \\# TYPE nilo_session_rejected_total counter
+                \\nilo_session_rejected_total {d}
+                \\
+            , .{rejected});
         }
 
         for (self.exposed) |e| {

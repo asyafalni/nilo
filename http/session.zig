@@ -440,7 +440,8 @@ fn sealFor(comptime T: type, value: T, expires_at: i64, key: Key, out: []u8, com
 /// shape of `T` — none of these is an error the application can do anything
 /// about, and all of them mean the same thing to it: this request has no
 /// session. Turning them into distinct errors would only invite a handler to
-/// treat one of them as "nearly signed in".
+/// treat one of them as "nearly signed in". The operator is told, though: all
+/// but an expired one add to `rejected`, which `/metrics` publishes.
 pub fn open(comptime T: type, text: []const u8, key: Key) ?T {
     return openAt(T, text, key, nowSeconds());
 }
@@ -476,11 +477,50 @@ fn openAmong(comptime T: type, text: []const u8, key: Key, fallbacks: []const Ke
 }
 
 fn openFor(comptime T: type, text: []const u8, key: Key, fallbacks: []const Key, now: i64, comptime purpose: []const u8) ?T {
-    const sealed_len = std.base64.standard.Decoder.calcSizeForSlice(text) catch return null;
-    if (sealed_len != plainSize(T) + overhead) return null;
+    return unseal(T, text, key, fallbacks, now, purpose) catch |e| {
+        // Counted here, the one place a cookie and a Bearer token both pass
+        // through (ADR 265). An expired one is the ordinary end of a session
+        // and is not a sign of anything wrong, so it is not counted.
+        if (e == error.Rejected) _ = rejected.fetchAdd(1, .monotonic);
+        return null;
+    };
+}
+
+/// How many credentials that were sent failed to open since the process
+/// started: a session cookie or a Bearer token that did not decode, did not
+/// unseal under the secret or a fallback, or was written by a build with another
+/// shape of `T`. An expired one and a request that sent nothing are not here.
+///
+/// **It is on `/metrics` as `nilo_session_rejected_total`**, because a wrong
+/// `session_secret` after a deploy answers every returning visitor as
+/// anonymous, and until this was counted nothing told an operator that from an
+/// ordinary quiet hour ([ADR 033](../docs/adr/033-a-session-is-sealed-into-the-cookie.md)).
+/// A bare atomic in the module, so the request path allocates nothing and a
+/// connection holds nothing more ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)).
+/// One per process rather than per App, which is what a scrape of that process
+/// wants. Read through `rejectedCount`, so nothing outside this file can write it.
+var rejected: std.atomic.Value(u64) = .init(0);
+
+/// What `rejected` has counted so far, for `/metrics`.
+pub fn rejectedCount() u64 {
+    return rejected.load(.monotonic);
+}
+
+/// `openFor` with the reason kept: `Expired` for a seal that opened and has
+/// lived past its time, `Rejected` for every other way to fail.
+fn unseal(
+    comptime T: type,
+    text: []const u8,
+    key: Key,
+    fallbacks: []const Key,
+    now: i64,
+    comptime purpose: []const u8,
+) error{ Rejected, Expired }!T {
+    const sealed_len = std.base64.standard.Decoder.calcSizeForSlice(text) catch return error.Rejected;
+    if (sealed_len != plainSize(T) + overhead) return error.Rejected;
 
     var raw: [plainSize(T) + overhead]u8 = undefined;
-    std.base64.standard.Decoder.decode(&raw, text) catch return null;
+    std.base64.standard.Decoder.decode(&raw, text) catch return error.Rejected;
 
     var plain: [plainSize(T)]u8 = undefined;
     const nonce = raw[0..Cipher.nonce_length];
@@ -492,20 +532,20 @@ fn openFor(comptime T: type, text: []const u8, key: Key, fallbacks: []const Key,
                 Cipher.decrypt(&plain, body, tag.*, purpose, nonce.*, fallback) catch continue;
                 break :opened;
             }
-            return null;
+            return error.Rejected;
         };
     }
 
-    if (plain[0] != format_version) return null;
-    if (std.mem.readInt(u32, plain[1..5], .little) != comptime fingerprint(T)) return null;
+    if (plain[0] != format_version) return error.Rejected;
+    if (std.mem.readInt(u32, plain[1..5], .little) != comptime fingerprint(T)) return error.Rejected;
     // Read after the tag has been verified, so this is a number the server
     // wrote rather than one a client chose. An expired session is `null` for
     // the reason every other failure here is: the application has one thing to
     // do about all of them, and "nearly signed in" is not a state worth
     // offering it.
-    if (std.mem.readInt(i64, plain[5..13], .little) <= now) return null;
+    if (std.mem.readInt(i64, plain[5..13], .little) <= now) return error.Expired;
 
-    const got = decode(T, plain[header_size..]) catch return null;
+    const got = decode(T, plain[header_size..]) catch return error.Rejected;
     return got.value;
 }
 
@@ -1900,4 +1940,27 @@ test "a max_age too large to add to the clock is refused rather than overflowing
     const signed = try client.post(&app, "/sign-in", "");
     try testing.expectEqual(@as(u16, 500), signed.status);
     try testing.expect(signed.setCookie(host_cookie_name) == null);
+}
+
+test "a cookie that fails to open is counted, and an anonymous request or an expired one is not" {
+    var buf: Sealed(Signed) = undefined;
+    const text = try seal(Signed, .{ .user = 7 }, 2_000_000_000, key_a, &buf);
+
+    const before = rejected.load(.monotonic);
+    // Opens: not counted.
+    try testing.expect(openAt(Signed, text, key_a, 1_900_000_000) != null);
+    // Expired: the ordinary end of a session, not counted.
+    try testing.expect(openAt(Signed, text, key_a, 2_000_000_000) == null);
+    try testing.expectEqual(before, rejected.load(.monotonic));
+
+    // A wrong secret, rubbish and a changed byte: each one counted.
+    try testing.expect(openAt(Signed, text, key_b, 1_900_000_000) == null);
+    try testing.expectEqual(before + 1, rejected.load(.monotonic));
+    try testing.expect(openAt(Signed, "not base64 at all!!", key_a, 1_900_000_000) == null);
+    try testing.expectEqual(before + 2, rejected.load(.monotonic));
+    var broken: Sealed(Signed) = undefined;
+    @memcpy(&broken, text);
+    broken[10] = if (broken[10] == 'A') 'B' else 'A';
+    try testing.expect(openAt(Signed, &broken, key_a, 1_900_000_000) == null);
+    try testing.expectEqual(before + 3, rejected.load(.monotonic));
 }

@@ -185,7 +185,7 @@ The cookie is named `__Host-session` (`nilo.session.host_cookie_name`) when it i
 
 ### The secret
 
-**Every way a cookie can be unreadable gives the same answer: `null`.** That covers tampered, truncated, expired, sealed under another secret, or written by a build with a different shape of `T`. The secret comes from `listen(.{ .session_secret = … })` and must be exactly 32 bytes; a handler asking for a session when none is set answers 500. A cookie the secret does not open is tried under each of `session_fallback_secrets`, which open sessions but never seal them ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
+**Every way a cookie can be unreadable gives the same answer: `null`.** That covers tampered, truncated, expired, sealed under another secret, or written by a build with a different shape of `T`. Every one of them except an expired cookie adds to `nilo_session_rejected_total` on `/metrics` (a cookie that was not sent does not), which is how a wrong secret after a deploy shows. The secret comes from `listen(.{ .session_secret = … })` and must be exactly 32 bytes; a handler asking for a session when none is set answers 500. A cookie the secret does not open is tried under each of `session_fallback_secrets`, which open sessions but never seal them ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
 
 ## `Bearer(T)`
 
@@ -193,7 +193,7 @@ The cookie is named `__Host-session` (`nilo.session.host_cookie_name`) when it i
 
 | | |
 |---|---|
-| `b.get()` | `?T`: the token's value, or null if none was sent or it did not open (expired, tampered, another secret, another shape, a session cookie's value) |
+| `b.get()` | `?T`: the token's value, or null if none was sent or it did not open (expired, tampered, another secret, another shape, a session cookie's value; all but expired are counted in `nilo_session_rejected_total`) |
 | `b.require()` | `!T`: the value, or a 401 with `WWW-Authenticate: Bearer`, and `error="invalid_token"` when a token was sent and did not open |
 | `Bearer(T).issue(c, value, .{ .max_age = 3600 })` | `!Issued`: `.text` (a slice of the request arena) and `.expires_in` (seconds). `max_age` defaults to `nilo.session.default_bearer_max_age`, 24 hours, and must be above zero |
 

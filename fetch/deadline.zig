@@ -258,10 +258,6 @@ fn callFromARun(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
     return c.str(try std.fmt.allocPrint(c.arena(), "{s} {s}", .{ verdict, if (waited >= 150) "own" else "early" }));
 }
 
-/// When the permit below went back, for the call that queued for it to
-/// compare itself with.
-var permit_back_ms: std.atomic.Value(i64) = .init(0);
-
 /// Holds the client's only permit for a second: a call begun and left open.
 /// Its own bound is what ends the body `end` has to read past on the
 /// endpoint that trickles, so the permit is back by 1.4 s at the latest.
@@ -270,20 +266,22 @@ fn holdPermit(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
     _ = ex.begin(api, .{ .method = .GET, .url = quiet_url, .timeout_ms = 1_400 }) catch |err| return c.str(@errorName(err));
     nilo.sleep(1_000) catch {};
     ex.end();
-    permit_back_ms.store(nilo.nowMillis(), .release);
     return c.str("held");
 }
 
-/// A route with 500 ms that queues for the permit above until it is back, long
-/// after its time is gone. The time in the queue is spent: the call must be
-/// refused the moment it is let in, where a time counted from then would
-/// dial and wait another 500 ms, and the quiet endpoint never sees it.
-fn callQueued(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
-    c.giveDeadline(500);
+/// A route with 300 ms that queues for the permit `holdPermit` has, which stays
+/// taken for a second. Reports the error and whether the refusal came while the
+/// permit was still out: it is the queue that has to give up at the route's
+/// deadline, not the call after the queue lets it in (ADR 105).
+fn callQueuedGivesUp(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
+    c.giveDeadline(300);
+    const began = nilo.nowMillis();
     const verdict: []const u8 = if (api.get(c, quiet_url, .{ .timeout_ms = 20_000 })) |_| "answered" else |err| @errorName(err);
-    const after = nilo.nowMillis() - permit_back_ms.load(.acquire);
+    const waited = nilo.nowMillis() - began;
     c.giveDeadline(0);
-    return c.str(try std.fmt.allocPrint(c.arena(), "{s} {s}", .{ verdict, if (after < 250) "at once" else "late" }));
+    // The permit is back some 700 ms after this call began, so anything under
+    // 600 gave up on the route's clock and not on the permit's return.
+    return c.str(try std.fmt.allocPrint(c.arena(), "{s} {s}", .{ verdict, if (waited < 600) "at the deadline" else "late" }));
 }
 
 /// The nilo server under test, on a thread of its own, plus whether it ever
@@ -422,7 +420,7 @@ test "a Run keeps the call's own bound, whatever deadline the request around it 
     try testing.expectEqualStrings("TimedOut own", body);
 }
 
-test "a call that queued for a permit past its route's deadline is refused and never dialled" {
+test "a call whose route's deadline passes while it queues for a permit gives up then, not when the permit is back" {
     hushStartupWiring();
     const gpa = std.heap.smp_allocator;
 
@@ -444,6 +442,7 @@ test "a call that queued for a permit past its route's deadline is refused and n
     var url_buf: [64]u8 = undefined;
     quiet_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{quiet.port});
 
+    // One permit, taken by `/hold` for a second.
     var api: fetch.Client = .init(gpa, .{ .max_in_flight = 1 });
     defer api.deinit();
 
@@ -451,7 +450,7 @@ test "a call that queued for a permit past its route's deadline is refused and n
     defer app.deinit();
     try app.provide(&api);
     try app.get("/hold", holdPermit);
-    try app.get("/queued", callQueued);
+    try app.get("/queued", callQueuedGivesUp);
 
     var serving: Serving = .{ .app = &app, .port = quiet.port + 200 };
     const app_thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
@@ -473,7 +472,7 @@ test "a call that queued for a permit past its route's deadline is refused and n
 
     const body = try askOnce(gpa, serving.port, "/queued");
     defer gpa.free(body);
-    try testing.expectEqualStrings("TimedOut at once", body);
+    try testing.expectEqualStrings("TimedOut at the deadline", body);
 }
 
 // ---- the WebSocket client against nilo's own server (ADR 281) ----

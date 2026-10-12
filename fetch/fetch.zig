@@ -1224,24 +1224,39 @@ pub const Exchange = struct {
         // A request whose deadline has passed is not dialled for (ADR 105).
         if (opts.route_left_ms) |left| if (left == 0) return error.TimedOut;
 
-        // The permit is taken before the deadline is armed, so a caller
-        // queueing for one is not also being timed out of the queue by a clock
-        // it has not started. It goes back in `end`, after the connection.
+        // The permit is taken before the call's own deadline is armed, so a
+        // caller queueing for one is not also being timed out of the queue by a
+        // clock it has not started. It goes back in `end`, after the connection.
         // A queue is a park like a socket is, so the watchdog is told
         // (ADR 210).
+        //
+        // **The route's time does bound the queue** (ADR 105): the wait is
+        // `waitTimeout` for what the route has left, so a saturated client
+        // cannot hold a request past its deadline. It is the semaphore's own
+        // timeout and not a `Bound`, which keeps it the same under an Engine
+        // and on a plain `Io`, costs no stack, and leaves no cancellation
+        // pending to be spent afterwards. A call with no route deadline waits
+        // as long as it ever did.
         const queued_at = core.monotonicMicros();
         {
             const w = client.limits.waiting();
             defer client.limits.waited(w);
-            try client.gate.wait(io);
+            if (opts.route_left_ms) |left| {
+                client.gate.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromMilliseconds(left),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => return error.TimedOut,
+                    error.Canceled => return error.Canceled,
+                };
+            } else try client.gate.wait(io);
         }
         self.permit = true;
 
         // **The route's time is counted from when it was read, not from when
         // the permit arrived** (ADR 105): what the queue took is already
-        // spent, and a request that is past its deadline after the wait is
-        // not dialled for. The wait itself is not bounded by the route's
-        // deadline, which stays an open item in `docs/todo.md`.
+        // spent, and a request that is past its deadline after the wait (a
+        // permit that came in the last millisecond) is not dialled for.
         const route_left_ms: ?u32 = if (opts.route_left_ms) |left| blk: {
             const spent_us = core.monotonicMicros() - queued_at;
             const left_us = @as(i64, left) * std.time.us_per_ms - spent_us;

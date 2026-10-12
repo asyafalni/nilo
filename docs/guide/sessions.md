@@ -165,6 +165,8 @@ That is a database lookup, but it is the lookup you were already doing to answer
 
 **Changing the secret does not have to sign everybody out**: keep the old one as a fallback ([above](#rotating-the-secret)). Dropping it outright does, and after a leak that is what you want.
 
+**A wrong secret looks like a quiet site, so it is counted.** A cookie that does not open reads as no session, the same as a visitor who never signed in. Every cookie (or Bearer token) that failed to open, other than one that expired, adds to `nilo_session_rejected_total` on [`/metrics`](./metrics.md). After a deploy, a climb there means the secret is not the one the cookies were sealed under. A visitor who sent no cookie is not counted.
+
 ### The `__Host-` cookie name
 
 **The cookie is called `__Host-session`, so another subdomain cannot plant one.** A browser only accepts a cookie with that prefix from this host, over HTTPS, at `/`. A plain `session` cookie could be set by any page on a sibling subdomain with `Domain=example.com; Path=/account`, and the browser would send that one first under `/account`, so the person would be working inside somebody else's account without knowing. A `setWith` that names a `domain`, another `path` or `secure = false` writes the plain name, because a browser drops the prefixed one with any of those, and so gives up that protection; it needs `listen(.{ .session_plain_name = true })`, without which the plain name is never read and the `set` fails with a message saying so. A program upgrading from 0.6.0, which wrote every session under the plain name, turns the same option on for as long as its longest `max_age`: each visitor's next `set` moves them to the new name, and then the option goes off.
