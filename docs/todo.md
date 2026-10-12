@@ -329,10 +329,6 @@ Nothing is open at this tier.
 
 **Direction:** [A developer from Go or Node meets no silent trap in the first week](./roadmap.md#a-developer-from-go-or-node-meets-no-silent-trap-in-the-first-week)
 
-**The Linux aarch64 job (`ubuntu-24.04-arm`) and the Windows job for the loop-free modules (`windows-tools`) have not had their first run**, so the deploying guide's platforms table rests on two jobs nobody has seen pass.
-
-**What would settle it:** both jobs green on their first push, or each failure they find filed here.
-
 **A security scheme or a path parameter's type that a resolver or a middleware needs does not reach the API description.** A route whose handler takes `Bearer(T)` is described with `bearerAuth`, and one whose resolver takes it is not; a resolver's `Path(T)` field types do not refine the parameter's schema, which stays text unless the handler's own argument types it.
 
 **What would settle it:** the document read from the same comptime needs `listen()` checks, so a scheme a resolver or a typed middleware requires is on every operation it covers.
