@@ -7555,8 +7555,16 @@ test "an index built outside a transaction lets writes through, where the one in
     // The build took long enough for the comparison to mean something.
     try testing.expect(held.ms > 100);
     try testing.expect(free.ms > 100);
-    try testing.expect(held.writes <= 20);
+    // Relative rather than a fixed ceiling: `writesDuring` counts from just
+    // before `apply`, so writes that land before the blocking build takes its
+    // lock count too, and a slower runner lets more of them in. The claim is
+    // that the concurrent build lets through many times what the blocking one
+    // does, and that it lets through a lot.
     try testing.expect(free.writes >= 100);
+    if (held.writes * 5 > free.writes) {
+        std.debug.print("blocking let {d} writes through in {d} ms, concurrent {d} in {d} ms\n", .{ held.writes, held.ms, free.writes, free.ms });
+        return error.TestUnexpectedResult;
+    }
 
     // And the index is whole, recorded, and was made with no transaction.
     try testing.expectEqual(@as(?bool, true), try indexIsValid(&stack.db, &run, "\"" ++ big_index ++ "\""));
