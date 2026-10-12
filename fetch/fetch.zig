@@ -992,6 +992,11 @@ pub const Exchange = struct {
     /// Address sensitive like the rest of the struct: its vtable finds the
     /// Exchange by `@fieldParentPtr`.
     tap: std.Io.Reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &tap_vtable },
+    /// The body of an answer that has none: a 204, a 304, a HEAD's. Its own
+    /// rather than `std.Io.Reader.ending`, which at 0.17.0 points at a `const`
+    /// in read-only memory while `readSliceShort` writes `seek` even to add
+    /// nothing, so reading an empty body through it segfaulted on aarch64.
+    empty: std.Io.Reader = .fixed(&.{}),
     /// What the response said its body was, kept so that `end` can decide
     /// whether reading the rest of it is cheaper than a new connection. Null
     /// is a body of unknown length, which counts as too much.
@@ -1402,7 +1407,8 @@ pub const Exchange = struct {
         if (bodiless(opts.method, head.status)) {
             self.req.reader.state = .ready;
             self.announced = 0;
-            self.reader = std.Io.Reader.ending;
+            self.empty = .fixed(&.{});
+            self.reader = &self.empty;
             return head;
         }
 

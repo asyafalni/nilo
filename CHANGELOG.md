@@ -28,6 +28,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Fixed
 
+- **Reading the empty body of a `nilo_fetch` answer that has none (a 204, a 304, a HEAD's) no longer segfaults on aarch64.** The body was std's `Reader.ending`, which at 0.17.0 sits in read-only memory while a read writes its position; an `Exchange` now carries an empty reader of its own. Nothing to change ([ADR 176](docs/adr/176-an-answer-with-no-body-ends-at-its-head.md)).
 - **`db generate` raises a Problem when the key moves onto a new column and the old key column is dropped in the same change**, where it added the new column as a plain one and left the table with no primary key. Write the key move as a step of its own ([ADR 123](docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 - **A `nilo_fetch` call under a route deadline stops queueing for a permit when the route's time runs out**, failing with `error.TimedOut` without dialling, where it waited for the permit and only then saw the deadline had passed. Nothing to change ([ADR 105](docs/adr/105-a-route-can-say-how-long-it-has.md)).
 
