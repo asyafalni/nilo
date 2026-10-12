@@ -1796,7 +1796,12 @@ fn postAmong(io: std.Io, count: u32, done: *std.atomic.Value(bool)) void {
 test "a post that crosses a frame arriving loses neither, however often they cross" {
     hush();
     const gpa = testing.allocator;
-    var room = try nilo.Room.initWith(gpa, .{ .seats = 4 });
+    // A backlog deeper than every post this test makes. The default of four
+    // drops the oldest post for a seat that falls four behind, which is the
+    // room's policy and not a post lost to a crossing: with four, a runner
+    // slow enough to fall behind dropped one, the client waited five seconds
+    // for it, and the receive bound panicked (ADR 284 was suspected).
+    var room = try nilo.Room.initWith(gpa, .{ .seats = 4, .backlog = 512 });
     defer room.deinit();
     ws_room = &room;
 
@@ -1816,7 +1821,7 @@ test "a post that crosses a frame arriving loses neither, however often they cro
     try client.send("seated");
     try testing.expectEqualStrings("seated", try client.next());
 
-    const posts: u32 = 400;
+    const posts: u32 = 400; // under the backlog above, so the room drops none
     const frames: u32 = 400;
     var done: std.atomic.Value(bool) = .init(false);
     const poster = try std.Thread.spawn(.{}, postAmong, .{ io, posts, &done });

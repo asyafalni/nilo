@@ -47,10 +47,6 @@ Nothing is open at this tier.
 
 **What would settle it:** a decision on extending ADR 111 to the code flow, and if so a start route and a callback argument whose state lives in a short-lived sealed cookie.
 
-**The live test that crosses a Room post with a WebSocket frame waits past its five-second bound in 3 to 5 runs of 12 or 14, so a frame or a post may be lost since frames were received in the peek wait.** "a post that crosses a frame arriving loses neither, however often they cross" (`http/live.zig`) panicked with `programmer bug caused syscall error: AGAIN` in `Io.Threaded.netReadPosix` on 2026-10-10: when its test binary was run directly beside eight busy loops, before and after the `.follow` fix, in three Debug runs of another change, as the one failure of 3,865 in a `zig build test-all`, and again in a `zig build test` on 2026-10-12; it crashed the same way on an untouched `git archive HEAD` export of `0bcc0e3`, so no change in flight brought it. The client's socket carries a 5 s `SO_RCVTIMEO`, and std's `Threaded` reads the `EAGAIN` that bound returns as a programmer bug (`errnoBug`), so every panic is the client having waited five seconds for a frame or a post that did not come. Losing one is what the test exists to catch, and `2622234` moved a WebSocket's next frame into the peek wait ([ADR 284](./adr/284-a-connection-in-conversation-waits-by-receiving.md)); one executor starved for five seconds by the busy loops is the other reading. Ranked here and not P0 until it is known which. The bound panicking is a defect of its own: the same `SO_RCVTIMEO` is set by three helpers in `live.zig`, two in `grpc_live.zig` and one in `grpc_tls_live.zig`, and none of them can fail with a sentence.
-
-**What would settle it:** the test binary run in the same loop under the same load at `2622234` and at its parent, interleaved, which says whether the change brought it; and each client bound made one that returns an error naming what was waited for, so the next stall is a failed test that says so.
-
 ---
 
 ## P2: a real cost, or a use case many services have
@@ -200,6 +196,10 @@ Nothing is open at this tier.
 **Needs:** the conflict target named by a unique the Row's table already declares, its predicate included, so nothing is taken on trust; and whether `nilo_table` can declare a partial unique yet.
 
 ### `nilo_http`
+
+**A test client's receive bound panics rather than failing, so a test that waits too long crashes the suite with `programmer bug caused syscall error: AGAIN` and says nothing about what it waited for.** `SO_RCVTIMEO` is set by three helpers in `http/live.zig`, two in `grpc_live.zig` and one in `grpc_tls_live.zig`, and std's `Threaded` reads the `EAGAIN` it returns as a programmer bug (`errnoBug`). The Room crossing test met it for weeks over posts the room dropped by policy ([history](./history.md#a-suite-that-hangs-and-a-build-that-looks-stuck)), and the panic is what hid that.
+
+**Needs:** each client bound made one that returns an error naming what was waited for, a deadline on the read through the `Io` or a poll before it, so the next stall is a failed test that says so.
 
 **One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.** Whether a field may be absent is now one comptime rule (`http/field.zig`), and a number described in a query and not in JSON is still open. Path prefixes are matched three ways (`middleware.underPrefix`, `static.underPrefix`, the router) and disagree on `//` and on a param, which is how `useOn` came to skip a `*` route until the chain was resolved per request for one. A JSON string is written by `json.zig` and again by `writeFailureBody`, and only one checks UTF-8. `If-None-Match`, `If-Range` and `Range` are answered in `serve.zig`, `sendfile.zig` and through `Versioned`. `fieldList` exists twice with different output. Each is a fix that closes its defects for good, where a patch to each copy closes them until the next copy.
 
