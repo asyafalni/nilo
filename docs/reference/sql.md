@@ -322,7 +322,7 @@ The Scope is why this module names no App: `arena()` and `str()` were the only t
 
 #### Raw parameters: `$1`, `$2`
 
-**A raw statement's parameters are `$1`, `$2`, … on every database.** The text is rewritten for the dialect while compiling (`?1`, `?2` on SQLite), so a `$2` that appears before `$1` binds the second value on both, and a statement naming `$3` but given two values is a Refusal. `exec` takes its text at run time and sends it as written ([ADR 204](../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+**A raw statement's parameters are `$1`, `$2`, … on every database.** The text is rewritten for the dialect while compiling (`?1`, `?2` on SQLite), so a `$2` that appears before `$1` binds the second value on both, and a statement naming `$3` but given two values is a Refusal. `exec` takes its text at run time, so it is not rewritten: the SQLite Wire binds each placeholder by its name (`$n` and `?n` take value n; a statement of only bare `?` binds by position, and one that mixes them with numbered placeholders or skips a number is refused), and refuses a `:name`, a `$3` given two values and a value nothing names, as a `QueryFailed` with the message in `sql.problem` ([ADR 204](../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 #### Set operations and round trips
 

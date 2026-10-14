@@ -59,7 +59,8 @@ fn tokens(c: *nilo.Ctx, llm: *Llm) !void {
 | `events.json(name, value)` | an event whose data is `value` as JSON |
 | `events.comment(text)` | a line the client ignores, for proxies that close a quiet connection |
 | `events.retry(millis)` | how long the browser waits before reconnecting |
-| `events.live()` | false once the server is stopping |
+| `events.live()` | false once the server is stopping, or `events.sleep` found the client gone |
+| `events.sleep(ms)` | wait for the next thing to send, and return early when the client is gone |
 | `events.close()` | end the stream |
 
 On the browser side, `EventSource` needs nothing from you:
@@ -137,7 +138,23 @@ On an HTTP/1.1 stream they are the trailer section of the chunked body. A client
 
 **Check `live()` in the loop so a deploy can finish.** It goes false when the server has been asked to stop. Measured with a client mid-stream, `Ctrl-C` to process exit took **204 ms**, and the client got the closing event rather than a dropped connection. A stream that ignores it holds the shutdown open for as long as it runs, up to `shutdown_grace_ms`, after which it is cut off.
 
-The other way a stream ends needs no check: when the client goes away, the next write fails and the error unwinds the handler.
+The other way a stream ends needs no check when it writes often: when the client goes away, the next write fails and the error unwinds the handler.
+
+**A stream that writes only when it has something should wait with `events.sleep`.** A closed tab on a quiet feed is not noticed by a write until the next one, which with a keep-alive comment every fifteen seconds is fifteen seconds of a held connection. `events.sleep(ms)` is `nilo.sleep` that returns the moment the client is gone, and then `live()` is false:
+
+<!-- compiles -->
+```zig
+fn tail(c: *nilo.Ctx) !void {
+    var events = try c.events();
+    while (events.live()) {
+        try events.sleep(1000); // ends at once when the tab closes
+        try events.comment("still here");
+    }
+    try events.close();
+}
+```
+
+A FIN ends it whatever the request said: a stream never ends, so a client that half-closed is waiting for nothing ([ADR 287](../adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)). `c.eventsFrom` needs none of this: its connection waits on the socket already.
 
 ## What an open stream costs
 

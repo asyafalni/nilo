@@ -370,7 +370,8 @@ Measured on the streaming example: 5 × (a 3 MB upload plus a 50,000-row streame
 | `incoming.discardRest()` | give up on the rest, deliberately |
 | `incoming.seen()` | bytes read so far |
 | `incoming.size()` | what the request announced, or `null` if it was chunked |
-| `incoming.reader` | a plain `std.Io.Reader`, for handing to the standard library |
+| `incoming.reader` | a plain, unbuffered `std.Io.Reader`, for handing to the standard library |
+| `incoming.buffered(&buf)` | the same `std.Io.Reader` with a buffer you own, for a parser that peeks or takes lines: `std.json.Reader`, `takeDelimiter` over NDJSON. [An example](../reference/streaming.md#body) |
 
 A body left half-read is fine: nilo discards the rest so the connection is clean for the next request.
 

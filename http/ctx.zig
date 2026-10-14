@@ -1161,6 +1161,80 @@ pub const Ctx = struct {
         self._limits.max_body = bytes;
     }
 
+    /// Whether the client of this request is still there (ADR 287).
+    ///
+    /// ```zig
+    /// while (try rows.next()) |row| {
+    ///     if (c.gone()) return error.ClientGone;
+    ///     try out.json(row);
+    /// }
+    /// ```
+    ///
+    /// **Two answers where an EOF is one, because they mean different
+    /// things.** A client that sent `Connection: close` and then
+    /// `shutdown(SHUT_WR)` has finished sending and is waiting for its
+    /// answer: `.half_closed`, and nothing should be abandoned for it. A reset
+    /// or an error is `.gone`, and so is a FIN from a client that had not said
+    /// it was finished, which is a closed tab or an aborted `fetch`. HTTP/2
+    /// has both signals by name: a `RST_STREAM` or a lost connection is
+    /// `.gone`, the connection's input ending with the call still running is
+    /// `.half_closed`. **A FIN is a `close()` and a `shutdown(SHUT_WR)` alike
+    /// until the server writes**, so ask again rather than keeping an
+    /// answer: a closed peer answers a write with a reset.
+    ///
+    /// Asked of the kernel when called, one `poll(2)` on HTTP/1.1, so a
+    /// route that never asks pays nothing and an answer is right even from a
+    /// loop that never yields. It cannot see through a TLS `close_notify`
+    /// that arrives with no FIN after it, and not at all what a client that
+    /// pipelined will send next.
+    pub fn presence(self: *const Ctx) bulkhead.Presence {
+        if (comptime framing_mod.http2_built) {
+            if (self._framing.presence()) |p| return p;
+        }
+        return bulkhead.Presence.of(self._waker.watching().hangup(), !self._request.keep_alive);
+    }
+
+    /// `presence() == .gone`: the question for a loop to ask between units of
+    /// work. `nilo.gone()` is the same for code that holds no `*Ctx`, a
+    /// function on a blocking worker above all.
+    pub fn gone(self: *const Ctx) bool {
+        return self.presence() == .gone;
+    }
+
+    /// `nilo.sleep` that ends early when the client goes: `.elapsed`, or
+    /// `.gone` the moment it has. `error.Canceled` is still the server's stop
+    /// or this request's deadline, and a different thing (ADR 287).
+    ///
+    /// A client that half-closed and may be waiting does not end it.
+    /// While it waits a quiet client costs nothing but the poll armed for
+    /// the length of the call; a loop of short sleeps should ask `gone()`
+    /// instead.
+    pub fn sleepUnlessGone(self: *Ctx, ms: u32) error{Canceled}!bulkhead.Waited {
+        return self.sleepWatching(ms);
+    }
+
+    fn sleepWatching(self: *Ctx, ms: u32) error{Canceled}!bulkhead.Waited {
+        if (comptime framing_mod.http2_built) {
+            if (self._framing == .http2) {
+                const token = watchdog.waitingAnywhere();
+                defer watchdog.waitedAnywhere(token);
+                return self._framing.sleepUnlessDeparted(ms, false);
+            }
+        }
+        const until = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        switch (self._waker.watching().sleepUnlessHungUp(ms)) {
+            .closed => return error.Canceled,
+            .elapsed => return .elapsed,
+            .hung_up => {},
+        }
+        if (self.presence() == .gone) return .gone;
+        // Half-closed, and perhaps reading: the rest of the time goes by as
+        // it would have.
+        const now = bulkhead.monotonicNanos();
+        if (now < until) try bulkhead.sleep((until - now) / std.time.ns_per_ms);
+        return .elapsed;
+    }
+
     /// Whether this request has run out of the time it was given.
     ///
     /// Always false for a request with no deadline, so a handler may ask
@@ -2708,7 +2782,10 @@ pub const Ctx = struct {
         if (self.onHttp2() and !self._framing.canStream()) return self.notInCall("c.events()");
         try self.setStaticHeader("Cache-Control", "no-cache");
         try self.setStaticHeader("X-Accel-Buffering", "no");
-        return .{ .stream = try self.stream(200, stream_mod.Events.content_type) };
+        return .{
+            .stream = try self.stream(200, stream_mod.Events.content_type),
+            ._waker = self._waker,
+        };
     }
 
     /// An event stream whose every event comes from Rooms, handed to the
@@ -2923,6 +3000,21 @@ pub const Ctx = struct {
         kept.* = .{ .room = in_room, .posts = into[0..n] };
     }
 };
+
+/// Whether the client of the request this code runs for has gone, from
+/// anywhere: a service, a middleware, or a function on a blocking worker,
+/// where `nilo.blocking` carries the slot to the thread (ADR 287). False
+/// outside a request, so the same function runs in a plain test, and the
+/// same as `c.gone()` inside one.
+///
+/// Reads the Ctx the slot holds, which `serveRequest` sets for the length of
+/// the request, and nothing it writes, so it is safe from another thread
+/// while the request's own fiber is parked in the call that thread serves.
+pub fn gone() bool {
+    const in_flight = fail.inFlight() orelse return false;
+    const c: *const Ctx = @ptrCast(@alignCast(in_flight.request orelse return false));
+    return c.gone();
+}
 
 /// `Ctx.sendKept`, for bytes the framework owns and knows outlive the
 /// stream: the request arena's own output (a writer's, a message's, the JSON

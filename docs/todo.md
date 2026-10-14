@@ -85,12 +85,6 @@ Nothing is open at this tier.
 
 **Needs:** one list of the marker names where both `nilo_sql` and `nilo_http` can read it, which by [ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md) is `core/`; a walk over the public declarations of a type nilo reads (`assertRow`, and the argument and answer classifiers in `http/typed.zig`) answering an unknown `nilo_` name with the nearest known one; and a refusal file and row in each of the two tables.
 
-### `nilo_config`
-
-**Settings that are not scalars: a list, and a group switched on by presence.** A field is text, a number, a `bool`, an enum or any of those in `?`, and the port of a service with real deployment rules found what that leaves out: a comma-separated list (`PROMOTED_ATTRIBUTES=a,b`); a group of settings that turns on when one variable is present (`DURABLE_ENDPOINT` set means `DURABLE_BUCKET` and `DURABLE_REGION` are now required, inheriting what the file set); and two spellings of `bool` in one program. The first two would be a list type and a "set by presence" section in `Read(T)`. The third is not proposed: `bool` is `true` or `false` and nothing else, and the module keeps its four `Reason`s ([the reference](./reference/config.md#failure)). The program reads its rules by hand today, about sixty lines tested case by case, and says what it gains from the module only for the scalars.
-
-**Needs:** the shape drawn from two programs and not from one: the port's rules, and a second program's written out, which can be one of the examples here.
-
 ### `nilo_pw`
 
 **The Cost floor only weighs memory.** `Cost.floor_memory_kib` refuses anything under 7 MiB, which is OWASP's weakest published configuration. But that configuration is 7 MiB *and five passes*, and `.{ .memory_kib = 7 * 1024, .passes = 1 }` is a quarter of the work and compiles. A floor on `memory_kib * passes` would catch it, and would also refuse this repository's own test Cost, which is how the suite affords two optimize modes ([ADR 044](./adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
@@ -221,9 +215,9 @@ Nothing is open at this tier.
 
 **Direction:** [Defects are caught by a build step before a reader](./roadmap.md#defects-are-caught-by-a-build-step-before-a-reader)
 
-**Nothing tells a handler its client has gone.** `error.Canceled` comes from a shutdown or from one of the deadlines the Engine sets; a client closing its connection in the middle of a handler produces neither, so the work runs to the end and the response is written into a socket nobody is reading. The other half of this — cutting a slow handler off — is `nilo.deadline(ms)` ([ADR 105](./adr/105-a-route-can-say-how-long-it-has.md)). This half is not simply unbuilt: **the obvious implementation is wrong.** A read-side EOF is not "the client left" — a client that sent `Connection: close` and then `shutdown(SHUT_WR)` produces exactly that and is still waiting for its response, so answering "peer gone" from it would abandon correct requests. Gin gets the disconnect from `net/http` for nothing; Fiber does not have it either.
+**A route that cannot be told to stop when its client leaves still runs to the end unless the handler asks.** ADR 287 lets a handler ask (`c.gone()`, `nilo.gone()`), but sql and fetch calls inside the handler do not: a 30 s query for a client that left in the first second runs for 30 s. Two designs, neither built. Cancelling the connection's fiber on a hang-up is refused for now because a handler holding a pool connection or a transaction would be torn out mid-statement ([ADR 287](./adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)). The one that fits is a Scope that carries `gone()`, the way `core.within` carries the deadline, so `nilo_sql`, `nilo_fetch` and `nilo_s3` stop their own waits at the next suspension point with a Refusal-style error and release what they hold. It crosses `nilo_core` and every Fitting and Service, so it is designed whole first.
 
-**Needs:** two named signals rather than one flag — "the client half-closed and is waiting" and "the socket is gone". What is already real is a write that fails, and a handler sees that today.
+**Needs:** a design page for what a Scope carries (deadline and departure), the poll-per-wait cost put against ADR 017, and the answer for a statement already on the wire (cancel request or wait it out).
 
 **A rule a build step holds against the patterns the audit kept finding.** Three of the four kinds of defect are spellable: `catch {}` and `else => {}` that swallow `error.Canceled` or `EndOfStream` on a connection path (the stop that waits, the upload that looks complete, the middleware's empty 200); `unreachable`, `std.debug.assert` and `catch unreachable` on a path a request reaches (`Room.print`, `Ctx.send`, `sayerFor`, `idempotentBegin`), each a remote panic in ReleaseSafe and undefined behaviour in ReleaseFast; and a module header's code example that no longer compiles. The fourth kind, a comment or ADR claiming what the code does not do, a dozen of them, has no mechanism but probes. A step that refuses the three in `http/` unless the line carries a marked reason makes the next one a build failure rather than an audit finding.
 
@@ -309,7 +303,7 @@ Nothing is open at this tier.
 
 **Direction:** [A second instance changes no answer](./roadmap.md#a-second-instance-changes-no-answer)
 
-**A failure is one sentence, so a client cannot mark the field that failed.** `nilo_failure(status, message)` is the only hook a failure shape has (`http/failurebody.zig`), and `Bound.fail()` joins every field that failed into one sentence in the 240-byte slot, ending in "and N more" (`http/bound.zig`). A form that wants to outline `email` parses English. [ADR 024](./adr/024-every-failure-answers-as-json.md) refused RFC 7807 (now 9457) `application/problem+json` partly because there was "nothing to put in the fields nilo actually knows"; since [ADR 034](./adr/034-a-binding-hands-its-failures-to-the-handler.md) nilo knows, for every field, its name, what was wrong and what would have worked. A plain `Form(T)` or JSON argument still reports the first field only.
+**A failure is one sentence, so a client cannot mark the field that failed.** `nilo_failure(status, message)` is the only hook a failure shape has (`http/failurebody.zig`), and `Bound.fail()` joins every field that failed into one sentence in the 240-byte slot, ending in "and N more" (`http/bound.zig`). A form that wants to outline `email` parses English. [ADR 024](./adr/024-every-failure-answers-as-json.md) refused RFC 7807 (now 9457) `application/problem+json` partly because there was "nothing to put in the fields nilo actually knows"; since [ADR 034](./adr/034-a-binding-hands-its-failures-to-the-handler.md) nilo knows, for every field, its name, what was wrong and what would have worked. A plain `Form(T)` or JSON argument still reports the first field only. A handler can already answer a field list it builds itself, as an arm of a `union(enum)` of `Status` answers (`invalid: Status(422, Fields)`, [ADR 286](./adr/286-a-handler-may-answer-in-several-typed-statuses.md)); what is missing is nilo handing it the list from `Bound` and from a plain argument, and `app.failures(T)` taking one.
 
 **Needs:** ADR 024 edited: a failure shape that can take the list of fields, copied into the arena on the failure path only, a content type of its own, and every field reported from a plain argument as well as from `Bound`, with the bytes it adds to the failure slot stated.
 
@@ -318,12 +312,6 @@ Nothing is open at this tier.
 **An error from code that does not know about HTTP cannot be given a status once, for the whole App.** `fail.statusFor` is a closed `switch` (`http/fail.zig:213`): `NotFound` is a 404, a dozen parse errors are 400s, and any other error is a 500. A service layer returning `error.EmailTaken` either imports `nilo_http` to call `fail.conflict`, or every handler that calls it repeats the same `catch`. echo's `HTTPErrorHandler`, Fastify's `setErrorHandler` and Nest's exception filters are where Go and Node put that mapping, once. A middleware that catches what `next.run(c)` returns can do it today, and no page says so.
 
 **Needs:** a table the App is given (`app.errors(.{ .{ error.EmailTaken, 409, "that email is taken" } })`, or the shape a design finds better), read before the built-in one, the document naming the statuses a handler's error set shares with it; and a probe of whether an inferred error set can be read at registration on Zig 0.17, which decides whether the document can name them.
-
-**Direction:** [A failure is a type](./roadmap.md#a-failure-is-a-type)
-
-**A handler answers one body type, so a second status with a different shape is a sentence the document never sees.** `Status(code, T)` and `Response(T)` carry one `T`; a 409 with `{"current_version": 7}`, or a 201 beside a 200, is a `fail.*` string or a `*Ctx` route. `decided.md` accepts that "the API description names one failure" and names what reopens it: a shape that states a failure in the type. A `union(enum)` return whose arms are each a `Status(code, T)` is that shape, and Fastify's `response: { 200: A, 409: B }` is what a migrant expects of it.
-
-**Needs:** the union return designed, the document writing one response per arm, and the decided entry taken out when it lands.
 
 **Direction:** [A failure is a type](./roadmap.md#a-failure-is-a-type)
 
@@ -342,6 +330,10 @@ Nothing is open at this tier.
 **What would settle it:** a connection that blocks after a swallowed cancel (a write to a client that never reads, with a stream still in flight), seen to hang with the yield's handback taken out; a spawn that can be made to fail, or a unit test of `spawnRunner`, which is a design decision; and the second review.
 
 ### `nilo_fetch`
+
+**A `stall_ms` does not end an upload whose peer stopped reading: the write already blocked on the socket is not interrupted when the silence clock runs out.** The upload's tap stamps only after a 16 KiB step reaches the socket ([ADR 056](./adr/056-the-way-out-was-open-the-clock-was-not.md)), so the clock does stop, but the cancel it sends does not reach a `sendmsg` already waiting: on `std.Io.Threaded` the cancel waited 4.7 s for the peer to hang up, and under the Engine a test of it hung with an io_uring `io_wq_worker` stuck, so no test of the stopped peer is kept. A backup or replica upload to a store that wedges mid-transfer holds its fiber and its connection until the kernel's TCP timeout.
+
+**Needs:** a write that a cancel ends, on both `Threaded` and the Engine (a send with a deadline, or a cancel the io_uring backend delivers to an in-flight `sendmsg`), and a live test of a peer that stops reading mid-upload which fails within `stall_ms` plus a bound.
 
 **`nilo_fetch` speaks HTTP/1.1 only, so a nilo service can answer gRPC and cannot call it.** The server half of HTTP/2 is built ([ADR 259](./adr/259-http2-is-a-framing-of-every-request.md)), and a service between other gRPC services, which is where most gRPC servers sit, needs both halves; a client connection carrying many calls is on the record nowhere. grpc-go and connect-go do both.
 
@@ -384,6 +376,10 @@ Nothing is open at this tier.
 **Needs:** a decision on a verifier that takes only a secret and only HS256, with the algorithm taken from the key and never from the token's header, so the two kinds of key cannot meet in one `verify`; ADR 111 edited whichever way it goes.
 
 ### `nilo_fetch`
+
+**An unverified `nilo_fetch` call sends no server name, so a host that picks its certificate by name answers with its default one.** `std.crypto.tls.Client` at 0.17.0 has one `.host` option for the name it sends and the name it checks, and `.tls = .unverified` has to set it to `no_verification` ([ADR 290](./adr/290-a-call-can-skip-the-certificate-check-and-only-that-call.md)). An uptime check against a shared load balancer whose default certificate belongs to another site still learns whether the host answers, but over a handshake the real client would not make.
+
+**Needs:** an upstream change splitting the name sent from the name checked in `std.crypto.tls.Client`, or the handshake owned by nilo on tls.zig behind `-Dtls`; either held by a test against a server with two certificates.
 
 **Whether a `Target` should stop calling a service that is failing, rather than wait out its timeout on every call.** A `Target`'s `max_in_flight` is a bulkhead: it bounds how many calls wait on a sick service, but each still waits its whole `timeout_ms`, and the handler behind it holds its fiber and its stack meanwhile ([ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md)). A breaker answers at once while the service is down; sony/gobreaker and failsafe-go are what a Go migrant used. A retry budget takes away much of the reason for one, because it stops the load multiplying, so this stays open until the budget has met an outage.
 
@@ -448,6 +444,14 @@ Nothing is open at this tier.
 **Needs:** an `.index` entry that ignores case, `COLLATE NOCASE` on SQLite and `lower(…)` on Postgres, and what the diff does with one that changes.
 
 ### `nilo_http`
+
+**A TLS connection that sends `close_notify` and then no FIN, and a connection behind a proxy that keeps the upstream socket open, read as `.here`.** The check asks the kernel about the socket, so it cannot see a departure the peer has not completed at the TCP level (ADR 287 names the gap; `tls_live.zig` pins close_notify then close, not close_notify alone). Non-Linux Engines answer `.none`.
+
+**What would settle it:** read the TLS alert off the record layer in the Engine when `hangup()` is asked on a TLS connection, and a `NetPoll` equivalent for macOS and Windows when an Engine for them exists.
+
+**zio's `NetPoll` has no hang-up event, so a wait on a connection the client already spoke to cannot wake on a departure.** `Wake.sleepUnlessHungUp` arms a poll completion on the loop and wakes at once when the socket is idle, but when request bytes are still unread it falls back to 1 s slices that ask `poll(2)` between, so the worst delay is one second. A hang-up event from `NetPoll` at `ev/backends/linux/io_uring.zig:673`, `epoll.zig:340` and `backends/poll.zig` would make that immediate and drop the fallback.
+
+**Needs:** the upstream change in lalinsky/zio (nilo never edits it), then the fallback deleted. Re-test the premise first (history: a blocker on somebody else's repository has been wrong seven times).
 
 **A gRPC call's latency under load has a spread of 3 to 4 times its median, and one cause is in zio's run queue, which nilo does not own.** At 1,024 connections with 100 streams each the median is 71 ms (what Little's law gives for 102,400 in flight at 1.1M req/s) and p99 430 to 550 ms, with a worst call of 0.84 to 1.07 s against tonic's 1.07 s in the same harness; the 1.4 s and 3.8 s of the first record do not reproduce. zio's ring of 256 tasks moves its oldest half to an overflow queue refilled 64 a tick, so a task's wait follows where it landed and not its age; a ring of 16,384 made p50 110 and p99 115 ms, and cost 25 to 30% of throughput at 1,024 connections ([`http.md`](../bench/result/http.md#where-a-grpc-calls-worst-latency-comes-from)).
 
@@ -531,9 +535,9 @@ Nothing is open at this tier.
 
 **What would settle it:** the longest stretch per request kept as a histogram on the metrics page, run against [ADR 017](./adr/017-the-trade-budget-has-four-axes.md)'s 10% line.
 
-**`cors.reading`, `csrf.reading` and `maxBody(&limit)` still point at a container-level `var`.** A typed middleware can take a service now (ADR 008), so a run-time origin list could be a `*const Origins` that `listen()` checks is provided, which would make the `reading` forms redundant; `maxBody` stays a `Limited`, because the gRPC collector reads its limit from the registration (ADR 156).
+**`csrf` has no form that reads its trusted origins while the server runs, where `cors` now has `cors.deciding`.** The rule [ADR 088](./adr/088-an-origin-is-a-fact-about-the-deployment.md) settled for CORS holds for both: a deployment fact fixed at boot is `reading` (a container `var`, or a `nilo.Late` value as [ADR 264](./adr/264-a-deployment-fact-is-a-late-value.md) chose for the allowance and the CSP), and one that changes while running is a service a function of the program's reads per request. A multi-tenant service whose cookie-authenticated front ends live in its database meets this for `csrf` as it did for `cors`. `maxBody` stays a `Limited`, because the gRPC collector reads its limit from the registration (ADR 156).
 
-**Needs:** a decision on whether a deployment fact is a `nilo.Late` value or a service, made once for all three, since ADR 264 chose `Late` for the allowance and the CSP.
+**Needs:** `csrf.deciding(decide, options)` on the generated typed middleware `cors.deciding` uses, refusing the same origins at run time that `csrf.with` refuses while compiling.
 
 **A held `nilo.Late` value, and a `Path(T)` read by a resolver a bare middleware calls through `c.resolve`, are checked at the first request rather than at `listen()`.** A zero count on an allowance or an empty CSP answers 500 until fixed, and a route without the param answers 500 naming the resolver. A typed middleware's needs are held at `listen()` already; a bare one gives `listen()` nothing to read, and no middleware has a hook there.
 

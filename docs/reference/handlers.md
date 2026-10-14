@@ -383,6 +383,7 @@ A `nilo_decode` without `nilo_content_type`, one with any other signature, a typ
 | `?T` | 200 with the value, **404** when null |
 | `Status(code, T)` | that status, and the API description names it |
 | `Response(T)` | a status chosen at run time; the description says `default` |
+| a `union(enum)` of `Status(code, T)` arms | the arm returned, as a `Status` would go out; the description lists one response per arm ([ADR 286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md)). Two arms with one status, an arm that is not a `Status`, and `?` around the union are compile errors |
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
 | `Bytes` | bytes already in hand, under a content type chosen per request, for example somebody else's download passed on ([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)) |

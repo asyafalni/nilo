@@ -210,7 +210,7 @@ defer live.stop() catch {};
 // connect to 127.0.0.1:live.port with std.http.Client, nilo.fetch or a socket
 ```
 
-`start` returns once the port is bound, and `stop` is the shutdown a deployed server gets, so the fibers are cancelled before it returns. Every wait in both is bounded: a server that never binds is the error it failed with, not a hung suite. It costs a thread and a second of wall clock at most, so keep it for what only a running server can show and test the rest through `Wired`. The [background guide](./background.md#a-queue-a-handler-fills-and-a-fiber-empties) has the writer this was written for.
+`start` returns once the port is bound and the boot work is over (the services started, what `before` registered run, their checks passed), so a seed written through a service straight after it does not race the boot, and `stop` is the shutdown a deployed server gets, so the fibers are cancelled before it returns. Every wait in both is bounded: a server that never binds is the error it failed with, not a hung suite. It costs a thread and a second of wall clock at most, so keep it for what only a running server can show and test the rest through `Wired`. The [background guide](./background.md#a-queue-a-handler-fills-and-a-fiber-empties) has the writer this was written for.
 
 ## Testing against a real database
 

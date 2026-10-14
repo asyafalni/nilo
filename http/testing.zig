@@ -1002,7 +1002,9 @@ fn parse(raw: []const u8, keep_alive: bool) !Answer {
 /// to stop. Both override whatever `options` carries.
 ///
 /// **Every wait is bounded and the giving-up path sets something.** `start`
-/// waits three seconds for the port, and a listener that failed to start has
+/// waits three seconds for the boot work to finish as well as for the port
+/// (the port is taken first, so a socket exists while a `before` is still
+/// running), and a listener that failed to start has
 /// already stored the error it failed with, which `start` returns instead of
 /// waiting out the clock. `stop` waits ten seconds for the listener to finish
 /// and answers `error.ServerDidNotStop` past that, leaving the value (and the
@@ -1028,7 +1030,12 @@ pub const Live = struct {
     failure: ?anyerror = null,
 
     /// Start `app` listening on an ephemeral loopback port and return once
-    /// it has bound. The App must outlive the returned value, and be
+    /// it has bound **and its boot work is over**: the services are started,
+    /// what `before` registered has run, the services' checks have passed and
+    /// the work `spawn` registered is going. A test that seeds through a
+    /// service right after this returns therefore does not race the boot.
+    /// The same three seconds bound the wait for both, and a boot that fails
+    /// returns the error it failed with. The App must outlive the returned value, and be
     /// registered and provided before this call, exactly as before `listen`.
     pub fn start(gpa: std.mem.Allocator, app: *App, options: bulkhead.Options) !*Live {
         const self = try gpa.create(Live);
@@ -1040,6 +1047,11 @@ pub const Live = struct {
             .listening = undefined,
         };
         const io = self.threaded.io();
+        // The listener clears these itself, but on its own thread, later than
+        // the poll below begins: an App that ran before still holds the old
+        // run's `true` and port until then, and `start` would return on them.
+        app.boot_done.store(false, .release);
+        app.bound_port.store(0, .release);
         var opts = options;
         opts.port = 0;
         opts.stop_on_signal = false;
@@ -1050,9 +1062,13 @@ pub const Live = struct {
         };
 
         for (0..300) |_| {
-            if (app.boundPort()) |port| {
-                self.port = port;
-                return self;
+            // The port is stored before the boot work, so it alone is not
+            // "ready": `boot_done` is stored after the last step of it.
+            if (app.boot_done.load(.acquire)) {
+                if (app.boundPort()) |port| {
+                    self.port = port;
+                    return self;
+                }
             }
             if (self.finished.load(.acquire)) break;
             std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};

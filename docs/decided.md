@@ -38,6 +38,10 @@ A gap that is the rule. Each was looked at, priced, and kept as it is, and the e
 
 ### `nilo_http`
 
+**A per-route knob for what a FIN means is not built, and a hang-up does not cancel the handler's fiber.** A FIN after a keep-alive request is `gone` and after `Connection: close` is `half_closed`; a client that half-closes a keep-alive connection and waits is misread as gone, which the ADR states plainly and which no pipelining client does. A knob would be a second place to be wrong; the framing that decides is the request's own header. Cancelling the fiber would tear out a handler holding a transaction or a pool connection, so the handler asks and ends itself ([ADR 287](./adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)).
+
+**Reopened by:** a client that half-closes a keep-alive connection and waits, met in practice; or a Scope that carries departure, which would let sql and fetch stop their own waits without tearing the fiber out.
+
 **A `print` or `json` message bigger than the write buffer is still unchecked.** [ADR 076](./adr/076-a-frame-that-lies-about-its-length-is-not-sent.md) holds the two passes to each other by reading `Writer.end`, which is exact only while nothing drains. Past the write buffer a drain moves it and there is nothing left to compare against, so a large formatted message can still put a length on the wire that its bytes do not match.
 
 **Reopened by:** nothing on its own. The two calls are for the small structured messages a WebSocket carries, and the alternatives — a wrapper writer on every byte, or a third pass over the arguments — both cost more than the shape they would guard.
@@ -46,9 +50,9 @@ A gap that is the rule. Each was looked at, priced, and kept as it is, and the e
 
 **Reopened by:** a browser still in use that sends a cross-site `POST` with neither header.
 
-**The API description names one failure, and endpoints have several.** `!?T` puts a 404 in the document because the signature settles it ([ADR 023](./adr/023-a-failure-mode-belongs-in-the-return-type.md)). A `fail.conflict` on a duplicate email is a line in a function body and stays invisible. That is the rule rather than a gap, since the document promises what the signature settles, but it is the rule that costs the most. Widening it means a second place to write a failure down, which is an annotation wearing another name and is the one thing this framework does not ask for.
+**A failure written as a `fail` call is a sentence, and the API description does not list it.** `!?T` puts a 404 in the document because the signature settles it ([ADR 023](./adr/023-a-failure-mode-belongs-in-the-return-type.md)), and a `union(enum)` of `Status(code, T)` arms puts every status it names there with its body ([ADR 286](./adr/286-a-handler-may-answer-in-several-typed-statuses.md)). A `fail.conflict` on a duplicate email is a line in a function body and stays invisible. That is the rule rather than a gap: the document promises what the signature settles, and a failure that should be in it is written as an arm. Listing `fail` calls would mean a second place to write a failure down, which is an annotation wearing another name.
 
-**Reopened by:** a shape that states a failure *in the type*. Wanting one does not.
+**Reopened by:** an App-wide table that maps an error to a status, which would be a second thing the signature settles (the todo entry on `fail.statusFor`).
 
 **A byte past 0x7f in a request target is routed as sent.** RFC 3986 has no such byte in a URI and llhttp refuses one; nginx and Go route it, `curl` sends a UTF-8 path that way, and it cannot end a line or split a field. A front end that percent-encodes it sends `%XX`, which a path param decodes to the same bytes. `fuzz-llhttp` counts it under `decided` rather than failing ([ADR 231](./adr/231-a-second-parser-reads-what-the-first-one-reads.md)).
 
@@ -81,6 +85,8 @@ Every row is a decision that has been made, with its reason. A row whose only re
 | Claim | The answer today | What reopens it |
 |---|---|---|
 | A setting cannot be marked secret, so a `report` could print `PGPASSWORD=…` | nothing in the module logs a Config, so there is nothing to redact | the first thing that logs one |
+| A `bool` setting cannot also read `1`, `yes` or `on` | `bool` is `true` or `false` and nothing else; a program that takes another spelling reads that variable as text or an enum ([ADR 039](./adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)) | a deployment tool that writes only those spellings and cannot be told otherwise |
+| A group of settings cannot sit inside another | a group is one `<FIELD>_*` prefix switched on by presence, and a nested one has no variable that says it is on ([ADR 289](./adr/289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md)) | a second program whose settings need one |
 
 ### `nilo_cache`
 

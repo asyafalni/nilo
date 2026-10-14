@@ -64,7 +64,7 @@ It carries the same headers a `Response(T)` does and behaves identically at runt
 
 ## What is still not in the contract
 
-Every other status. A 409 from a duplicate email, a 422 from a rule the types cannot state, a 403 from a resolver — those are still `fail.*` calls in a body and are still absent from the document. That is deliberate and not a staging post: the rule this ADR sets is that **the document promises what the signature settles, and nothing else**. A failure that is a matter of what the data turned out to be is not something a type can promise, and inventing a way to write it down would be inventing the annotation this refused.
+Every status a signature does not name. A 409 from a duplicate email, a 422 from a rule the types cannot state, a 403 from a resolver: those are still `fail.*` calls in a body and are still absent from the document. A handler that wants one of them listed names it in its return type: a `union(enum)` whose arms are each a `Status(code, T)`, one response per arm in the document ([ADR 286](./286-a-handler-may-answer-in-several-typed-statuses.md)). That is the same rule, not an exception to it: **the document promises what the signature settles, and nothing else**. A failure that is a matter of what the data turned out to be is not something a type can promise, and inventing a way to write it down would be inventing the annotation this refused.
 
 ## Consequences
 

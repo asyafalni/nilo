@@ -20,6 +20,7 @@ const std = @import("std");
 const nilo = @import("http.zig");
 const liveclient = @import("liveclient.zig");
 const h2 = @import("h2.zig");
+const bulkhead = @import("bulkhead.zig");
 const hpack = @import("hpack.zig");
 
 const testing = std.testing;
@@ -1046,4 +1047,72 @@ test "a call whose message never finishes arriving is cancelled, and the connect
         if (head.has(h2.Flags.end_stream)) break;
     }
     try testing.expectEqualStrings("0", status.?);
+}
+
+var cancel_entered: std.atomic.Value(bool) = .init(false);
+var cancel_gone: std.atomic.Value(bool) = .init(false);
+var cancel_ended_ns: std.atomic.Value(u64) = .init(0);
+
+/// A unary method that waits for its caller, as one that calls a slow backend
+/// does, and learns that the caller cancelled (ADR 287).
+fn waitsForCaller(c: *nilo.Ctx) anyerror!void {
+    _ = try c.body();
+    cancel_entered.store(true, .release);
+    const waited = try c.sleepUnlessGone(10_000);
+    cancel_gone.store(waited == .gone, .release);
+    cancel_ended_ns.store(bulkhead.monotonicNanos(), .release);
+    if (waited == .gone) return error.ClientGone;
+    try c.send(200, "application/grpc", "");
+}
+
+test "a gRPC client that cancels its call is gone to the method that waits for it" {
+    hush();
+    cancel_entered.store(false, .release);
+    cancel_gone.store(false, .release);
+    cancel_ended_ns.store(0, .release);
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-cancel.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Wait/Sleep", waitsForCaller);
+
+    var serving: Serving = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{});
+    try writeCall(&writer.interface, 1, "/test.Wait/Sleep", "hello");
+    try writer.interface.flush();
+
+    var waited: u32 = 0;
+    while (!cancel_entered.load(.acquire) and waited < 3_000) : (waited += 10) {
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(cancel_entered.load(.acquire));
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    const left = bulkhead.monotonicNanos();
+    try h2.writeRstStream(&writer.interface, 1, .cancel);
+    try writer.interface.flush();
+
+    waited = 0;
+    while (cancel_ended_ns.load(.acquire) == 0 and waited < 3_000) : (waited += 10) {
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(cancel_gone.load(.acquire));
+    try testing.expect((cancel_ended_ns.load(.acquire) -| left) / std.time.ns_per_ms < 1_000);
 }

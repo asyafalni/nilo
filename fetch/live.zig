@@ -485,6 +485,74 @@ test "a redirect that was followed says where it ended, and one that was not say
     }.run);
 }
 
+test "ten redirects of 300-byte Locations are followed through a 2 KiB buffer, and one Location longer than the buffer is not" {
+    const hops = 10;
+    const script = comptime blk: {
+        var replies: [hops + 1]fetch.testing.Reply = undefined;
+        for (0..hops) |n| replies[n] = .{
+            .status = "302 Found",
+            .headers = std.fmt.comptimePrint("Location: /hop{d:0>2}{s}\r\n", .{ n, @as([300]u8, @splat('x')) }),
+        };
+        replies[hops] = .{ .body = "ok" };
+        break :blk replies;
+    };
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveScript, .{ &canned, &script, hops + 1 });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var redirect: [2 << 10]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .GET,
+                .url = try canned.url(&buf),
+                .redirects = .{ .follow = &redirect },
+            });
+            try testing.expect(head.ok());
+            var where: [512]u8 = undefined;
+            const landed = (try head.location(&where)).?;
+            try testing.expect(std.mem.indexOf(u8, landed, "/hop09xxx") != null);
+            try testing.expectEqual(@as(usize, hops + 1), canned.tried.count);
+        }
+    }.run);
+
+    // The control: one Location longer than the whole buffer is still the
+    // error that names it.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            const long = fetch.testing.Reply{ .status = "302 Found", .headers = "Location: /" ++ @as([3000]u8, @splat('y')) ++ "\r\n" };
+            var served = try io.concurrent(Canned.serveScript, .{ &canned, &[_]fetch.testing.Reply{long}, 1 });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var redirect: [2 << 10]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            try testing.expectError(error.HttpRedirectLocationOversize, ex.begin(&client, .{
+                .method = .GET,
+                .url = try canned.url(&buf),
+                .redirects = .{ .follow = &redirect },
+            }));
+        }
+    }.run);
+}
+
 /// Whether the request head `seen` (as `Canned.request` returns it) carries
 /// a header of this name, in any case: the client writes its own slots in
 /// lower case and the caller's lines as they were given.
@@ -1431,6 +1499,76 @@ test "a streamed body sends exactly the length it announced" {
     }.run);
 }
 
+/// The streamed put of a real file, with the silence clock on or off. A
+/// `File.Reader` streams by asking the writer for a slice or for a
+/// `sendFile`, which a `Reader.fixed` never does (photon's replicator found
+/// it: the framed body writer had no buffer to give).
+fn putFromFile(io: std.Io, method: std.http.Method, stall_ms: u32, size: usize) !void {
+    var tmp = core.tmpDir();
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @intCast('a' + i % 23);
+    try tmp.dir.writeFile(io, .{ .sub_path = "up.bin", .data = data });
+    var file = try tmp.dir.openFile(io, "up.bin", .{});
+    defer file.close(io);
+    var file_buf: [512]u8 = undefined;
+    var source = file.reader(io, &file_buf);
+
+    var canned = try Canned.open(io);
+    defer canned.close();
+    var served = try io.concurrent(Canned.serveWithBody, .{&canned});
+    defer served.cancel(io) catch {};
+
+    var client = try started(io, .{ .timeout_ms = 0, .stall_ms = stall_ms });
+    defer client.deinit();
+
+    var buf: [64]u8 = undefined;
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    const head = try ex.begin(&client, .{
+        .method = method,
+        .url = try canned.url(&buf),
+        .body = .{ .stream = .{ .reader = &source.interface, .len = size } },
+    });
+    try testing.expect(head.ok());
+    served.await(io) catch {};
+    var want: [40]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, canned.seen[0..canned.seen_len], try std.fmt.bufPrint(&want, "content-length: {d}", .{size})) != null);
+    try testing.expectEqualStrings(data[0..canned.body_seen_len], canned.requestBody());
+    try testing.expectEqual(@min(size, 1024), canned.body_seen_len);
+    // The whole body, not only the kilobyte the server keeps.
+    try testing.expectEqual(@as(u64, size), canned.body_total);
+    try testing.expectEqual(std.hash.Wyhash.hash(0, data), canned.body_hash);
+}
+
+test "a framed body streamed from a real file arrives whole" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            try putFromFile(io, .PUT, 0, 100_000);
+        }
+    }.run);
+}
+
+test "a framed body streamed from a real file arrives whole under a stall bound" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            try putFromFile(io, .PUT, 5000, 100_000);
+        }
+    }.run);
+}
+
+test "an unframed body streamed from a real file arrives whole, with and without a stall bound" {
+    // A DELETE is framed by nothing in std, so its body goes out on the
+    // connection's own writer rather than a body writer (`sendHeadWithLength`).
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            try putFromFile(io, .DELETE, 0, 100_000);
+            try putFromFile(io, .DELETE, 5000, 100_000);
+        }
+    }.run);
+}
+
 test "a body decides the framing, not the method: a DELETE with one and a PATCH without" {
     // Item 73: `std.http.Client` asserts that a DELETE has no body and a
     // PATCH has one, and a real API does both the other way — a bulk delete
@@ -2043,6 +2181,63 @@ test "a body going out to a peer that stopped reading is a stall" {
                 .body = .{ .stream = .{ .reader = &source.reader, .len = 2 } },
             }));
             try testing.expect(core.monotonicMicros() - began < 1_200 * std.time.us_per_ms);
+        }
+    }.run);
+}
+
+test "a body going out under a stall bound is read and flushed a step at a time, so the clock follows the socket" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveWithBody, .{&canned});
+            defer served.cancel(io) catch {};
+
+            // A source that watches how it is asked: every call must find
+            // the writer empty (the step before was flushed to the socket
+            // before the clock was stamped) and be asked for no more than
+            // one step. With the 64 KiB buffer and a stamp per read, the
+            // writer was full at the second call and the ask was 64 KiB:
+            // the clock moved once per 64 KiB, and a healthy upload slower
+            // than 13 KB/s was `Stalled` at `stall_ms = 5000` (ADR 056).
+            const Watch = struct {
+                reader: std.Io.Reader,
+                left: usize,
+                calls: usize = 0,
+                dirty: usize = 0,
+                widest: usize = 0,
+
+                fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                    const self: *@This() = @alignCast(@fieldParentPtr("reader", r));
+                    if (self.left == 0) return error.EndOfStream;
+                    self.calls += 1;
+                    if (w.end != 0) self.dirty += 1;
+                    const n = limit.minInt(self.left);
+                    self.widest = @max(self.widest, n);
+                    try w.splatByteAll('q', n);
+                    self.left -= n;
+                    return n;
+                }
+            };
+            const size = 200_000;
+            var watch: Watch = .{ .reader = .{ .vtable = &.{ .stream = Watch.stream }, .buffer = &.{}, .seek = 0, .end = 0 }, .left = size };
+
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 5000 });
+            defer client.deinit();
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .PUT,
+                .url = try canned.url(&buf),
+                .body = .{ .stream = .{ .reader = &watch.reader, .len = size } },
+            });
+            try testing.expect(head.ok());
+            served.await(io) catch {};
+            try testing.expectEqual(@as(usize, 0), watch.dirty);
+            try testing.expect(watch.widest <= 16 << 10);
+            try testing.expect(watch.calls >= size / (16 << 10));
+            try testing.expectEqual(@as(u64, size), canned.body_total);
         }
     }.run);
 }

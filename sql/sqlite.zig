@@ -405,7 +405,7 @@ pub fn Wire(comptime opts_in: Options) type {
                 try self.live();
                 try Self.checked(values, problem);
                 self.noteDrops(arena, sql);
-                const stmt, const kept = self.wire.stmtOn(self.at, sql, plan, values) catch |err| {
+                const stmt, const kept = self.wire.stmtOn(self.at, sql, plan, values, null) catch |err| {
                     self.wire.said(self.at, err, arena, problem);
                     self.wire.conns[self.at].aborted = true;
                     return err;
@@ -431,7 +431,11 @@ pub fn Wire(comptime opts_in: Options) type {
                 try self.live();
                 try Self.checked(values, problem);
                 self.noteDrops(arena, sql);
-                return self.wire.execOn(self.at, sql, plan, values) catch |err| {
+                var refusal: Refusal = .{ .arena = arena };
+                return self.wire.execOn(self.at, sql, plan, values, &refusal) catch |err| {
+                    // A refusal never reached SQLite, so it is not a failed
+                    // statement and does not abort the transaction.
+                    if (self.wire.refused(err, &refusal, problem)) return err;
                     self.wire.said(self.at, err, arena, problem);
                     self.wire.conns[self.at].aborted = true;
                     return err;
@@ -897,6 +901,7 @@ pub fn Wire(comptime opts_in: Options) type {
             sql: []const u8,
             plan: ?[]const u8,
             values: anytype,
+            refusal: ?*Refusal,
         ) wire.Error!struct { zqlite.Stmt, bool } {
             const conn = &self.conns[at];
             // The values were held to `checked` by the caller, before any
@@ -942,11 +947,31 @@ pub fn Wire(comptime opts_in: Options) type {
             }
 
             const stmt = prepareOne(conn.handle, sql) catch |err| return translate(conn.handle, err);
-            stmt.bind(args) catch |err| {
+            // **Run-time text binds by what each placeholder is called**, so
+            // `$n` means the same in `exec` as in `raw` (ADR 204).
+            // A struct of values is named by its fields and zqlite already binds
+            // it that way, so only a tuple is read back by name.
+            const bound = if (comptime @typeInfo(@TypeOf(args)).@"struct".is_tuple)
+                (if (refusal) |r| bindByName(stmt, args, r) else stmt.bind(args))
+            else
+                stmt.bind(args);
+            bound catch |err| {
                 stmt.deinit();
+                if (err == error.Refused) return error.QueryFailed;
                 return translate(conn.handle, err);
             };
             return .{ stmt, false };
+        }
+
+        /// Whether `err` is a refusal `bindByName` made, and if so the
+        /// message in `problem` (it never reached SQLite, so `said` would
+        /// read the connection's previous error).
+        fn refused(self: *Self, err: wire.Error, refusal: *const Refusal, problem: ?*?wire.Problem) bool {
+            _ = self;
+            const message = refusal.message orelse return false;
+            if (err != error.QueryFailed) return false;
+            if (problem) |slot| slot.* = .{ .message = message };
+            return true;
         }
 
         fn execOn(
@@ -955,9 +980,10 @@ pub fn Wire(comptime opts_in: Options) type {
             sql: []const u8,
             plan: ?[]const u8,
             values: anytype,
+            refusal: *Refusal,
         ) wire.Error!usize {
             const conn = &self.conns[at];
-            const stmt, const kept = try self.stmtOn(at, sql, plan, values);
+            const stmt, const kept = try self.stmtOn(at, sql, plan, values, if (plan == null) refusal else null);
             defer if (kept) {
                 stmt.reset() catch {};
                 stmt.clearBindings() catch {};
@@ -1009,7 +1035,7 @@ pub fn Wire(comptime opts_in: Options) type {
             const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
             errdefer self.release(at);
             try checked(values, problem);
-            const stmt, const kept = self.stmtOn(at, sql, plan, values) catch |err| {
+            const stmt, const kept = self.stmtOn(at, sql, plan, values, null) catch |err| {
                 self.said(at, err, arena, problem);
                 return err;
             };
@@ -1027,7 +1053,9 @@ pub fn Wire(comptime opts_in: Options) type {
             const at = try self.takeWriter(sql);
             defer self.release(at);
             try checked(values, problem);
-            return self.execOn(at, sql, plan, values) catch |err| {
+            var refusal: Refusal = .{ .arena = arena };
+            return self.execOn(at, sql, plan, values, &refusal) catch |err| {
+                if (self.refused(err, &refusal, problem)) return err;
                 self.said(at, err, arena, problem);
                 return err;
             };
@@ -1738,6 +1766,80 @@ fn wideInt(comptime T: type) ?type {
     if (std.math.minInt(I) >= std.math.minInt(i64) and std.math.maxInt(I) <= std.math.maxInt(i64))
         return null;
     return I;
+}
+
+/// Why `bindByName` turned a statement away: the text it wrote, in the
+/// request arena, for the `Problem` and the log.
+const Refusal = struct {
+    arena: std.mem.Allocator,
+    message: ?[]const u8 = null,
+};
+
+/// Bind `values` to a statement's placeholders **by what each is called**,
+/// for text that arrives at run time (`db.exec`).
+///
+/// zqlite's positional bind gives value `i` to slot `i + 1`, and SQLite numbers
+/// a `$name` parameter by first appearance, so `SET a = $2 WHERE n = $1` put
+/// the second value in the `WHERE` and changed no row, with no error. `raw`
+/// respells `$n` while compiling (ADR 204); run-time text cannot be, so the
+/// statement is prepared as written and each slot is read back with
+/// `sqlite3_bind_parameter_name`: `$N` and `?N` take value N, and a name that
+/// is not a number is refused, since `exec` takes a tuple and has no names. A
+/// statement of only bare `?` binds by position. **If any slot has a name,
+/// every slot must have one**: SQLite gives a bare `?` and the slots a `?5`
+/// skips over the same NULL name, and a bare `?` mixed with numbered ones takes
+/// the largest number so far plus one, not its position, so a statement that
+/// mixes them or skips a number is refused, and that is what makes the refusal
+/// of a value no placeholder named sound. Cost: one `sqlite3_bind_parameter_count` call, and one
+/// `_name` call and a short parse per placeholder, once per call (run-time
+/// text is never cached), with no allocation unless it refuses.
+fn bindByName(stmt: zqlite.Stmt, args: anytype, refusal: *Refusal) !void {
+    const n = args.len;
+    var seen: [n]bool = @splat(false);
+    const count: usize = @intCast(zqlite.c.sqlite3_bind_parameter_count(stmt.stmt));
+    var any_named = false;
+    var slot: usize = 1;
+    while (slot <= count) : (slot += 1) {
+        if (zqlite.c.sqlite3_bind_parameter_name(stmt.stmt, @intCast(slot)) != null) any_named = true;
+    }
+    slot = 1;
+    while (slot <= count) : (slot += 1) {
+        const name = zqlite.c.sqlite3_bind_parameter_name(stmt.stmt, @intCast(slot));
+        if (name == null and any_named) return refuse(refusal, "nilo_sql: write every placeholder as `$1`, `$2`, ... with no number skipped, or every one as a bare `?`; this statement mixes them or skips a number (placeholder {d} has no number).", .{slot});
+        const number: usize = if (name == null) slot else blk: {
+            const text = std.mem.span(name);
+            const digits = text[1..];
+            const numbered = (text[0] == '$' or text[0] == '?') and digits.len > 0 and
+                for (digits) |ch| {
+                    if (!std.ascii.isDigit(ch)) break false;
+                } else true;
+            if (!numbered) return refuse(refusal, "nilo_sql: `exec` takes a tuple of values and has no names, so the placeholder `{s}` has nothing to bind to. Write `$1`, `$2`, ... (or a bare `?`) and pass the values in that order.", .{text});
+            break :blk std.fmt.parseInt(usize, digits, 10) catch |err| switch (err) {
+                error.Overflow => return refuse(refusal, "nilo_sql: the placeholder `{s}` is a number too large to be one of the {d} value(s) `exec` was given.", .{ text, n }),
+                error.InvalidCharacter => 0,
+            };
+        };
+        if (number == 0) return refuse(refusal, "nilo_sql: a placeholder is numbered from 1 (`$1`), and the statement has `{s}`.", .{if (name == null) "?" else std.mem.span(name)});
+        if (number > n) {
+            if (name == null) return refuse(refusal, "nilo_sql: the statement has a bare `?` that is placeholder {d}, and `exec` was given {d} value(s).", .{ number, n });
+            return refuse(refusal, "nilo_sql: the statement names `${d}` and `exec` was given {d} value(s). Pass a value for every placeholder, in order.", .{ number, n });
+        }
+        inline for (0..n) |i| {
+            if (i + 1 == number) {
+                seen[i] = true;
+                try stmt.bindValue(args[i], slot - 1);
+            }
+        }
+    }
+    inline for (0..n) |i| {
+        if (!seen[i]) return refuse(refusal, "nilo_sql: `exec` was given {d} value(s) and the statement never names `${d}`. Pass one value for each placeholder.", .{ n, i + 1 });
+    }
+}
+
+fn refuse(refusal: *Refusal, comptime fmt: []const u8, args: anytype) error{Refused} {
+    refusal.message = std.fmt.allocPrint(refusal.arena, fmt, args) catch "nilo_sql: the statement's placeholders do not match the values given to `exec`.";
+    std.log.warn("{s}", .{refusal.message.?});
+    return error.Refused;
 }
 
 fn blobbed(values: anytype) Blobbed(@TypeOf(values)) {
@@ -3005,6 +3107,102 @@ test "a name given to a shared in-memory database is still shared by every pool 
             defer tables.close();
             try testing.expect(try b.next(&tables));
             try testing.expectEqual(@as(i64, 1), try b.read(&tables, i64, 0));
+        }
+    }.run);
+}
+
+test "an exec whose $2 comes before $1 binds each value to the placeholder it names" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:exec-by-name?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(name TEXT, a TEXT, b TEXT)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO t VALUES ('one', 'x', 'y'), ('two', 'x', 'y')", .{}, null, null);
+            // The report: SQLite numbers `$2` first here, so a positional bind
+            // sent "one" to `a` and changed no row.
+            try testing.expectEqual(@as(usize, 1), try w.exec(
+                gpa,
+                "UPDATE t SET a = $2, b = $3 WHERE name = $1",
+                .{ "one", "new-a", "new-b" },
+                null,
+                null,
+            ));
+            var rows = try w.run(gpa, "SELECT a, b FROM t WHERE name = 'one'", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqualStrings("new-a", try w.read(&rows, []const u8, 0));
+            try testing.expectEqualStrings("new-b", try w.read(&rows, []const u8, 1));
+        }
+    }.run);
+}
+
+test "an exec placeholder used twice is one value, and a bare ? still binds by position" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:exec-twice?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(a INTEGER, b INTEGER)", .{}, null, null);
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t VALUES ($1, $1)", .{@as(i64, 7)}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t VALUES (?, ?)", .{ @as(i64, 1), @as(i64, 2) }, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t VALUES (?2, ?1)", .{ @as(i64, 3), @as(i64, 4) }, null, null));
+            var rows = try w.run(gpa, "SELECT a, b FROM t ORDER BY rowid", .{}, null, null);
+            defer rows.close();
+            const want = [_][2]i64{ .{ 7, 7 }, .{ 1, 2 }, .{ 4, 3 } };
+            for (want) |row| {
+                try testing.expect(try w.next(&rows));
+                try testing.expectEqual(row[0], try w.read(&rows, i64, 0));
+                try testing.expectEqual(row[1], try w.read(&rows, i64, 1));
+            }
+        }
+    }.run);
+}
+
+test "an exec naming a placeholder with no value, a value with no placeholder, or a name is refused and says which" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:exec-refused?mode=memory&cache=shared", 2);
+            defer w.close();
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+
+            _ = try w.exec(a, "CREATE TABLE t(a INTEGER, b INTEGER)", .{}, null, null);
+            var problem: ?wire.Problem = null;
+
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES ($1, $3)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "`$3`") != null);
+
+            problem = null;
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES ($1, $1)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "`$2`") != null);
+
+            problem = null;
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES (:x, $1)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "`:x`") != null);
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "$1") != null);
+
+            // A `?2` alone leaves slot 1 as a gap, and `$2, ?` takes slot 2 for the bare one.
+            problem = null;
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES (?2, ?2)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "every placeholder") != null);
+            problem = null;
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES ($2, ?)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "every placeholder") != null);
+
+            // A number too large for usize is its own message.
+            problem = null;
+            try testing.expectError(error.QueryFailed, w.exec(a, "INSERT INTO t VALUES ($1, $99999999999999999999)", .{ @as(i64, 1), @as(i64, 2) }, null, &problem));
+            try testing.expect(std.mem.indexOf(u8, problem.?.message, "too large") != null);
+
+            // None of it reached the table.
+            var rows = try w.run(a, "SELECT count(*) FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 0), try w.read(&rows, i64, 0));
         }
     }.run);
 }

@@ -98,23 +98,24 @@ Independent of the order: each touches files no stage of the direction above doe
 
 ### A failure is a type
 
-**A failure becomes something a handler states in its signature and a client can read field by field, the way a success already is.** Three decisions hold the failure side to one sentence today: a failure body is a status and a message ([ADR 024](./adr/024-every-failure-answers-as-json.md)), an error the mapping table does not name is a 500 (`fail.statusFor`), and the document names one failure an endpoint ([decided](./decided.md)). Each was right when it was made, and what has been built since has moved them: `Bound` knows every field that failed and why ([ADR 034](./adr/034-a-binding-hands-its-failures-to-the-handler.md)), and a `union(enum)` of `Status(code, T)` is the "shape that states a failure in the type" the decided entry waits for. Echo, Fastify, Nest and Hono all give an application one place to map a domain error to a status and a per-field body a form can read, so this is the gap a migrant from either side meets first after the happy path works. It costs the failure path only, and its one number to state is the bytes it adds to the failure slot.
+**A failure becomes something a handler states in its signature and a client can read field by field, the way a success already is.** A handler can already answer several typed statuses, a `union(enum)` of `Status(code, T)` arms each listed in the document with its body ([ADR 286](./adr/286-a-handler-may-answer-in-several-typed-statuses.md)). Two decisions still hold the rest of the failure side to one sentence: a failure body is a status and a message ([ADR 024](./adr/024-every-failure-answers-as-json.md)), and an error the mapping table does not name is a 500 (`fail.statusFor`). Each was right when it was made, and what has been built since has moved them: `Bound` knows every field that failed and why ([ADR 034](./adr/034-a-binding-hands-its-failures-to-the-handler.md)), and a field list is now a body an arm can carry. Echo, Fastify, Nest and Hono all give an application one place to map a domain error to a status and a per-field body a form can read, so this is the gap a migrant from either side meets first after the happy path works. It costs the failure path only, and its one number to state is the bytes it adds to the failure slot.
 
 <!-- gathered: `zig build docs-index` writes this list from the Direction lines in docs/todo.md -->
 
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · A failure is one sentence, so a client cannot mark the field that failed.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · An error from code that does not know about HTTP cannot be given a status once, for the whole App.
-- [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · A handler answers one body type, so a second status with a different shape is a sentence the document never sees.
 
 <!-- /gathered -->
 
-**What would settle it:** a form that marks the field that failed from the body alone, a service-layer `error.EmailTaken` answered as a 409 with no `fail` call and no `catch`, and a handler with two typed answers whose document lists both, with the success path's allocations and instructions unchanged in `bench/release.py`.
+**What would settle it:** a form that marks the field that failed from the body alone, a service-layer `error.EmailTaken` answered as a 409 with no `fail` call and no `catch` (a handler with two typed answers whose document lists both is built), with the success path's allocations and instructions unchanged in `bench/release.py`.
 
 ### A stream is one shape
 
 **A WebSocket, an event stream, a gRPC stream, a streamed upload and a compressed stream become one kind of handler: one that reads and writes in pieces, on a fiber that lives as long as the stream.** Each exists today in its own form or not at all: a WebSocket is a handler that does not return ([ADR 021](./adr/021-a-websocket-is-a-handler-that-does-not-return.md)), an event stream is written by hand, a gRPC call carries exactly one message, a multipart body is read whole into the arena where every Go and Rust framework compared streams it or writes a file to disk past a threshold, and a stream is never compressed. They share the one cost that matters, a fiber and its stack for the life of the stream ([ADR 062](./adr/062-where-a-connection-waits-is-what-it-costs.md)), so they should share the one shape that names it.
 
 It builds on the HTTP/2 framing that has landed: the two pipes of [ADR 260](./adr/260-a-request-on-http2-runs-from-its-headers.md), a body read and an answer written in pieces under the client's windows, are what a gRPC stream is carried on, and what this direction adds is the shape a handler writes one in.
+
+Streaming gRPC reuses `Stream.departed` and `Framing.presence` from ADR 287, so a server-streaming method ends its loop on a client cancel without a second mechanism.
 
 <!-- gathered: `zig build docs-index` writes this list from the Direction lines in docs/todo.md -->
 

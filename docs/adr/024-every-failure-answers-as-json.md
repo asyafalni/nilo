@@ -93,7 +93,7 @@ nilo flushes on `send`, so the body would be rewritten after the head had alread
 | Throughput and p99 | 0: one null check, on the failure path |
 | Binary size, an App that never calls `failures` | +400 bytes on `hello`, +448 on `rest`, stripped `ReleaseFast` |
 
-The stack buffer is sized `fail.max_message * 6 + 256`: `fail.max_message` is a fixed 240 bytes, escaping can turn each byte into six, and 256 is the envelope's own room.
+The stack buffer is sized `fail.max_message * 6 + 256`: `fail.max_message` is the 240 bytes of the Failure's slot, escaping can turn each byte into six, and 256 is the envelope's own room. A message past the slot is kept whole in the request arena (up to 16 KiB, ADR 006), and its body is built in the arena as well, `len * 6 + 256` bytes, so the frame does not grow; if the arena has no room the message is cut to the slot's, as it was before ([ADR 286](./286-a-handler-may-answer-in-several-typed-statuses.md)). A gRPC call is told the first KiB of it, since `grpc-message` is a header.
 A shape that outgrows the buffer gets nilo's own shape instead, sentence intact, which the first failure in development shows; there is no `std.log.warn` for it, because a log call site costs a kilobyte or two of formatting in the binary of every App, fired or not, whether or not that App ever calls `failures`.
 An application that does call `failures` additionally pays its own `json.write` instantiation and `schemaOf`, the same as a handler returning that struct would.
 `Refusals`: not a struct; no `nilo_failure`; a `nilo_failure` with the wrong signature.

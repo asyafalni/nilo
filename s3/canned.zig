@@ -50,6 +50,11 @@ const Seen = struct {
     /// multipart part is megabytes, and what a test asserts on is that the
     /// right number arrived, with the first `body.len` bytes to look at.
     declared_len: u64 = 0,
+    /// A Wyhash (seed 0) and a count of every body byte the server read,
+    /// the capture or not: a streamed put that lost a block in the middle
+    /// matches in its first `body.len` bytes and in nothing else.
+    body_hash: u64 = 0,
+    body_total: u64 = 0,
 
     fn methodText(self: *const Seen) []const u8 {
         return self.method[0..self.method_len];
@@ -366,11 +371,24 @@ const Canned = struct {
 
         self.seen.declared_len = content_length;
         self.seen.body_len = @min(content_length, self.seen.body.len);
-        if (self.seen.body_len != 0) try r.readSliceAll(self.seen.body[0..self.seen.body_len]);
+        var hash: std.hash.Wyhash = .init(0);
+        if (self.seen.body_len != 0) {
+            try r.readSliceAll(self.seen.body[0..self.seen.body_len]);
+            hash.update(self.seen.body[0..self.seen.body_len]);
+        }
         // The rest of a body bigger than the capture, off the socket so the
-        // next request on this connection starts at a request line.
-        if (content_length > self.seen.body_len)
-            try r.discardAll64(content_length - self.seen.body_len);
+        // next request on this connection starts at a request line, and
+        // through the hash on its way.
+        var left: u64 = content_length - self.seen.body_len;
+        var scratch: [8192]u8 = undefined;
+        while (left != 0) {
+            const n: usize = @intCast(@min(left, scratch.len));
+            try r.readSliceAll(scratch[0..n]);
+            hash.update(scratch[0..n]);
+            left -= n;
+        }
+        self.seen.body_hash = hash.final();
+        self.seen.body_total = content_length;
     }
 
     /// Rebuild the canonical request from what arrived, and see whether the
@@ -753,6 +771,55 @@ test "a streamed put frames its body by length rather than in chunks" {
     }.run);
 }
 
+test "a streamed put reads its bytes from a real file" {
+    // Every other `putStream` test reads from `Reader.fixed`, which never asks
+    // its writer for room; a `File.Reader` does, and against a body writer of
+    // no capacity that was an assertion in std, not an error.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var tmp = core.tmpDir();
+            defer tmp.cleanup();
+            var data: [40_000]u8 = undefined;
+            for (&data, 0..) |*b, i| b.* = @intCast('a' + i % 23);
+            try tmp.dir.writeFile(io, .{ .sub_path = "one.bin", .data = &data });
+            var file = try tmp.dir.openFile(io, "one.bin", .{});
+            defer file.close(io);
+            var file_buf: [512]u8 = undefined;
+            var source = file.reader(io, &file_buf);
+
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try files.putStream(&scope, "big/one.bin", .{
+                .reader = &source.interface,
+                .len = @as(u64, data.len),
+                .content_type = "application/octet-stream",
+            });
+
+            served.await(io) catch {};
+            try expectVerified(&canned);
+            try testing.expectEqualStrings("40000", canned.seen.header("content-length").?);
+            try testing.expectEqualStrings(data[0..canned.seen.bodyText().len], canned.seen.bodyText());
+            // The whole body arrived, not only the bytes the server kept.
+            try testing.expectEqual(@as(u64, data.len), canned.seen.body_total);
+            try testing.expectEqual(std.hash.Wyhash.hash(0, &data), canned.seen.body_hash);
+        }
+    }.run);
+}
+
 test "a range is signed as a header, and asks for the slice it was given" {
     try withIo(struct {
         fn run(io: std.Io) !void {
@@ -906,6 +973,46 @@ test "S3 saying no becomes one of the seven" {
             try testing.expectError(error.NotFound, files.get(&scope, "gone.png"));
             served.await(io) catch {};
             try expectVerified(&canned);
+        }
+    }.run);
+}
+
+test "a proxy's answer with no S3 body still ends in the error its status says" {
+    // A load balancer's 502 and 413 carry no `<Error>`; the call fails with
+    // the error the status maps to, and `bucket.failure` logs one line naming
+    // the call and the status (its text is read in `bucket.zig`, since a log
+    // line is not captured here).
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            testing.log_level = .err;
+            const cases = [_]struct { status: []const u8, want: anyerror }{
+                .{ .status = "502 Bad Gateway", .want = error.Unavailable },
+                .{ .status = "413 Content Too Large", .want = error.Failed },
+            };
+            for (cases) |case| {
+                var canned = try Canned.open(io);
+                defer canned.close();
+                canned.answer = .{ .status = case.status };
+
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+
+                var buf: [64]u8 = undefined;
+                var store = try started(io, &canned, &buf);
+                defer store.deinit();
+
+                var files = try Files.open(&store);
+                defer files.deinit();
+
+                var scope: core.Run = .init(testing.allocator);
+                defer scope.deinit();
+
+                try testing.expectError(case.want, files.put(&scope, "notes/one.txt", .{
+                    .bytes = scope.str("cinta laut dan langit"),
+                    .content_type = scope.str("text/plain"),
+                }));
+                served.await(io) catch {};
+            }
         }
     }.run);
 }

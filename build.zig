@@ -1554,6 +1554,34 @@ const config_refusals = [_]Refusal{
         .name = "config_layered_not_a_source",
         .says = "layer 2 of a layered source is comptime_int, and that cannot be a source.",
     },
+    .{
+        .name = "config_list_with_no_room",
+        .says = "`config.List([]const u8, 0)` has room for no entries, so it could never hold what it was read from.",
+    },
+    .{
+        .name = "config_list_of_a_struct",
+        .says = "`config.List(config_list_of_a_struct.Broker, 4)` holds config_list_of_a_struct.Broker, which is not something one entry of a variable can become.",
+    },
+    .{
+        .name = "config_list_default_too_long",
+        .says = "a default of 2 entries does not fit a `config.List` with room for 1.",
+    },
+    .{
+        .name = "config_group_in_a_group",
+        .says = "the group `smtp` of the Config `config_group_in_a_group.Settings` holds a group `relay`, and a group does not nest.",
+    },
+    .{
+        .name = "config_group_with_no_fields",
+        .says = "the group `smtp: ?config_group_with_no_fields.Smtp` of the Config `config_group_with_no_fields.Settings` has no fields, so it would read nothing.",
+    },
+    .{
+        .name = "config_two_settings_one_variable",
+        .says = "the Config `config_two_settings_one_variable.Settings` reads `SMTP_HOST` twice, from `smtp_host` and from `smtp.host`.",
+    },
+    .{
+        .name = "config_groups_one_variable",
+        .says = "the Config `config_groups_one_variable.Settings` reads `A_B_C` twice, from `a.b_c` and from `a_b.c`.",
+    },
 };
 
 /// The same, for `pw/refusals/`. They hang off `test-pw` for the reason the
@@ -2218,6 +2246,18 @@ const refusals = [_]Refusal{
         .says = "cors.reading takes its origins from the Origins you hand it, so the `.origins` field has nothing to do.",
     },
     .{
+        .name = "cors_deciding_with_origins_named_too",
+        .says = "cors.deciding asks your function which origins are allowed, so the `.origins` field has nothing to do.",
+    },
+    .{
+        .name = "cors_deciding_returns_void",
+        .says = "the function given to cors.deciding returns a void, and it has to return a `bool`: true to allow the origin.",
+    },
+    .{
+        .name = "cors_deciding_without_the_origin",
+        .says = "the function given to cors.deciding has to end with the origin as a `[]const u8`, after at most two services.",
+    },
+    .{
         .name = "csrf_empty_origin",
         .says = "csrf was given an empty origin, which matches nothing.",
     },
@@ -2438,6 +2478,19 @@ const refusals = [_]Refusal{
     .{
         .name = "optional_outside_a_versioned",
         .says = "the handler for route \"/orders/:id\" returns ?nilo.Versioned(optional_outside_a_versioned.Order), and a thing that is not there has no version.",
+    },
+    // A handler that answers in several statuses (ADR 286).
+    .{
+        .name = "union_of_answers_with_one_status_twice",
+        .says = "the handler for route \"/search\" returns union_of_answers_with_one_status_twice.Search, and its arms `bad_query` and `bad_field` both answer 400.",
+    },
+    .{
+        .name = "union_of_answers_with_an_arm_that_is_not_a_status",
+        .says = "the handler for route \"/search\" returns union_of_answers_with_an_arm_that_is_not_a_status.Search, and its arm `refused` is union_of_answers_with_an_arm_that_is_not_a_status.Invalid, not a `nilo.Status(code, T)`.",
+    },
+    .{
+        .name = "optional_outside_a_union_of_answers",
+        .says = "the handler for route \"/search\" returns ?optional_outside_a_union_of_answers.Search, and the `?` has to go inside the arm it is about.",
     },
     .{
         .name = "form_not_a_struct",
@@ -6037,6 +6090,21 @@ pub fn build(b: *std.Build) void {
     });
     b.step("bench-keepalive-server", "A server naming the thread that answered, for which executor a connection lives on")
         .dependOn(&b.addInstallArtifact(bench_keepalive_server, .{}).step);
+
+    // What asking whether the client is there costs a route that asks
+    // (ADR 287): `bench/gone_server.zig`.
+    const bench_gone_server = b.addExecutable(.{
+        .name = "nilo-bench-gone-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/gone_server.zig"),
+            .target = target,
+            .optimize = .fast,
+            .strip = stripMeasured(strip, .fast),
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        }),
+    });
+    b.step("bench-gone-server", "A server timing c.presence() against a control, ns a call (ADR 287)")
+        .dependOn(&b.addInstallArtifact(bench_gone_server, .{}).step);
 
     // Whether a plain idle connection holds one page of fiber stack, or two,
     // which is the line between 4,669 bytes and 8,765 on every connection a

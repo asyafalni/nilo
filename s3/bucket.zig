@@ -1919,10 +1919,19 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
         /// Read what S3 said about a failure, log it, and hand the handler one
         /// of the seven.
+        ///
+        /// **Every answer that ends here leaves exactly one `warn` line**, with
+        /// the bucket, the method and path the call went to (the key, as the
+        /// URL carries it), the status, and the `Code` and message when the
+        /// body had them. A proxy's 413 or 502, or a store that is still
+        /// starting, answers with no S3 body at all, and a bare `Failed`
+        /// there named nothing. The clock-skew and no-such-bucket answers
+        /// keep their own lines, which say the fix and not only the fact.
         fn failure(self: *Self, c: anytype, ex: *fetch.Exchange, got: fetch.Exchange.Head) Error {
             // Bounded, because an error body is a few hundred bytes and
             // anything claiming to be more is not one.
             const body = ex.take(c, 8 << 10) catch {
+                logAnswer(self.name, ex, got.status, .{});
                 return code.errorFor(got.status, "");
             };
             const reason: code.Reason = .read(body.view());
@@ -1939,14 +1948,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                         "or at its endpoint. The bucket's name is what to check.",
                     .{self.name},
                 );
-            } else if (reason.code.len != 0) {
-                std.log.warn("nilo_s3: {s} answered {d} {s}: {s}", .{
-                    self.name,
-                    @backingInt(got.status),
-                    reason.code,
-                    reason.message,
-                });
-            }
+            } else logAnswer(self.name, ex, got.status, reason);
 
             return code.errorFor(got.status, reason.code);
         }
@@ -2034,6 +2036,38 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             };
         }
     };
+}
+
+/// The one line a failed call leaves, split from the log call so a test can
+/// read it. `bucket METHOD /path answered 502`, and `403 AccessDenied: …`
+/// when the body had a Code (see `Bucket.failure`).
+const Answer = struct {
+    bucket: []const u8,
+    method: []const u8,
+    path: []const u8,
+    status: u10,
+    reason: code.Reason,
+
+    pub fn format(self: Answer, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("nilo_s3: {s} {s} {s} answered {d}", .{ self.bucket, self.method, self.path, self.status });
+        if (self.reason.code.len != 0) try w.print(" {s}: {s}", .{ self.reason.code, self.reason.message });
+    }
+};
+
+/// Warn once about the answer to the call `ex` made, without its query: the
+/// signature travels in a header, but a query is the caller's and is not for
+/// a log.
+fn logAnswer(bucket: []const u8, ex: *const fetch.Exchange, status: std.http.Status, reason: code.Reason) void {
+    const path = switch (ex.req.uri.path) {
+        .raw, .percent_encoded => |text| text,
+    };
+    std.log.warn("{f}", .{Answer{
+        .bucket = bucket,
+        .method = @tagName(ex.req.method),
+        .path = path,
+        .status = @backingInt(status),
+        .reason = reason,
+    }});
 }
 
 /// The length after the slash of a `content-range` (`bytes 0-9/100` is 100),
@@ -2710,4 +2744,24 @@ test "the size of the whole object is read from after the slash of a content-ran
     try std.testing.expectEqual(@as(?u64, null), totalOf("0-9/100"));
     try std.testing.expectEqual(@as(?u64, null), totalOf(""));
     try std.testing.expectEqual(@as(?u64, null), totalOf(null));
+}
+
+test "a failed call's log line names the bucket, the call and the status, and the Code when there is one" {
+    var buf: [256]u8 = undefined;
+    const bare: Answer = .{ .bucket = "photos", .method = "PUT", .path = "/big/one.bin", .status = 502, .reason = .{} };
+    try std.testing.expectEqualStrings(
+        "nilo_s3: photos PUT /big/one.bin answered 502",
+        try std.fmt.bufPrint(&buf, "{f}", .{bare}),
+    );
+    const coded: Answer = .{
+        .bucket = "photos",
+        .method = "GET",
+        .path = "/a.png",
+        .status = 403,
+        .reason = .{ .code = "AccessDenied", .message = "Access Denied" },
+    };
+    try std.testing.expectEqualStrings(
+        "nilo_s3: photos GET /a.png answered 403 AccessDenied: Access Denied",
+        try std.fmt.bufPrint(&buf, "{f}", .{coded}),
+    );
 }

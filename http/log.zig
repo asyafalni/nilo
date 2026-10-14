@@ -521,6 +521,9 @@ test "a handler's line carries the id of the request it was written in" {
         fn id(_: *anyopaque, _: fail.InFlight.Part) []const u8 {
             return "req-7";
         }
+        fn none(_: *anyopaque, _: usize) ?[]u8 {
+            return null;
+        }
     };
     var anchor: u8 = 0;
     const previous = bulkhead.setFallbackSlot(&in_flight);
@@ -530,7 +533,7 @@ test "a handler's line carries the id of the request it was written in" {
     try testing.expect(std.mem.indexOf(u8, lineHere(&buf, .warn, .default, "out", .{}), "request=") == null);
 
     in_flight.request = &anchor;
-    in_flight.read_request = Fake.id;
+    in_flight.request_ops = &.{ .read = Fake.id, .alloc = Fake.none };
     try testing.expect(std.mem.endsWith(u8, lineHere(&buf, .warn, .default, "slow", .{}), "slow request=req-7\n"));
 
     in_flight.startRequest();

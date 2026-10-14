@@ -74,6 +74,7 @@
 //! ```
 
 const std = @import("std");
+const convert_mod = @import("convert.zig");
 const dotenv_mod = @import("dotenv.zig");
 const read_mod = @import("read.zig");
 const source_mod = @import("source.zig");
@@ -83,10 +84,15 @@ const source_mod = @import("source.zig");
 pub const Read = read_mod.Read;
 /// One setting that could not be read.
 pub const Failure = read_mod.Failure;
-/// Why one setting could not be read — four, and it stays four.
+/// Why one setting could not be read: five, and it stays five.
 pub const Reason = read_mod.Reason;
 /// What became of one field.
 pub const Outcome = read_mod.Outcome;
+
+/// A setting that is several values in one variable, `A=x,y,z`: room for
+/// `max` entries fixed while compiling, so nothing is allocated. See
+/// `List` in `convert.zig` and ADR 289.
+pub const List = convert_mod.List;
 
 /// The process environment, read where it lies. Allocates nothing.
 pub const Env = source_mod.Env;

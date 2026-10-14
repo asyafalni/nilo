@@ -14,7 +14,7 @@ Once redirects had a name of their own, following one still lost where it ended.
 ### `Begin.redirects` is a union with three arms, and the default says so out loud
 
 - **`.refuse`, the default:** a 3xx with a `Location` is `error.RedirectRefused`. A 304 has no `Location`, is an answer to `if-none-match`, and is handed over as itself.
-- **`.follow = &buf`:** walked by `nilo_fetch` itself, three deep at most, the `Location` resolved in the buffer, `head.redirected` saying where it ended (below), and each hop held to the origin rule (below).
+- **`.follow = &buf`:** walked by `nilo_fetch` itself, ten deep at most (what Go's `net/http` and reqwest follow; a loop ends there as `error.TooManyHttpRedirects`), the `Location` resolved in the buffer, `head.redirected` saying where it ended (below), and each hop held to the origin rule (below).
 - **`.expose`:** the 3xx as itself, 302 and all, for the signed request that checks where an object moved and for the client that reads the body of the answer, which is where S3 puts the reason for a 301; `s3/bucket.zig` says it on every call, because a signature is over one host and following would send it elsewhere.
 
 The intent has a name, the buffer goes where the one intent that needs it is, and the absence of a decision is no longer spelled like one. `Client.get` and the rest follow it as they did.
@@ -32,11 +32,13 @@ So `.follow` is std's `.unhandled` and `Exchange.begin` walks the chain, one req
 
 ### `Head.redirected` is the `std.Uri` a followed redirect ended at, or null, and `head.location(buf)` writes it out as one string
 
-`begin` counts the redirects it has left; fewer than it started with is a chain it walked, and the address it ended at is then the end of it, resolved by std's own `resolveInPlace` into the `redirect_buffer` the call was given. That is where the text lives: good for as long as the buffer is, which the caller owns.
+`begin` counts the redirects it has left; fewer than it started with is a chain it walked, and the address it ended at is then the end of it, resolved by std's own `resolveInPlace` into the `redirect_buffer` the call was given and then slid to the start of it, every piece of the URL, so the next hop starts from one URL and not from the chain. That is where the text lives: good for as long as the buffer is, which the caller owns. **The buffer bounds one URL and one Location (with the room `resolveInPlace` and the slide need, a few times that), not the chain**: ten hops of 300-byte Locations are followed through 2 KiB, and a single Location longer than the buffer is `error.HttpRedirectLocationOversize`. Before this the buffer was a budget for the whole chain, and ten Locations of 200 bytes ended in that error.
 
 The string form takes a buffer because a `std.Uri` is components, and writing them out needs somewhere to go. `error.NoSpaceLeft` is a URL longer than the buffer that held it, which is the only way it fails.
 
 ## What was rejected
+
+**Three hops, std's number, kept.** `max_redirects` was 3 because `std.http.Client`'s `redirect_behavior` counted three, and the walk moved to `nilo_fetch` without anyone choosing the number. A login page behind `http://` to `https://` to `www.` to `/login` to `/login/` is four hops, and a monitor that passed on a client following ten (reqwest, Go) failed on this one (photon's uptime probe, the first caller to meet it). Ten costs one `u8` and a loop that stops sooner than a person would notice; a loop (A to B to A) is bounded by the same cap and ends in `error.TooManyHttpRedirects`, which a test holds. **A count in the `.follow` arm was not added**: no case has been seen that needs more than four, and a knob for an unseen need is not added.
 
 **Keep the field and make a 3xx with an empty buffer the error.** Breaks nobody, and leaves the buffer's emptiness carrying two meanings with an error deciding between them at run time. The union costs every `begin` with a `redirect_buffer` in it one line each, and the alternative left the release untagged.
 

@@ -42,6 +42,7 @@ const http1 = @import("http1.zig");
 const fail = @import("fail.zig");
 const naming = @import("names.zig");
 const versioned = @import("versioned.zig");
+const statusunion = @import("statusunion.zig");
 
 /// The two spellings of a message, protobuf in two envelopes; `unread` is a
 /// request nothing has asked yet.
@@ -99,10 +100,21 @@ pub fn speaks(comptime Fn: type) bool {
     comptime {
         for (@typeInfo(Fn).@"fn".param_types) |p| if (p) |P| if (isMessage(P)) return true;
         const Returned = @typeInfo(Fn).@"fn".return_type orelse return false;
-        var V = switch (@typeInfo(Returned)) {
+        const V = switch (@typeInfo(Returned)) {
             .error_union => |u| u.payload,
             else => Returned,
         };
+        if (statusunion.is(V)) {
+            for (@typeInfo(V).@"union".field_types) |A| if (speaksOf(A)) return true;
+            return false;
+        }
+        return speaksOf(V);
+    }
+}
+
+fn speaksOf(comptime Answered: type) bool {
+    comptime {
+        var V = Answered;
         if (hasDeclOn(V, "nilo_response")) V = V.nilo_response;
         if (versioned.isVersioned(V)) V = V.nilo_versioned;
         if (@typeInfo(V) == .optional) V = @typeInfo(V).optional.child;

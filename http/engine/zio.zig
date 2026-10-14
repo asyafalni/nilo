@@ -651,6 +651,12 @@ pub fn firedOperation(state: *anyopaque) bool {
     return cancel.check(error.Canceled);
 }
 
+/// What the socket says about the peer's end (`Wake.hangup`).
+pub const Hangup = enum { none, fin, reset };
+
+/// How a `Wake.sleepUnlessHungUp` ended.
+pub const Slept = enum { elapsed, hung_up, closed };
+
 /// What ended a `Wake.wait`.
 pub const Woken = enum {
     /// The socket has something to read.
@@ -1062,6 +1068,90 @@ pub const Wake = struct {
         self.cq.cancelAll(.discard);
         self.armed = false;
         self.poll_armed = false;
+    }
+
+    /// What the peer's end of the socket says, asked of the kernel now:
+    /// nothing, a FIN, or a reset (ADR 287).
+    ///
+    /// **`poll(2)` with `POLLRDHUP` and nothing else**, not a peek: a FIN is
+    /// reported even while bytes the peer sent before it are unread, so a
+    /// client that pipelined, or a TLS client whose `close_notify` is still
+    /// in the buffer, does not hide its hang-up (`MSG_PEEK` would return the
+    /// bytes and say nothing of the FIN). `POLLERR` and `POLLHUP` are a
+    /// reset, or the socket gone. A FIN is a `close()` and a
+    /// `shutdown(SHUT_WR)` alike until the server writes, when a closed peer
+    /// answers with a reset: the caller asks again, it does not cache.
+    ///
+    /// Read-only and thread-safe, which is the point: a blocking worker asks
+    /// from its own thread while the fiber that owns the socket is parked on
+    /// it. Only Linux has `POLLRDHUP`; another OS answers `.none`, so nothing
+    /// there is ended early.
+    /// `POLLRDHUP`, which Zig's `POLL` does not list (its `EPOLL.RDHUP` is the
+    /// same bit, `linux.zig`): `<poll.h>` under `_GNU_SOURCE`, Linux 2.6.17.
+    const pollrdhup: i16 = 0x2000;
+
+    pub fn hangup(self: *const Wake) Hangup {
+        if (comptime builtin.os.tag != .linux) return .none;
+        const events: i16 = pollrdhup;
+        var fds = [1]std.posix.pollfd{.{ .fd = self.handle, .events = events, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch return .none;
+        if (ready == 0) return .none;
+        const got = fds[0].revents;
+        if (got & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return .reset;
+        if (got & events != 0) return .fin;
+        return .none;
+    }
+
+    /// Bytes the peer sent that nobody has read. A poll for `POLLIN` completes
+    /// at once while there are any, which is why the armed wait below cannot
+    /// be used then.
+    fn bytesPending(self: *const Wake) bool {
+        var fds = [1]std.posix.pollfd{.{ .fd = self.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 0) catch return true;
+        return ready != 0;
+    }
+
+    /// The longest a sleep goes without asking the kernel when it cannot be
+    /// woken by the socket (`sleepUnlessHungUp`).
+    const hangup_slice_ms = 1000;
+
+    /// Sleep for `ms`, or until the peer hangs up. A quiet client causes no
+    /// wakeup before the timer: the socket's readable poll, the one `wait`
+    /// uses, is armed for the length of the call and cancelled on every way
+    /// out, so the Wake is as it was (a poll left armed would announce the
+    /// next request's bytes to a later `wait`, which `wait` explains).
+    ///
+    /// zio's `NetPoll` watches `POLLIN` only, which completes at once while
+    /// bytes are unread, and fires on bytes as well as on a FIN. So when
+    /// bytes are pending, or the client speaks during the sleep, the rest is
+    /// slept in slices of `hangup_slice_ms`, asking `hangup` between them:
+    /// the hang-up is still seen, at most a slice late (ADR 287).
+    pub fn sleepUnlessHungUp(self: *Wake, ms: u32) Slept {
+        if (self.hangup() != .none) return .hung_up;
+        if (ms == 0) return .elapsed;
+        const started = monotonicNanos();
+        if (!self.armed and !self.poll_armed and !self.bytesPending()) {
+            self.cq.submit(&self.poll.c) catch unreachable;
+            self.poll_armed = true;
+            if (self.cq.waitTimeout(.{ .duration = .fromMilliseconds(ms) })) |_| {
+                // Bytes or a FIN or a reset. Only `hangup` says which.
+                self.poll_armed = false;
+                if (self.hangup() != .none) return .hung_up;
+            } else |err| {
+                self.cq.cancel(&self.poll.c);
+                self.poll_armed = false;
+                return if (err == error.Timeout) .elapsed else .closed;
+            }
+        }
+        const used_ms = (monotonicNanos() - started) / std.time.ns_per_ms;
+        var left: u64 = if (used_ms >= ms) 0 else ms - used_ms;
+        while (left > 0) {
+            const step = @min(left, hangup_slice_ms);
+            sleep(step) catch return .closed;
+            left -= step;
+            if (self.hangup() != .none) return .hung_up;
+        }
+        return .elapsed;
     }
 
     /// Wake the fiber holding this connection. Thread-safe, and the only call

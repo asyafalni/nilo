@@ -36,7 +36,8 @@
 | `e.json(name, value)` | data as JSON |
 | `e.comment(text)` | a line the client ignores |
 | `e.retry(millis)` | the browser's reconnect delay |
-| `e.live()` | false once the server is stopping |
+| `e.live()` | false once the server is stopping, or `e.sleep` found the client gone |
+| `e.sleep(ms)` | `error{Canceled}!void`: wait up to `ms` for the next thing to send, and return early when the client is gone, after which `live()` is false. A FIN ends it whatever the request said, because a stream never ends and a half-closed client is waiting for nothing. Without it a stream that writes only when it has something holds its connection until a write fails ([ADR 287](../adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)) |
 | `e.close()` | |
 
 **Multi-line text is split where the browser would split it**: at LF, CRLF **and a lone CR**. So `data` and `comment` are sent as one field per line, and a value cannot start an event of its own. `name` and `id` are single lines by definition: a CR or LF in either, or in `json`'s name, returns `error.EventFieldBreaksLine`, and nothing is written.
@@ -75,7 +76,32 @@ What it cannot do is run any of the handler's own code between events. For that,
 | `b.discardRest()` | |
 | `b.seen()` | bytes read so far |
 | `b.size()` | `?u64`: what the request announced; `null` if chunked |
-| `b.reader` | a plain `std.Io.Reader` |
+| `b.reader` | a plain, unbuffered `std.Io.Reader`, for what asks for runs of bytes. Do not set its `buffer` by hand |
+| `b.buffered(&buf)` | `!*std.Io.Reader`: the same reader with a buffer you own, for a parser that peeks or takes lines (`std.json.Reader`, `takeDelimiter`). Allocates nothing, and `buf` is the longest line or token it holds. An empty buffer is `error.EmptyBuffer`. Give it a fixed size: `size()` is the client's word, so a buffer sized from it is empty for `Content-Length: 0` and as large as the client likes otherwise |
+| `b.explain(err)` | what a failed read through `reader` or `buffered` was: `BodyTooLarge`, `BodyTruncated`, `BadChunk`, as a `std.Io.Reader` can only say `ReadFailed`. Any other error, `StreamTooLong` and `EndOfStream` included, comes back unchanged |
+
+<!-- compiles -->
+```zig
+const Reading = struct { id: u32, celsius: f32 };
+
+fn ingest(c: *nilo.Ctx) !struct { readings: usize } {
+    var incoming = try c.bodyStream();
+    var buf: [4096]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+
+    // NDJSON: one reading a line, as the lines arrive. A document is the
+    // same with `std.json.Reader.init(c.arena(), r)`.
+    var count: usize = 0;
+    while (r.takeDelimiter('\n') catch |err| return incoming.explain(err)) |line| {
+        const reading = try std.json.parseFromSliceLeaky(Reading, c.arena(), line, .{});
+        _ = reading;
+        count += 1;
+    }
+    return .{ .readings = count };
+}
+```
+
+The bound `max_bytes` and every error of `read` hold through `buffered`, because the bytes come through the same counting read; the buffer holds up to one buffer more than the parser has used, so `seen()` runs ahead of it by at most that. Call `buffered` once, before reading.
 
 **`read`, `writeTo` and `discardRest` fail with `error.BodyTruncated`, a 400, when the connection ends while bytes are still owed**, so an upload cut short is never stored as a whole one. `null` from `read` is always the real end ([ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)).
 

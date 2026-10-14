@@ -132,9 +132,13 @@ pub const Body = struct {
     pub const nilo_type_name = "nilo.Body";
 
     /// The body as a `std.Io.Reader`, for handing to something in the
-    /// standard library. Unbuffered on purpose: a body reader is asked for
-    /// runs of bytes, never for a line or a peek, and an unbuffered one
-    /// allocates nothing.
+    /// standard library that asks for runs of bytes (`streamRemaining`,
+    /// `readSliceAll`). Unbuffered, so it allocates nothing and a parser that
+    /// peeks has nowhere to peek: **a parser that does, `std.json.Reader` or a
+    /// line at a time, takes `buffered` instead**, which is this reader with a
+    /// buffer the caller owns. Do not set `reader.buffer` by hand: `buffered`
+    /// is the one place that does it, and checks what the by-hand version did
+    /// not.
     reader: std.Io.Reader,
 
     /// The connection.
@@ -145,6 +149,48 @@ pub const Body = struct {
     /// behind this — a Body a test built against a fixed reader. A stretch of
     /// handler time ends at every read (ADR 013).
     _watch: ?*watchdog.Watch = null,
+
+    /// The body as a buffered `std.Io.Reader`, for a parser that peeks, takes
+    /// a line or refills as it goes: `std.json.Reader`, `takeDelimiter` over
+    /// NDJSON, `takeInt`.
+    ///
+    /// ```zig
+    /// var incoming = try c.bodyStream();
+    /// var buf: [4096]u8 = undefined;
+    /// const r = try try incoming.buffered(&buf);
+    /// while (try r.takeDelimiter('\n')) |line| try store.add(line);
+    /// ```
+    ///
+    /// **The buffer is the caller's**, on the stack or from `c.arena()`, and
+    /// nothing is allocated here, so the path that does not ask for it costs
+    /// what it did. It is also the longest a line, a token or a peek may be:
+    /// `takeDelimiter` answers `error.StreamTooLong` past it.
+    ///
+    /// **The limit holds the same way** (`max_bytes`, ADR 019), because the
+    /// bytes still come through the one counting read. A `std.Io.Reader` can
+    /// only say `ReadFailed`, so a failed read through it is turned back into
+    /// what happened with `incoming.explain(err)`: `BodyTooLarge`,
+    /// `BodyTruncated`, `BadChunk`. `seen` counts what was pulled from the
+    /// connection, which is up to one buffer ahead of what the parser has
+    /// used.
+    ///
+    /// **Size the buffer from what the parser needs, never from the request.**
+    /// `incoming.size()` is the client's word: `Content-Length: 0` would make
+    /// an empty buffer, and a large one would hand the client the memory. An
+    /// empty buffer is `error.EmptyBuffer` rather than an assertion, which a
+    /// ReleaseFast build does not check and a reader with no room would spin
+    /// on.
+    ///
+    /// Call it once, before reading, and read through the returned reader
+    /// from then on.
+    pub fn buffered(self: *Body, buffer: []u8) error{EmptyBuffer}!*std.Io.Reader {
+        if (buffer.len == 0) return error.EmptyBuffer;
+        std.debug.assert(self.reader.end == self.reader.seek);
+        self.reader.buffer = buffer;
+        self.reader.seek = 0;
+        self.reader.end = 0;
+        return &self.reader;
+    }
 
     /// The next piece of the body, or null once there is none.
     ///
@@ -196,10 +242,14 @@ pub const Body = struct {
         return self._progress.announced;
     }
 
-    /// Turn the one error the `Reader` interface can carry back into the one
-    /// that actually happened. `stream` may only fail with `ReadFailed`, so
-    /// what went wrong is recorded on the way past and read back here.
-    fn explain(self: *Body, err: anyerror) Error {
+    /// Turn `ReadFailed`, the one error a `Reader` can carry out of `stream`,
+    /// back into the one that actually happened: `BodyTooLarge`,
+    /// `BodyTruncated` or `BadChunk`, recorded on the way past and read back
+    /// here. **Every other error passes through unchanged**, so
+    /// `takeDelimiter`'s `StreamTooLong` and `takeInt`'s `EndOfStream` are
+    /// still those, and a handler can answer each as what it is.
+    pub fn explain(self: *Body, err: anytype) (Error || @TypeOf(err)) {
+        if (!std.mem.eql(u8, @errorName(err), "ReadFailed")) return err;
         if (self._progress.state == .cut) return error.BodyTruncated;
         if (self._progress.state == .broken) {
             return if (self._progress.seen > self._progress.max_bytes)
@@ -207,11 +257,7 @@ pub const Body = struct {
             else
                 error.BadChunk;
         }
-        return switch (err) {
-            error.ReadFailed => error.ReadFailed,
-            error.WriteFailed => error.WriteFailed,
-            else => error.ReadFailed,
-        };
+        return error.ReadFailed;
     }
 
     /// nilo's own: `Ctx.bodyStream` builds one of these.
@@ -546,4 +592,103 @@ test "an upload the connection ended before its Content-Length is a failure on e
     try testing.expectError(error.BodyTruncated, d.read(&buf));
     try testing.expectError(error.BodyTruncated, d.read(&buf));
     try testing.expectEqual(Progress.State.cut, chunked.progress.state);
+}
+
+test "a JSON body bigger than the buffer is parsed by std.json.Reader through buffered" {
+    var case: Case = undefined;
+    const doc = "{\"items\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20],\"name\":\"a fairly long string value\"}";
+    case.init(doc ++ "next", sized(doc.len), 1024);
+    var incoming = case.body();
+    var buf: [16]u8 = undefined;
+    var json_reader: std.json.Reader = .init(testing.allocator, try incoming.buffered(&buf));
+    defer json_reader.deinit();
+
+    const parsed = try std.json.parseFromTokenSource(
+        struct { items: []const u32, name: []const u8 },
+        testing.allocator,
+        &json_reader,
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 20), parsed.value.items.len);
+    try testing.expectEqualStrings("a fairly long string value", parsed.value.name);
+    try testing.expectEqual(@as(u64, doc.len), incoming.seen());
+    // Past the last byte of the body is the next request's, untouched.
+    try testing.expect(case.progress.finished());
+}
+
+test "NDJSON lines arrive one at a time through buffered, across chunk edges" {
+    var case: Case = undefined;
+    case.init("4\r\none\n\r\n1\r\n\n\r\n8\r\ntwo\nthre\r\n3\r\ne\n\n\r\n0\r\n\r\n", chunked_request, 1024);
+    var incoming = case.body();
+    var buf: [8]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+
+    try testing.expectEqualStrings("one", (try r.takeDelimiter('\n')).?);
+    try testing.expectEqualStrings("", (try r.takeDelimiter('\n')).?);
+    try testing.expectEqualStrings("two", (try r.takeDelimiter('\n')).?);
+    try testing.expectEqualStrings("three", (try r.takeDelimiter('\n')).?);
+    try testing.expectEqualStrings("", (try r.takeDelimiter('\n')).?);
+    try testing.expectEqual(@as(?[]u8, null), try r.takeDelimiter('\n'));
+    try testing.expect(case.progress.finished());
+}
+
+test "a line longer than the buffer is StreamTooLong and not a spin" {
+    var case: Case = undefined;
+    case.init("a line that does not fit\n", sized(24), 1024);
+    var incoming = case.body();
+    var buf: [8]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+    try testing.expectError(error.StreamTooLong, r.takeDelimiter('\n'));
+    // `explain` leaves it as what it is, for a handler to answer as such.
+    try testing.expectEqual(error.StreamTooLong, incoming.explain(error.StreamTooLong));
+    try testing.expectEqual(error.EndOfStream, incoming.explain(error.EndOfStream));
+}
+
+test "buffered refuses a buffer with no room, and a handler need not size one from the request" {
+    var case: Case = undefined;
+    case.init("", sized(0), 1024);
+    var incoming = case.body();
+    var none: [0]u8 = undefined;
+    try testing.expectError(error.EmptyBuffer, incoming.buffered(&none));
+}
+
+test "a body past the limit is still refused through buffered, and explain says why" {
+    var case: Case = undefined;
+    case.init("5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n", chunked_request, 8);
+    var incoming = case.body();
+    var buf: [4]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+
+    var out: [16]u8 = undefined;
+    const err = r.readSliceAll(&out);
+    try testing.expectError(error.ReadFailed, err);
+    try testing.expectEqual(error.BodyTooLarge, incoming.explain(error.ReadFailed));
+}
+
+test "a body the connection cut short is BodyTruncated through buffered" {
+    var case: Case = undefined;
+    case.init("only ten b", sized(20), 1024);
+    var incoming = case.body();
+    var buf: [4]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+
+    var out: [32]u8 = undefined;
+    try testing.expectError(error.ReadFailed, r.readSliceAll(&out));
+    try testing.expectEqual(error.BodyTruncated, incoming.explain(error.ReadFailed));
+}
+
+test "what a handler left in the buffer does not stop the rest being discarded" {
+    var case: Case = undefined;
+    case.init("0123456789next", sized(10), 1024);
+    var incoming = case.body();
+    var buf: [4]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+    try testing.expectEqualStrings("012", try r.take(3));
+
+    try incoming.discardRest();
+    try testing.expect(case.progress.finished());
+    var rest: [4]u8 = undefined;
+    try case.in.readSliceAll(&rest);
+    try testing.expectEqualStrings("next", &rest);
 }

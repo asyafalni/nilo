@@ -383,6 +383,13 @@ pub const Events = struct {
     pub const nilo_type_name = "nilo.Events";
 
     stream: Stream,
+    /// The connection's Waker, for `sleep` (ADR 287). The wait is reached
+    /// through `Waker.watching`, called from `sleep` and nowhere else here,
+    /// so a program that opens a stream and never sleeps on it links none of
+    /// it (a function pointer to it was 2,664 bytes of `example-stream`).
+    _waker: bulkhead.Waker = .off,
+    /// A `sleep` found the client gone.
+    _left: bool = false,
 
     pub const content_type = "text/event-stream";
 
@@ -433,9 +440,47 @@ pub const Events = struct {
         try self.stream.flush();
     }
 
-    /// Whether the server still wants this stream running. See `Stream.live`.
+    /// Whether the server still wants this stream running, and the client
+    /// has not been found gone by `sleep`. See `Stream.live`.
     pub fn live(self: *const Events) bool {
-        return self.stream.live();
+        return !self._left and self.stream.live();
+    }
+
+    /// Wait up to `ms` for the next thing to send, and give up the moment
+    /// the client is gone, after which `live()` is false (ADR 287).
+    ///
+    /// ```zig
+    /// while (events.live()) {
+    ///     try events.sleep(1000);
+    ///     if (feed.take()) |row| try events.send(.{ .data = row });
+    /// }
+    /// ```
+    ///
+    /// **A client that closed its tab is told apart from nothing at the next
+    /// wake, not the next write**: without this a stream that writes only
+    /// when it has something holds its connection until a write fails. A
+    /// FIN ends it whatever the request said, because a response that
+    /// never ends has nothing for a half-closed client to wait for. A
+    /// stopping server or a deadline is `error.Canceled`, as for `nilo.sleep`.
+    pub fn sleep(self: *Events, ms: u32) error{Canceled}!void {
+        if (self._left) return;
+        if (comptime framing_mod.http2_built) {
+            if (self.stream._framing.* == .http2) {
+                const token = watchdog.waitingAnywhere();
+                defer watchdog.waitedAnywhere(token);
+                if (try self.stream._framing.sleepUnlessDeparted(ms, true) == .gone) self._left = true;
+                if (self.stream._framing.presence()) |p| if (p != .here) {
+                    self._left = true;
+                };
+                return;
+            }
+        }
+        switch (self._waker.watching().sleepUnlessHungUp(ms)) {
+            .closed => return error.Canceled,
+            .elapsed => {},
+            // A FIN or a reset: on a stream that never ends both are leaving.
+            .hung_up => self._left = true,
+        }
     }
 
     pub fn close(self: *Events) !void {

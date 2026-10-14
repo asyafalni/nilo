@@ -5113,6 +5113,120 @@ test "a CORS origin can arrive at run time instead of being compiled in" {
     ) != null);
 }
 
+/// The program's own store of allowed origins, which changes while the server
+/// runs: what `cors.deciding` asks (ADR 088).
+const SiteSettings = struct {
+    allowed: []const []const u8 = &.{},
+
+    fn allows(self: *SiteSettings, origin: []const u8) bool {
+        for (self.allowed) |a| if (std.mem.eql(u8, a, origin)) return true;
+        return false;
+    }
+};
+
+fn originIsAllowed(sites: *SiteSettings, origin: []const u8) bool {
+    return sites.allows(origin);
+}
+
+test "cors.deciding follows a list that changes between two requests" {
+    var sites = SiteSettings{ .allowed = &.{"https://a.example.com"} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&sites);
+    try app.use(cors.deciding(originIsAllowed, .{ .credentials = true, .max_age = 600 }));
+    try app.get("/thing", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const a_req = "GET /thing HTTP/1.1\r\nHost: t\r\nOrigin: https://a.example.com\r\n\r\n";
+    const b_req = "GET /thing HTTP/1.1\r\nHost: t\r\nOrigin: https://b.example.com\r\n\r\n";
+
+    const a1 = h.send(&app, a_req);
+    try testing.expect(std.mem.indexOf(u8, a1.response, "Access-Control-Allow-Origin: https://a.example.com\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, a1.response, "Access-Control-Allow-Credentials: true") != null);
+    try testing.expect(std.mem.indexOf(u8, a1.response, "Vary: Origin") != null);
+
+    const b1 = h.send(&app, b_req);
+    try testing.expect(std.mem.indexOf(u8, b1.response, "Access-Control-Allow-Origin") == null);
+    try testing.expect(std.mem.indexOf(u8, b1.response, "Vary: Origin") != null);
+
+    // The program changes its data while the server runs.
+    sites.allowed = &.{"https://b.example.com"};
+
+    const a2 = h.send(&app, a_req);
+    try testing.expect(std.mem.indexOf(u8, a2.response, "Access-Control-Allow-Origin") == null);
+    const b2 = h.send(&app, b_req);
+    try testing.expect(std.mem.indexOf(u8, b2.response, "Access-Control-Allow-Origin: https://b.example.com\r\n") != null);
+
+    // No Origin: not cross-origin, no such header, and Vary still says so.
+    const none = h.send(&app, "GET /thing HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, none.response, "Access-Control-Allow-Origin") == null);
+    try testing.expect(std.mem.indexOf(u8, none.response, "Vary: Origin") != null);
+
+    // `null` is never put to the program, even if its list holds it.
+    sites.allowed = &.{"null"};
+    const sandboxed = h.send(&app, "GET /thing HTTP/1.1\r\nHost: t\r\nOrigin: null\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, sandboxed.response, "Access-Control-Allow-Origin") == null);
+}
+
+test "cors.deciding answers a preflight for an allowed origin and refuses another" {
+    var sites = SiteSettings{ .allowed = &.{"https://a.example.com"} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&sites);
+    try app.use(cors.deciding(originIsAllowed, .{ .max_age = 600 }));
+    try app.get("/thing", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = h.send(&app, "OPTIONS /thing HTTP/1.1\r\nHost: t\r\nOrigin: https://a.example.com\r\n" ++
+        "Access-Control-Request-Method: POST\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, ok.response, "HTTP/1.1 204"));
+    try testing.expect(std.mem.indexOf(u8, ok.response, "Access-Control-Allow-Origin: https://a.example.com\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ok.response, "Access-Control-Max-Age: 600") != null);
+
+    const no = h.send(&app, "OPTIONS /thing HTTP/1.1\r\nHost: t\r\nOrigin: https://evil.example.com\r\n" ++
+        "Access-Control-Request-Method: POST\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, no.response, "HTTP/1.1 204"));
+    try testing.expect(std.mem.indexOf(u8, no.response, "Access-Control-Allow-Origin") == null);
+}
+
+test "cors.deciding treats a value that is not an origin as no Origin, even one the program would allow" {
+    const bad = [_][]const u8{ "", "*", "https://a.example.com/path", "https://A.example.com", "https://a b.example.com" };
+    var sites = SiteSettings{ .allowed = &bad };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&sites);
+    try app.use(cors.deciding(originIsAllowed, .{}));
+    try app.get("/thing", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    inline for (bad) |value| {
+        const r = h.send(&app, "GET /thing HTTP/1.1\r\nHost: t\r\nOrigin: " ++ value ++ "\r\n\r\n");
+        try testing.expect(std.mem.startsWith(u8, r.response, "HTTP/1.1 200"));
+        try testing.expect(std.mem.indexOf(u8, r.response, "Access-Control-Allow-Origin") == null);
+        try testing.expect(std.mem.indexOf(u8, r.response, "Vary: Origin") != null);
+    }
+}
+
+test "a service cors.deciding needs but the App does not provide is refused at listen()" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(cors.deciding(originIsAllowed, .{}));
+    try app.get("/thing", plainOk);
+
+    const missing = app.missingService().?;
+    try testing.expectEqualStrings(@typeName(SiteSettings), missing.type_name);
+    try testing.expect(std.mem.startsWith(u8, missing.route, "the middleware taking (*"));
+}
+
 test "two layers each naming a Vary axis both survive onto the response" {
     // A gzipped file behind a CORS with a named origin: the middleware says
     // the answer depends on the Origin, the file says it depends on
@@ -13711,4 +13825,104 @@ test "a Many left out is its default in a JSON body, a form and a binding alike"
     // Sent, it is what was sent.
     const sent = postSignUp(&h, &app, "/form", form, "tags=4&tags=5");
     try testing.expect(std.mem.endsWith(u8, sent, "4"));
+}
+
+const Hits = struct { total: u32 };
+const Invalid = struct { @"error": []const u8, offset: u32 };
+const SearchQuery = struct { q: Str };
+
+const SearchAnswer = union(enum) {
+    found: typed.Status(200, Hits),
+    refused: typed.Status(400, Invalid),
+};
+
+fn searchAnswering(q: typed.Query(SearchQuery)) !SearchAnswer {
+    if (std.mem.indexOfScalar(u8, q.value.q.view(), '(')) |at| return .{ .refused = .{
+        .value = .{ .@"error" = "unbalanced parenthesis", .offset = @intCast(at) },
+    } };
+    if (q.value.q.view().len == 0) return fail.notFound("nothing to search for", .{});
+    return .{ .found = .{ .value = .{ .total = 3 } } };
+}
+
+test "a handler returning a union of Status arms answers each arm with its own status and body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/search", searchAnswering);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const found = h.send(&app, "GET /search?q=error HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, found.response, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, found.response, "{\"total\":3}"));
+
+    // The photon shape: a 400 that says where, beside a 200 list.
+    const refused = h.send(&app, "GET /search?q=ab(c HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, refused.response, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.endsWith(u8, refused.response, "{\"error\":\"unbalanced parenthesis\",\"offset\":2}"));
+
+    // An error still goes through `fail` as it always did.
+    const failed = h.send(&app, "GET /search?q= HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, failed.response, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "the document lists one response for each arm of a union of Status arms" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.get("/search", searchAnswering);
+
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"200\":{\"description\":\"the response\",\"content\":{\"application/json\":" ++
+            "{\"schema\":{\"$ref\":\"#/components/schemas/Hits\"}}}}",
+    ) != null);
+    // The query can be refused by nilo too, so the 400 is either body.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"400\":{\"description\":\"the response\",\"content\":{\"application/json\":" ++
+            "{\"schema\":{\"oneOf\":[{\"$ref\":\"#/components/schemas/Invalid\"}," ++
+            "{\"$ref\":\"#/components/schemas/Failure\"}]}}}}",
+    ) != null);
+    // One 400, not two: a key twice in an object keeps one of them.
+    const first = std.mem.indexOf(u8, json, "\"400\":").?;
+    try testing.expect(std.mem.indexOfPos(u8, json, first + 1, "\"400\":") == null);
+}
+
+const long_sentence = blk: {
+    var sentence: []const u8 = "every problem the preflight found: ";
+    for (0..21) |_| sentence = sentence ++ "a dangerous construct in the rendered compose, ";
+    break :blk sentence;
+};
+
+fn refusesAtLength() !void {
+    return fail.badRequest("{s}", .{long_sentence});
+}
+
+test "a fail message of a thousand bytes reaches the client whole" {
+    try testing.expect(long_sentence.len > 900 and long_sentence.len < 1100);
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/deploy", refusesAtLength);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const result = h.send(&app, "GET /deploy HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.endsWith(u8, result.response, "{\"error\":\"" ++ long_sentence ++ "\",\"status\":400}"));
+    try testing.expect(result.keep_alive);
+}
+
+test "a fail message of a thousand bytes reaches the client whole in the shape app.failures named" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(ApiError);
+    try app.get("/deploy", refusesAtLength);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const result = h.send(&app, "GET /deploy HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, result.response, long_sentence ++ "\"") != null);
 }

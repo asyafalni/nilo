@@ -89,6 +89,15 @@
 //!   skip safe rather than a bet: no read can park a connection with a
 //!   response still in memory (ADR 201). One load of the writer's fill on
 //!   each read that reaches the socket, and nothing on a read that does not.
+//! - `Waker.hangup`/`Waker.sleepUnlessHungUp`: what the peer's end of the
+//!   socket says now (nothing, a FIN, a reset), read-only and callable from
+//!   any thread, and a sleep that ends when it says one. Optional, reached
+//!   through `Waker.watching` so a program that never asks links none of it:
+//!   an Engine without them answers `.none` and sleeps plain, and nothing is
+//!   ended early (ADR 287). zio's `NetPoll` watches `POLLIN` only, so on
+//!   Linux the Engine asks `poll(2)` with `POLLRDHUP`, which a client's
+//!   unread bytes do not hide, and sleeps in slices where it cannot wait on
+//!   the socket.
 //! - `Waker.halfClose` — send the peer a FIN without closing the socket, so
 //!   a refused request's answer reaches it before the reset that closing on
 //!   unread input would send (ADR 195). One `shutdown(2)`; an Engine that
@@ -1065,6 +1074,40 @@ const engine_waker: Waker.VTable = .{
     }.f,
 };
 
+/// `engine_waker` and the two questions about the peer's end (ADR 287).
+///
+/// **A second table rather than two more entries in the first**, because the
+/// first is named by every connection and so links what its entries call into
+/// every program: the two cost 1,712 bytes of a stripped `ReleaseFast` `hello`
+/// and `rest`, which is what `bench/result/http.md` measured. Only `watching`
+/// names this one, and only `Ctx.presence` and `Ctx.sleepUnlessGone` call
+/// `watching`, so a program that never asks carries none of it. The move
+/// ADR 227 made for an event stream's `run`.
+const engine_waker_watching: Waker.VTable = blk: {
+    var table = engine_waker;
+    table.hangup = struct {
+        fn f(target: ?*anyopaque) Hangup {
+            const wake: *engine.Wake = @ptrCast(@alignCast(target.?));
+            return switch (wake.hangup()) {
+                .none => .none,
+                .fin => .fin,
+                .reset => .reset,
+            };
+        }
+    }.f;
+    table.sleep_hangup = struct {
+        fn f(target: ?*anyopaque, ms: u32) Slept {
+            const wake: *engine.Wake = @ptrCast(@alignCast(target.?));
+            return switch (wake.sleepUnlessHungUp(ms)) {
+                .elapsed => .elapsed,
+                .hung_up => .hung_up,
+                .closed => .closed,
+            };
+        }
+    }.f;
+    break :blk table;
+};
+
 const engine_deadlines: Deadlines.VTable = .{
     .limit = struct {
         fn f(target: ?*anyopaque, side: Side, l: Limit) void {
@@ -1742,6 +1785,49 @@ pub const Woken = enum { readable, posted, timed_out, closed };
 /// straight has bytes in a fixed buffer or it does not; there is nobody to
 /// post to it, and a `receive` that parked waiting for one would hang the
 /// suite rather than fail it.
+/// What the socket says about the peer's end of a connection, as the Engine
+/// reads it from the kernel (`poll(2)` with `POLLRDHUP` on Linux). `fin` is a
+/// close or a half-close, which TCP cannot tell apart until the server
+/// writes; `reset` is an RST or an error (ADR 287).
+pub const Hangup = enum { none, fin, reset };
+
+/// How a handler's `sleepUnlessGone` ended: the time passed, or the client
+/// went (ADR 287). A cancel from a stop or a deadline is `error.Canceled`,
+/// a different thing.
+pub const Waited = enum { elapsed, gone };
+
+/// How a `Waker.sleepUnlessHungUp` ended.
+pub const Slept = enum { elapsed, hung_up, closed };
+
+/// Whether the client of a request is still there, in the two signals
+/// RFC 9112 forces apart: a client that half-closed may be waiting for its
+/// answer, one that is gone is not (ADR 287).
+pub const Presence = enum {
+    /// What a nilo compile error calls this type (ADR 074).
+    pub const nilo_type_name = "nilo.Presence";
+
+    /// Nothing says otherwise.
+    here,
+    /// The client sent a FIN after saying it was finished sending
+    /// (`Connection: close`, HTTP/1.0), or its HTTP/2 connection reached the
+    /// end of its input: it may still be reading the answer.
+    half_closed,
+    /// A reset or an error, a FIN from a client that did not say it was
+    /// finished (a closed tab, an aborted `fetch`), or an HTTP/2
+    /// `RST_STREAM`: nobody is reading the answer.
+    gone,
+
+    /// What a `Hangup` means for a request. `finished` is whether the
+    /// request announced that it was the last on its connection.
+    pub fn of(h: Hangup, finished: bool) Presence {
+        return switch (h) {
+            .none => .here,
+            .reset => .gone,
+            .fin => if (finished) .half_closed else .gone,
+        };
+    }
+};
+
 /// What a plain listener's choosing of a framing returned: the connection
 /// was served, or it is HTTP/2 and still to be (ADR 259).
 pub const Hand = enum { done, http2 };
@@ -1779,6 +1865,13 @@ pub const Waker = struct {
         /// rather than only saying it has arrived. See `waitFilling`. Null
         /// is `wait`, which is what a Waker with no socket under it means.
         wait_filling: ?*const fn (target: ?*anyopaque, limit_ms: u32) Woken = null,
+        /// What the peer's end of the socket says right now, without waiting
+        /// or reading. Null is `.none`, which is what a Waker with no socket
+        /// under it means. See `hangup`.
+        hangup: ?*const fn (target: ?*anyopaque) Hangup = null,
+        /// Sleep up to `ms`, or until the peer's end hangs up. Null is a plain
+        /// sleep. See `sleepUnlessHungUp`.
+        sleep_hangup: ?*const fn (target: ?*anyopaque, ms: u32) Slept = null,
     };
 
     fn nothingYet(_: ?*anyopaque) Woken {
@@ -1877,6 +1970,36 @@ pub const Waker = struct {
     pub fn poll(self: Waker) Woken {
         if (comptime !looks_ahead) unreachable;
         return self.vtable.poll(self.target);
+    }
+
+    /// This Waker able to answer `hangup` and `sleepUnlessHungUp`: the same
+    /// connection with the table that carries them. A Waker that is not the
+    /// Engine's (a test's, `off`) is returned as it is. Called by the two
+    /// `Ctx` methods that ask and nothing else, which is what keeps the code
+    /// behind it out of a program that does not (`engine_waker_watching`).
+    pub fn watching(self: Waker) Waker {
+        if (self.vtable != &engine_waker) return self;
+        return .{ .vtable = &engine_waker_watching, .target = self.target };
+    }
+
+    /// What the socket says about the peer's end, now: nothing, a FIN, or a
+    /// reset. A question to the kernel and not a flag somebody sets, so it is
+    /// right whichever thread asks and costs a route that never asks nothing
+    /// (ADR 287). Nothing with no Engine underneath.
+    pub fn hangup(self: Waker) Hangup {
+        const f = self.vtable.hangup orelse return .none;
+        return f(self.target);
+    }
+
+    /// `sleep`, ended early when the peer hangs up: `.elapsed`, `.hung_up`
+    /// (a FIN or a reset, which `hangup` then tells apart), or `.closed` when
+    /// the fiber was cancelled. With no Engine under it, a plain sleep.
+    pub fn sleepUnlessHungUp(self: Waker, ms: u32) Slept {
+        const w = watchdog.waitingAnywhere();
+        defer watchdog.waitedAnywhere(w);
+        if (self.vtable.sleep_hangup) |f| return f(self.target, ms);
+        sleep(ms) catch return .closed;
+        return .elapsed;
     }
 };
 
@@ -2573,4 +2696,21 @@ test "a connection's budget is the cap less up to a tenth, differs between neigh
     }
     // Spread over the whole tenth, not stuck on one number.
     try std.testing.expect(lowest <= 905 and highest >= 995);
+}
+
+test "a hang-up is read as the request's own words allow: a FIN from a client that did not say it was finished is gone" {
+    // ADR 287. Keep-alive request: a closed tab. `Connection: close`: a
+    // client that may be reading. A reset is gone either way, and nothing
+    // is here.
+    try testing.expectEqual(Presence.here, Presence.of(.none, false));
+    try testing.expectEqual(Presence.here, Presence.of(.none, true));
+    try testing.expectEqual(Presence.gone, Presence.of(.fin, false));
+    try testing.expectEqual(Presence.half_closed, Presence.of(.fin, true));
+    try testing.expectEqual(Presence.gone, Presence.of(.reset, false));
+    try testing.expectEqual(Presence.gone, Presence.of(.reset, true));
+}
+
+test "a Waker with no Engine under it sees no hang-up and sleeps plainly" {
+    try testing.expectEqual(Hangup.none, Waker.off.hangup());
+    try testing.expectEqual(Slept.elapsed, Waker.off.sleepUnlessHungUp(1));
 }

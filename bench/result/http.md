@@ -4787,3 +4787,46 @@ swerver on the same rig earlier the same day: json-h2c 1.74M at 4.47 µs at 1,02
 **What was tried and dropped, the same day on the same rig** (one round each unless said): lending each body to one vectored write at the flush instead of copying it, 5.99 to 7.30 µs of server CPU on json-h2c at 1,024 (the stream could not be recycled until the flush, so `ArenaAllocator.reset` went from 0.62% to 8.51% of the profile) while the client's fell; a `write_buffer` of 64 KiB, 4.35 µs against the burst's 4.59 in that round, held by every connection for its whole life and an `mmap` each; a burst buffer of 12 KiB, 6.05 µs; a burst buffer for every answer, which took unary gRPC from 2.37 to 2.70 µs at 256 connections and static-h2 at 1,024 connections from 27.1 to 30.1, and is why only bodies of 1 KiB to under 16 KiB take it.
 
 **What it moved:** ADR 285. **Can it be pushed further:** yes, by writing once a burst rather than once a buffer, which is what swerver's 50.8 KB a segment is; that needs the answers of a burst to outlive the copy, the lending design above, without holding their streams.
+
+## What asking whether the client is there costs
+
+Run on 2026-10-14, AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.17.0, on `ddc46b6` with ADR 287 in the working tree. The decision it moved: **the question is the kernel's, asked when asked** (`poll(2)` with `POLLRDHUP`), where the first design armed a watcher per request, and **the two Waker entries sit in a second vtable** that only `Ctx.presence` and `Ctx.sleepUnlessGone` name.
+
+**`c.presence()`, a route that asks** (`bench/gone_server.zig`, `zig build bench-gone-server`, ReleaseFast, one thread pinned to cpu 2, a loopback keep-alive socket, 500,000 calls inside one handler, the control the same loop around `c.overdue()`; eight pairs, control then peer, interleaved): the control 181 to 183 ps a call (the loop itself), **`presence()` 75.4 to 76.8 ns a call**, one `poll(2)` on the connection's socket. The syscall is the whole of it. A route that does not ask makes none: it has no call to make, and no field, SQE or timer was added to the request path. This machine's kernel has no syscall mitigations on, so the figure is a floor; the doc says "between units of work", not per row.
+
+**`c.sleepUnlessGone(1)` against `nilo.sleep(1)`** (`/naps/1000` and `/naps-watched/1000`, six pairs interleaved, mean ns a sleep over 1,000): `nilo.sleep` 1,008,632 to 1,019,466, `sleepUnlessGone` 1,009,666 to 1,022,174. The two ranges overlap: the poll armed for the call, the timer and the cancel add less than the 10 to 20 µs of timer slack either carries, which is a margin narrower than its spread and is quoted as such, not as zero.
+
+**Binary size**, stripped `ReleaseFast` (`zig build examples -Doptimize=ReleaseFast -Dstrip=true -Dtarget=x86_64-linux-gnu`; the before from `git archive HEAD` into a scratch directory, same flags, same afternoon):
+
+| | before | first form: two entries in `engine_waker` | second form: a table only `watching` names |
+|---|---|---|---|
+| `example-hello` | 1,111,912 | 1,113,624 (+1,712) | 1,112,024 (**+112**) |
+| `example-rest` | 1,329,360 | 1,331,088 (+1,728) | 1,329,472 (**+112**) |
+| `example-stream` | 1,157,000 | not built | 1,157,176 (+176) |
+
+The first form linked what the two entries call into every program, as ADR 284's `wait_filling` did (+1,840). A function pointer in the stream (`Events._sleep`) cost `example-stream` another 2,664 bytes on its own and was replaced by the stream's own `Waker` and a call to `Waker.watching` made from `events.sleep` alone (`stream.zig` may not name `ctx.zig`, which `zig build layering` holds). The 112 that remain are the two fields in the table every connection names and the `499` status phrase.
+
+**Memory per idle connection: +0.** `@sizeOf(Wake)` is 528 and `@sizeOf(InFlight)` is 328 before and after (Debug and ReleaseSafe, which carry the loop's list checks; asserted in `http/gone_live.zig`), neither struct gained a field. `zig build park-check -Dtarget=x86_64-linux-gnu`: of 48 idle connections 0 hold more than one page of stack.
+
+**Allocations per request: +0**, `test "the request path stays inside its allocation budget"` in `http/behaviour.zig` unchanged and passing. **Throughput and p99:** not measured, because nothing on the request path changed for a route that does not ask (no branch, no field, no syscall); the one new line a request that does ask runs is the `poll(2)` above.
+
+**Can it be pushed further:** the slice fallback (a handler asked to sleep while the client has bytes pending is woken once a second to ask again) goes away with a hang-up event on zio's `NetPoll`, which today watches `POLLIN` only.
+
+## What keeping a long failure message costs in binary size
+
+Run on 2026-10-14, AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.17.0, on `ddc46b6` plus the uncommitted tree of the review-fix round (ADR 286, ADR 287 and the other merged tracks). The decision it moved: **a fail message is formatted once**, through a writer that spills from the slot into the request arena (`Spill.drain` in `http/fail.zig`), where the first form measured it up to three times (the slot, a `Discarding` counting pass, the arena) and so instantiated three formatting paths at every `fail.*(fmt, args)` call site.
+
+Method: `zig build examples -Doptimize=ReleaseFast -Dstrip=true -Dtarget=x86_64-linux-gnu` in the tree, the before from `git archive ddc46b6` built the same way earlier the same day. The attribution of the middle step is a scratch edit of `setIn` back to a plain fixed writer, rebuilt.
+
+| | before | first form | spilling writer | spilling writer, `init` and `finish` not inlined |
+|---|---|---|---|---|
+| `example-hello` | 1,111,912 | +5,984 | 1,114,392 (+2,480) | 1,112,552 (**+640**) |
+| `example-rest` | 1,329,360 | +23,680 | 1,334,560 (+5,200) | 1,323,744 (**-5,616**) |
+| `example-orders` | 1,513,360 | +51,408 | 1,519,792 (+6,432) | 1,492,912 (**-20,448**) |
+| `example-stream` | 1,157,000 | | 1,160,360 | 1,157,480 (+480) |
+| `example-chat` | 1,162,184 | | 1,165,032 | 1,161,128 (-1,056) |
+| `example-forms` | 1,235,440 | | 1,239,424 | 1,229,824 (-5,616) |
+
+With `setIn` reverted to the fixed writer, `hello` was 1,113,416 and `rest` 1,331,776, so the spilling writer's own cost in the first spilling form was +976 and +2,784: the writer's setup and the epilogue were inlined into every call site. Keeping both in `noinline` functions (`Spill.init`, `Failure.finish`) leaves one copy of each. `hello`'s +640 includes ADR 287's +112; the rest is the other merged tracks. `failureBodyLen` in `serve.zig` is one function per App, counted with `Discarding` twice (nilo's shape and the application's), and is part of the figures above; it was not separated because the remainder is already under 1 KB. Growth by doubling wastes the earlier arena blocks until the request ends; a message reaching 16 KiB leaves 8 + 4 + 2 + 1 KiB behind, on the failure path only.
+
+**Allocations per request: +0** (the allocation budget test is unchanged and passes); memory per idle connection: +0 (`@sizeOf(Failure)` is 256, asserted). **Can it be pushed further:** the remaining +528 B on `hello` over ADR 287's 112 is from tracks outside this change and was not bisected.

@@ -566,6 +566,37 @@ Instructions are a hardware counter in user mode, read at exit at 1,000 and at 5
 
 **What it decided.** The shape stands: the message is handed over where it lies and the socket holds a buffer only for a message that did not arrive whole, so a feed costs no allocation per message.
 
+## A body streamed from a file reader (the framed body writer's buffer)
+
+Run on 2026-10-14, AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.17.0, at `ddc46b6` plus the change that gives the framed body writer a buffer. `bench/fetch_upload.zig` (the header has the build line), `-O ReleaseFast`, one PUT of a file to `fetch.testing.Canned` in the same process over loopback, so the server's read side is in every figure and is the same in all rows. Median of 21 runs per row (three processes of seven), the modes interleaved. CPU is `CLOCK_PROCESS_CPUTIME_ID`, wall is `CLOCK_MONOTONIC`.
+
+**The defect.** A framed body went out through `req.sendBody(&.{})`, a body writer of no capacity. A `std.Io.File.Reader` streams into its writer by `sendFile` first, which `std.Io.Threaded` answers `error.Unimplemented` (`netWriteFile` is a `TODO` in 0.17), then drops to a mode that asks the writer for a writable slice, and `Writer.defaultRebase` asserts when the buffer cannot hold one. That is `unreachable` in Debug and ReleaseSafe alike (both aborted: `live.test.a framed body streamed from a real file arrives whole`, with and without `stall_ms`, and `canned.test.a streamed put reads its bytes from a real file`). Every earlier test streamed from `Reader.fixed`, which writes from where it lies and never asks. The unframed branch (a DELETE with a body, `sendHeadWithLength`) writes to the connection's own writer, which has a kilobyte, and was never affected; the `.slice` and `.none` branches write whole slices and need no room.
+
+| | 64 MiB cpu / wall | 1 GiB cpu / wall |
+|---|---|---|
+| before: the only thing that worked, a reader that copies the file through its own 64 KiB chunk (photon's `Pump`) | 0.011 / 0.010 s | 0.148 / 0.131 s |
+| after, `File.Reader` direct, chunk 4 KiB | 0.015 / 0.013 s | 0.228 / 0.191 s |
+| after, chunk 16 KiB | 0.012 / 0.050 s | 0.174 / 0.147 s |
+| **after, chunk 64 KiB (shipped)** | **0.010 / 0.009 s** | **0.157 / 0.140 s** |
+| the same bytes from memory (`Reader.fixed`), the floor | 0.007 / 0.006 s | 0.147 / 0.119 s |
+
+A read is the buffer's size, so the buffer is the syscall count: a kilobyte would have been 65,536 reads for the 64 MiB. 64 KiB is within 6% of the workaround on CPU. The 16 KiB row's 50 ms wall at 64 MiB repeated on every run and is not understood (a tail wait on the last segment is the guess); 64 KiB does not show it. With `stall_ms = 5000` the 1 GiB upload was 0.159 / 0.144 s against 0.159 / 0.144 s without, **but that figure was wrong about what it measured**: the tap stamped once per read, and with a 64 KiB buffer a read is not bytes on the wire (the drain to the socket ran between stamps), so a healthy upload slower than 13 KB/s was `Stalled` at `stall_ms = 5000`. The tap of an upload now reads 16 KiB at a time and flushes each step before it stamps (`uploadStream`). Run on 2026-10-14, same machine, `-O ReleaseFast`, 1 GiB from a file, three interleaved rounds of five runs, median CPU / wall:
+
+| 1 GiB, `stall_ms = 5000` | cpu | wall |
+|---|---|---|
+| before (a stamp per 64 KiB read) | 0.199 s | 0.145 s |
+| **after, 16 KiB step (shipped)** | **0.236 s** | **0.165 s** |
+| after, 32 KiB step | 0.222 s | 0.150 s |
+| `stall_ms = 0`, before / after | 0.193 / 0.187 s | 0.140 / 0.133 s |
+
+The cost is on the calls that set a `stall_ms` only (a syscall per 16 KiB instead of per 64 KiB, which is 18% CPU on a loopback upload where the syscall is the whole cost) and nothing without one. The step is the clock's resolution: a peer slower than step / `stall_ms` is called stalled, 3.3 KB/s at five seconds for 16 KiB and 6.5 KB/s for 32 KiB. Whether 16 or 32 is the right trade is the one open number here. **Not measured, and found while trying:** a peer that stops reading while the socket buffers are full leaves the write blocked, and the timer does not interrupt it: engineless, `future.cancel` waited 4.7 s for the peer to hang up (`std.Io.Threaded` does not return from a blocked `sendmsg` on a cancel), and under the Engine a stalled-upload test hung with an io_uring worker in `io_wq_worker`, so no test of it is kept.
+
+**Zero-copy is not on offer here, and the fix does not close it.** `Threaded.netWriteFile` returns `Unimplemented`, so no `sendfile(2)` is reached today, and a TLS connection's writer has no `sendFile` at all. The body writer keeps its `sendFile` entry, so a `File.Reader` still tries it first and a later std that implements it is used on a plain connection without a change here.
+
+**Axes.** The 64 KiB is heap, taken from the client's allocator for the length of one send and only for a `.stream` body with a framed method: one allocation per such call (none for any other body, and none on the server's request path). A stack buffer was refused because a fiber keeps its stack's high-water mark for as long as the connection lives (ADR 062). Memory per idle connection, throughput of the server and binary size are not touched by this code path; the stripped size was not re-measured.
+
+**Can it be pushed further.** Yes, by `sendfile`, once std has it. Not otherwise on loopback: the shipped row is 6% over the floor that sends from memory.
+
 ## What is still missing
 
 - **A quiet machine.** The load average was between 6 and 18 across these runs

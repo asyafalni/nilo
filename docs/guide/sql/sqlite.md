@@ -93,7 +93,7 @@ One operator goes the other way. `.ilike` is Postgres's word for what SQLite's `
 
 **A raw statement's text is yours, and two things trip up a program written from the Postgres examples.** The [raw SQL page](./raw.md#what-sqlite-does-differently) has the longer list.
 
-**`$1`, `$2`, … mean the same here.** SQLite's own numbered placeholder is `?1`, and `$name` there is a named parameter numbered by first appearance, so `WHERE ($2 IS NULL OR x = $2)` with no `$1` before it used to take the *first* value. nilo rewrites `$n` as `?n` while compiling, for every call that takes comptime text, so a statement written for Postgres binds by number here too and one text works on both ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)). `db.exec` takes run-time text and sends it as written; its statements are DDL, which has no parameters.
+**`$1`, `$2`, … mean the same here.** SQLite's own numbered placeholder is `?1`, and `$name` there is a named parameter numbered by first appearance, so `WHERE ($2 IS NULL OR x = $2)` with no `$1` before it used to take the *first* value. nilo rewrites `$n` as `?n` while compiling, for every call that takes comptime text, so a statement written for Postgres binds by number here too and one text works on both ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)). `db.exec` takes run-time text, so it is not rewritten: the Wire binds each placeholder by the name SQLite gives it, and `$n` means the same there.
 
 ### Dates from a Timestamp
 

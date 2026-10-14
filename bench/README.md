@@ -78,6 +78,7 @@ zig build autobahn-server      # the echo server `bash bench/autobahn/run.sh` dr
 
 ```
 zig build-exe bench/fetch_tls_pool.zig -O ReleaseFast   # what a pooled outbound connection holds, plain and over TLS; the header has the commands
+# bench/fetch_upload.zig: CPU and wall of one streamed upload of a file; the header has the build line
 ```
 
 ## Scripts

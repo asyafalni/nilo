@@ -30,7 +30,7 @@ const settings = read.value() orelse {
 };
 ```
 
-The field name upper-cased is the variable, `database_url` is read from `DATABASE_URL`, a default is what "not set" means, and a `?T` is a setting that may be absent. That is [ADR 011](./011-the-query-string-is-a-struct-of-your-own.md)'s sentence about a query string with two words changed, and the repetition is the point: a person who has read a `Query(T)` has already read this. A marker naming a variable that is not the field's own, the way `nilo_table` names a table, is not built: every Config that has needed one so far has been able to rename the field instead, and the roadmap holds it as an open question rather than a guess.
+The field name upper-cased is the variable, `database_url` is read from `DATABASE_URL`, a default is what "not set" means, and a `?T` is a setting that may be absent. A setting that is several values (`config.List`) or a group switched on by presence (a `?Struct`) is [ADR 289](./289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md). That is [ADR 011](./011-the-query-string-is-a-struct-of-your-own.md)'s sentence about a query string with two words changed, and the repetition is the point: a person who has read a `Query(T)` has already read this. A marker naming a variable that is not the field's own, the way `nilo_table` names a table, is not built: every Config that has needed one so far has been able to rename the field instead, and the roadmap holds it as an open question rather than a guess.
 
 **Every bad setting is named at once, and that is the feature.** Not the reading, which is forty lines. `value()` is optional the way ADR 034's is, so there is no way to reach past a failure into a half-filled struct and serve on a port nobody set:
 
@@ -41,7 +41,7 @@ The field name upper-cased is the variable, `database_url` is read from `DATABAS
   LOG_LEVEL has to be one of debug, info, warn, not "verbose"
 ```
 
-**Four reasons, and it stays four.** `missing`, `not_a_number`, `not_true_or_false`, `not_a_choice`. Whether the port is one this machine may bind is the program's own question, and a reason set that grew to answer it would be a validation language wearing a smaller name, the sentence ADR 034 wrote about `Bound`, binding here for the same reason.
+**Five reasons, and it stays five.** `missing`, `not_a_number`, `not_true_or_false`, `not_a_choice`, and `too_many` for a list longer than its type has room for ([ADR 289](./289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md); it was four until a setting could be a list). Whether the port is one this machine may bind is the program's own question, and a reason set that grew to answer it would be a validation language wearing a smaller name, the sentence ADR 034 wrote about `Bound`, binding here for the same reason.
 
 **It reads `[]const u8`, not `Str`, and the module imports nothing at all.** A `Str` is text that belongs to a request and goes stale when it ends; the trap that enforces it is that module's whole reason for existing. Settings are read once and held for the life of the process, so every `Str` here would be a `Str.static`, a lifetime annotation on text with no lifetime question. `getPosix` hands back a slice of the block the operating system gave the process, which outlives every use of it, and `[]const u8` says exactly that and nothing more.
 
@@ -79,7 +79,7 @@ Taking text rather than a path is what keeps `Dotenv` inside this layer: it allo
   line 3 sets "MY KEY", which is not a name an environment variable may carry
 ```
 
-**Four reasons a line is not a setting, and they are all about shape:** `no_equals`, `empty_name`, `bad_name`, `unbalanced_quote`, one level down from the "four, and it stays four" above. Whether the value itself is any good is `convert.Reason`'s question, `PORT=soon` parses perfectly here and fails there, and that split keeps this file from growing a second opinion about types.
+**Four reasons a line is not a setting, and they are all about shape:** `no_equals`, `empty_name`, `bad_name`, `unbalanced_quote`, one level down from the "five, and it stays five" above. Whether the value itself is any good is `convert.Reason`'s question, `PORT=soon` parses perfectly here and fails there, and that split keeps this file from growing a second opinion about types.
 
 **The grammar is small, and what it refuses is the decision.** `NAME=value`, blank lines, `#` comments on their own line, `'` and `"` quoting, an optional `export ` prefix, and CRLF. No escapes, no multi-line values, no `${OTHER}` interpolation, and no comment after a value: `PASSWORD=abc#123` stays intact, and `PORT=8080 # the port` becomes `PORT has to be a whole number, not "8080 # the port"`, which says exactly what happened without this file guessing where a comment started. A strict rule that reports itself beats a lenient one that guesses.
 

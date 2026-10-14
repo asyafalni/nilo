@@ -234,6 +234,18 @@ pub const App = struct {
     /// by `boundPort()` from whichever thread asks. 0 is "not yet", and a
     /// unix socket.
     bound_port: std.atomic.Value(u16) = .init(0),
+    /// Stored once, last, by `serverStarting` when every boot step has
+    /// finished: the services are started, what `before` registered has run,
+    /// the services' checks have passed and the spawned work is going. The
+    /// port is taken earlier than that (nothing is accepted before the boot
+    /// work is done, but the socket exists), so `boundPort()` says "a socket
+    /// exists" and this says "the boot work is over". Read by
+    /// `testing.Live.start`, which returns on this and not on the port, so a
+    /// test that seeds through a service right after it does not race the
+    /// boot. Not public: `nilo_ready` and `app.health` already answer "can
+    /// this process do its job", and a second public meaning of ready beside
+    /// them has no reader.
+    boot_done: std.atomic.Value(bool) = .init(false),
     /// The part of `listen()`'s options a request reads rather than the
     /// socket, copied out once when the server starts. Defaults stand for
     /// an App a test drives directly, which never calls `listen()`; a test
@@ -1420,6 +1432,13 @@ pub const App = struct {
     /// falls back to another port. The one-line explanations still go to
     /// the log; what changes is that the error comes back as a value.
     pub fn tryListen(self: *App, options_: bulkhead.Options) !void {
+        // **First, before anything can observe the new run.** Both are stored
+        // once a boot and never cleared on the way out, so an App that listens
+        // again after `stop` would say "ready, on the old port" to a
+        // `Live.start` (or a supervisor) polling `boundPort` and `boot_done`
+        // until this boot reached `serverStarting`.
+        self.boot_done.store(false, .release);
+        self.bound_port.store(0, .release);
         log_mod.configure(options_.log);
         wiring.checkRootWiring(options_.log.format);
         wiring.warnLoopbackInContainer(options_.address, options_.also);
@@ -1663,6 +1682,7 @@ pub const App = struct {
         try self.checkServiceHooks(io);
         try self.startBackground(io);
         try wiring.startFollowing(self);
+        self.boot_done.store(true, .release);
     }
 
     /// Run what every service declared as `nilo_check`, once, after the

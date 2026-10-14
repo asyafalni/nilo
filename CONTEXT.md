@@ -42,6 +42,10 @@ _Avoid_: adapter, abstraction layer, interface
 The object standing for one request in flight, and all the control over it. This is nilo's real API — every layer above it turns into calls to this while compiling.
 _Avoid_: Context, Request context, c
 
+**Presence**:
+Whether the client of a request is still there: `here`, `half_closed` (it sent a FIN after saying it was finished sending, or its HTTP/2 connection's input ended, and may be waiting for its answer) or `gone` (a reset, an error, a FIN from a client that had not said it was finished, an HTTP/2 `RST_STREAM`). Asked with `c.presence()` or `c.gone()` and **asked again, never kept**: a FIN is a `close()` and a `shutdown(SHUT_WR)` alike until the server writes. Not `c.peer()`, which is the address of the other end.
+_Avoid_: disconnected, cancelled (that is `error.Canceled`: the server stopping or a deadline), client state
+
 **Scope**:
 One lifetime and the memory that belongs to it, asked for as exactly two calls: `arena()` and `str()`. A Ctx is the Scope a request has, and the only one the framework itself ever hands out. It is a shape checked while compiling rather than an interface with a function table, so a module that takes one generates the same code it would have generated naming Ctx.
 _Avoid_: context, allocator, session, unit of work, lifetime

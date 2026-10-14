@@ -2251,6 +2251,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// , .{});
         /// ```
         ///
+        /// **Placeholders are `$1`, `$2`, ... on both databases**, as in `raw`
+        /// (ADR 204). The text is run-time, so it cannot be respelled while
+        /// compiling: Postgres reads `$n` itself, and the SQLite Wire binds
+        /// each placeholder by the name SQLite gives it, so `SET a = $2 WHERE
+        /// n = $1` changes the row it names. Every bare `?` works on
+        /// SQLite too, but not mixed with numbered ones, and with no number
+        /// skipped (`?2` alone is refused). A `:name` is refused (`exec` takes a tuple), and so is
+        /// a `$3` given two values or a value nothing names: `QueryFailed`,
+        /// with the message in `sql.problem`.
+        ///
         /// This module still did not write the statement, so the column check
         /// it gives up is the same one `raw` gives up. What it keeps is the
         /// pool, the Scope and the seven errors.
@@ -8892,6 +8902,48 @@ test "db.exec answers with the rows it changed and needs no Row to do it" {
     errdefer tx.rollback();
     _ = try tx.exec(&run, "CREATE INDEX accounts_email ON accounts(email)", .{});
     try tx.commit();
+}
+
+test "db.exec reads $n the way db.raw does, so a $2 before a $1 changes the row it names" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:exec-dollar-order?mode=memory&cache=shared",
+        .{ .size = 1, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, "CREATE TABLE apps (name TEXT PRIMARY KEY, region TEXT, owner TEXT)", .{});
+    _ = try db.exec(&run, "INSERT INTO apps VALUES ('web', 'old', 'old'), ('api', 'old', 'old')", .{});
+
+    const sql = "UPDATE apps SET region = $2, owner = $3 WHERE name = $1";
+    try testing.expectEqual(@as(usize, 1), try db.exec(&run, sql, .{ "web", "eu", "ops" }));
+
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    try testing.expectEqual(@as(usize, 1), try tx.exec(&run, sql, .{ "api", "us", "dev" }));
+    // A refusal is not a failed statement: the transaction goes on.
+    try testing.expectError(error.QueryFailed, tx.exec(&run, "UPDATE apps SET region = $3 WHERE name = $1", .{ "api", "x" }));
+    try testing.expectEqual(@as(usize, 1), try tx.exec(&run, "UPDATE apps SET owner = ? WHERE name = ?", .{ "ops", "api" }));
+    try tx.commit();
+
+    const Apps = struct {
+        pub const nilo_table = .{ .name = "apps", .key = .name };
+        name: nilo.Str,
+        region: nilo.Str,
+        owner: nilo.Str,
+    };
+    const rows = try db.raw(Apps, &run, "SELECT name, region, owner FROM apps ORDER BY name", .{});
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("us", rows[0].region.view());
+    try testing.expectEqualStrings("ops", rows[0].owner.view());
+    try testing.expectEqualStrings("eu", rows[1].region.view());
+    try testing.expectEqualStrings("ops", rows[1].owner.view());
 }
 
 test "a Db can be stopped, and stopping it twice or deiniting after is a no-op" {

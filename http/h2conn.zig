@@ -289,6 +289,10 @@ const Shared = struct {
     running: std.atomic.Value(u32) = .init(0),
     /// What the calls' pipes are guarded by (ADR 260).
     monitor: bulkhead.Monitor = .init,
+    /// The connection's input ended and its socket was not reset, with calls
+    /// perhaps still running: a client that stopped sending and may still be
+    /// reading (ADR 287). Read by the calls, so it lives here.
+    input_ended: std.atomic.Value(bool) = .init(false),
     /// A call has told the connection something through its pipe: bytes it
     /// has read, a `100 Continue` it wants sent, room it asks for.
     attention: std.atomic.Value(bool) = .init(false),
@@ -522,6 +526,12 @@ const Stream = struct {
     /// can stop it midway, and still counts against the cap until it does;
     /// its answer is thrown away.
     reset: bool = false,
+    /// The client has gone: it reset this stream, or its connection was lost
+    /// (ADR 287). Stored by the connection's fiber **before** it wakes the
+    /// call's pipe, and read by the call from any thread, a blocking worker
+    /// included, which is why it is not `reset`, a plain `bool` that is also
+    /// the call's own; and not `inbox.failure`, where the first reason stands.
+    departed: std.atomic.Value(bool) = .init(false),
     /// The pipe a streamed answer is written through, published by the call
     /// once its head is out (`@atomicStore`) and null for a whole answer. In
     /// the arena, so a stream that never streams pays a pointer for it.
@@ -926,7 +936,7 @@ const Conn = struct {
             c.readFrame() catch |err| {
                 // Gone is a client that stopped sending, which may still be
                 // reading: what it is owed is written on the way out.
-                if (err != error.Gone) c.goawayFor(err);
+                if (err == error.Gone) c.inputEnded() else c.goawayFor(err);
                 break;
             };
         }
@@ -935,6 +945,21 @@ const Conn = struct {
         // Nothing more is read: a call still waiting for its body is told so.
         c.abortInbound(false);
         c.windDown();
+    }
+
+    /// The input ended. A reset or an error on the socket says the client is
+    /// gone, and the calls running are told so; a plain FIN says only that it
+    /// stopped sending (ADR 287). The calls asking are woken either way.
+    fn inputEnded(c: *Conn) void {
+        if (c.waker.watching().hangup() == .reset) {
+            for (c.streams.items) |s| {
+                if (s.state == .running) s.departed.store(true, .release);
+            }
+        }
+        c.shared.input_ended.store(true, .release);
+        for (c.streams.items) |s| {
+            if (s.state == .running) s.inbox.nudge();
+        }
     }
 
     const Waited = enum { readable, posted, again, stop };
@@ -1242,6 +1267,7 @@ const Conn = struct {
     fn abortInbound(c: *Conn, everything: bool) void {
         for (c.streams.items) |s| {
             if (s.state != .running) continue;
+            if (everything) s.departed.store(true, .release);
             if (s.open or everything) s.inbox.fail(.gone);
         }
         c.settle();
@@ -2054,6 +2080,7 @@ const Conn = struct {
                     return s.destroy();
                 }
                 s.reset = true;
+                s.departed.store(true, .release);
                 if (s.open) {
                     s.open = false;
                     c.letGo(s);
@@ -2971,7 +2998,14 @@ fn answer(s: *Stream, in_flight: *fail.InFlight) !void {
     // where it lies and held once for as long as the client's window keeps
     // it. Any other request is answered as HTTP, and a route's headers kept
     // as whole lines are read into fields for it.
-    var collected: framing.Collected = .{ .arena = a, .front = if (s.grpc) grpc.prefix_len else 0, .lines = !s.grpc };
+    var collected: framing.Collected = .{
+        .arena = a,
+        .front = if (s.grpc) grpc.prefix_len else 0,
+        .lines = !s.grpc,
+        .departed = &s.departed,
+        .input_ended = &s.shared.input_ended,
+        .parker = &s.inbox,
+    };
     // Any request but a gRPC call can stream its answer, through a pipe the
     // connection writes (ADR 260).
     if (!s.grpc) collected.streamer = .{

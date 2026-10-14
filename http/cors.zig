@@ -1,4 +1,5 @@
-//! The CORS middleware.
+//! The CORS middleware: `with` (a list written in the program), `reading` (a list
+//! filled before `listen()`) and `deciding` (a question asked per request).
 //!
 //! ```zig
 //! try app.use(cors.permissive);                       // fine for a public API
@@ -156,6 +157,11 @@ pub const Origins = struct {
         }
         // `csrf.with`'s rule, which it applies while compiling: a browser
         // sends a scheme, `://`, a host and maybe a port, and never a path.
+        // A byte `setHeader` would refuse (a space, a control byte) is no part
+        // of one either, and `originOf` relies on that for what a client sends.
+        for (origin) |byte| {
+            if (byte <= ' ' or byte == 0x7f) return error.OriginNotAnOrigin;
+        }
         const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return error.OriginNotAnOrigin;
         if (std.mem.indexOfScalar(u8, origin[scheme_end + "://".len ..], '/') != null) {
             return error.OriginNotAnOrigin;
@@ -240,6 +246,152 @@ pub fn reading(comptime held: *Origins, comptime options: Options) mw.Middleware
             );
         }
     }.run;
+}
+
+/// The CORS middleware, asking the program per request whether an origin is
+/// allowed (ADR 088).
+///
+/// `reading` serves a deployment fact fixed at boot. This serves an origin list
+/// that changes while the server runs: a collector whose allowed domains are
+/// rows in a database, a multi-tenant API storing each tenant's origins. The
+/// program owns the data and its lock; nilo owns the headers.
+///
+/// ```zig
+/// fn allows(apps: *RumApps, origin: []const u8) bool {
+///     return apps.hasOrigin(origin);
+/// }
+///
+/// try app.provide(&rum_apps);
+/// try app.use(nilo.cors.deciding(allows, .{ .methods = "POST, OPTIONS" }));
+/// ```
+///
+/// `decide` is read the way a typed middleware's arguments are (ADR 008): every
+/// argument but the last is a pointer, a service the App provides, and a
+/// missing one stops `listen()` with the same sentence a typed middleware's
+/// does. The last is the request's `Origin`, as text, valid for the call only.
+/// It returns `bool`. Up to two services.
+///
+/// On `true` the origin goes out as `Access-Control-Allow-Origin`, copied into
+/// the request arena (`setHeader`), because those are the request's bytes and
+/// not the program's. Everything else (the preflight, methods, headers,
+/// credentials, max age, `Vary: Origin` on every response) is comptime exactly
+/// as `with`'s is. A request with no `Origin` is not cross-origin and `decide`
+/// is not called. **`decide` only ever sees a well-formed origin**: a scheme,
+/// `://`, a host and maybe a port, in lower case. The origin `null` (any site
+/// can make one, so trusting it trusts every site), an empty value, `*`, a
+/// value with a path and one with a capital are treated as no `Origin` at all
+/// (ADR 088).
+///
+/// **`decide` sees services and the origin, not the route.** A preflight is
+/// answered before a handler is chosen, and carries no body or key, so what it
+/// asks is only "may this origin talk to this server at all". A finer check
+/// (this origin against the app the request's key names) belongs to the
+/// handler, which has the request.
+///
+/// Cost: nothing on routes without it. On one with it, an indirect call per
+/// request carrying an `Origin`, whatever `decide` does, and one arena copy of
+/// the origin when it is allowed.
+pub fn deciding(comptime decide: anytype, comptime options: Options) @TypeOf(Deciding(decide, options).run) {
+    return Deciding(decide, options).run;
+}
+
+fn Deciding(comptime decide: anytype, comptime options: Options) type {
+    comptime checkDeciding(decide, options);
+    const params = @typeInfo(@TypeOf(decide)).@"fn".param_types;
+    return switch (params.len) {
+        1 => struct {
+            fn run(c: *Ctx, next: mw.Next) anyerror!void {
+                const sent = originOf(c);
+                const ok = if (sent) |o| decide(o) else false;
+                return answer(c, next, options, if (ok) sent else null);
+            }
+        },
+        2 => struct {
+            fn run(c: *Ctx, next: mw.Next, a: params[0].?) anyerror!void {
+                const sent = originOf(c);
+                const ok = if (sent) |o| decide(a, o) else false;
+                return answer(c, next, options, if (ok) sent else null);
+            }
+        },
+        3 => struct {
+            fn run(c: *Ctx, next: mw.Next, a: params[0].?, b: params[1].?) anyerror!void {
+                const sent = originOf(c);
+                const ok = if (sent) |o| decide(a, b, o) else false;
+                return answer(c, next, options, if (ok) sent else null);
+            }
+        },
+        else => unreachable,
+    };
+}
+
+/// The request's `Origin`, or null when it has none or sent something that is
+/// not an origin: `null`, an empty value, `*`, a path, a capital. `Origins`
+/// refuses the same shapes in a list, and a client can send any text, so the
+/// function given to `deciding` only ever sees a well-formed one and a byte
+/// `setHeader` would refuse never reaches it (ADR 088). Such a request is
+/// answered as one with no `Origin`: no `Access-Control-Allow-Origin`, and
+/// `Vary: Origin` still set.
+fn originOf(c: *Ctx) ?[]const u8 {
+    const sent = (c.header("Origin") orelse return null).view();
+    Origins.checkOne(sent) catch return null;
+    return sent;
+}
+
+/// What `deciding` does once the decision is made: the headers, the preflight,
+/// the rest of the chain. `allowed` is the request's own `Origin` or null.
+fn answer(c: *Ctx, next: mw.Next, comptime options: Options, allowed: ?[]const u8) anyerror!void {
+    try c.setStaticHeader("Vary", "Origin");
+    if (allowed) |origin| try c.setHeader("Access-Control-Allow-Origin", origin);
+
+    if (comptime options.credentials) {
+        try c.setStaticHeader("Access-Control-Allow-Credentials", "true");
+    }
+    if (comptime options.expose.len > 0) {
+        try c.setStaticHeader("Access-Control-Expose-Headers", options.expose);
+    }
+
+    if (c.method == .OPTIONS and c.header("Access-Control-Request-Method") != null) {
+        try c.setStaticHeader("Access-Control-Allow-Methods", options.methods);
+        try c.setStaticHeader("Access-Control-Allow-Headers", options.headers);
+        if (comptime options.max_age > 0) {
+            try c.setStaticHeader("Access-Control-Max-Age", maxAgeText(options));
+        }
+        return c.sendEmpty(204);
+    }
+
+    return next.run(c);
+}
+
+fn checkDeciding(comptime decide: anytype, comptime options: Options) void {
+    comptime {
+        if (options.origins.len != 1 or !std.mem.eql(u8, options.origins[0], "*")) @compileError(
+            "nilo: cors.deciding asks your function which origins are allowed, so the " ++
+                "`.origins` field has nothing to do.\n  Drop it, or use " ++
+                "`cors.with(.{ .origins = … })` if the list is known while compiling.",
+        );
+        const shape = "\n  Write `fn (services: *Apps, origin: []const u8) bool`: up to two " ++
+            "services the App provides, then the origin as text, returning `bool`.";
+        const T = @TypeOf(decide);
+        if (@typeInfo(T) != .@"fn") @compileError(
+            "nilo: cors.deciding takes a function, and this is a " ++ @typeName(T) ++ "." ++ shape,
+        );
+        const info = @typeInfo(T).@"fn";
+        if (info.is_generic or info.attrs.varargs or info.param_types.len == 0 or info.param_types.len > 3 or
+            info.param_types[info.param_types.len - 1].? != []const u8) @compileError(
+            "nilo: the function given to cors.deciding has to end with the origin as a " ++
+                "`[]const u8`, after at most two services." ++ shape,
+        );
+        if (info.return_type.? != bool) @compileError(
+            "nilo: the function given to cors.deciding returns a " ++ @typeName(info.return_type.?) ++
+                ", and it has to return a `bool`: true to allow the origin." ++ shape,
+        );
+        for (info.param_types[0 .. info.param_types.len - 1]) |p| {
+            if (@typeInfo(p.?) != .pointer or @typeInfo(p.?).pointer.size != .one) @compileError(
+                "nilo: an argument before the origin of the function given to cors.deciding is a " ++
+                    @typeName(p.?) ++ ", and it has to be a pointer to a service the App provides." ++ shape,
+            );
+        }
+    }
 }
 
 /// The one thing that can be wrong with a `reading` call: naming origins in

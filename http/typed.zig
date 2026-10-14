@@ -58,6 +58,7 @@ const cached_mod = @import("cached.zig");
 const str_mod = @import("nilo_core");
 const resolve = @import("resolve.zig");
 const openapi = @import("openapi.zig");
+const statusunion = @import("statusunion.zig");
 const patch_mod = @import("patch.zig");
 const bound_mod = @import("bound.zig");
 const filebody = @import("filebody.zig");
@@ -430,6 +431,10 @@ fn answersWithAFile(comptime R: type) bool {
         };
         if (@typeInfo(V) == .optional) V = @typeInfo(V).optional.child;
         if (filebody.isFileBody(V)) return true;
+        if (statusunion.is(V)) {
+            for (@typeInfo(V).@"union".field_types) |A| if (answersWithAFile(A)) return true;
+            return false;
+        }
         if ((hasNamedDecl(V, "nilo_response") or versioned_mod.isVersioned(V)) and @hasField(V, "value"))
             return answersWithAFile(@FieldType(V, "value"));
         return false;
@@ -1051,6 +1056,11 @@ fn renderAnswer(c: *Ctx, spelling: anytype, result: anytype) !Rendered {
     const value = if (@typeInfo(R) == .error_union) try result else result;
     const T = @TypeOf(value);
 
+    // An arm of a union of answers is rendered as the `Status` it is (ADR 286).
+    if (comptime statusunion.is(T)) switch (value) {
+        inline else => |arm| return renderAnswer(c, spelling, arm),
+    };
+
     var own_headers: []const http1.Header = &.{};
     var own_trailers: []const http1.Header = &.{};
     var status: u16 = 200;
@@ -1419,7 +1429,26 @@ fn answerOf(comptime Fn: type) openapi.Answer {
             .error_union => |u| u.payload,
             else => Returned,
         };
+        return answerOfValue(V);
+    }
+}
+
+/// `answerOf` for the value a handler returns once its error union is off.
+/// A union of `Status` arms is its first arm's answer with the rest beside
+/// it, so the document writes one response each (ADR 286).
+fn answerOfValue(comptime V: type) openapi.Answer {
+    comptime {
+        const empty = openapi.Answer{ .status = 200, .content_type = "", .schema = null };
         if (V == void) return empty;
+
+        if (statusunion.is(V)) {
+            const arms = @typeInfo(V).@"union".field_types;
+            var first = answerOfValue(arms[0]);
+            var rest: []const openapi.Answer = &.{};
+            for (arms[1..]) |A| rest = rest ++ [_]openapi.Answer{answerOfValue(A)};
+            first.also = rest;
+            return first;
+        }
 
         // A redirect has no body to describe and a status that is part of
         // the type, so it is the most completely described thing a
@@ -1521,11 +1550,25 @@ pub fn check(comptime pattern: []const u8, comptime handler: anytype) void {
 fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
     comptime {
         const Returned = @typeInfo(Fn).@"fn".return_type orelse return;
-        var V = switch (@typeInfo(Returned)) {
+        const V = switch (@typeInfo(Returned)) {
             .error_union => |u| u.payload,
             else => Returned,
         };
         if (V == void) return;
+        if (statusunion.is(V)) {
+            statusunion.check(pattern, V);
+            for (@typeInfo(V).@"union".field_types) |A| checkAnswerOf(pattern, Fn, A);
+            return;
+        }
+        checkAnswerOf(pattern, Fn, V);
+    }
+}
+
+/// `checkAnswer` for one value the handler answers with: the return type
+/// itself, or an arm of a union of them (ADR 286).
+fn checkAnswerOf(comptime pattern: []const u8, comptime Fn: type, comptime Answered: type) void {
+    comptime {
+        var V = Answered;
         verified_mod.checkNotAnswered(pattern, V);
         checkOptionalInside(pattern, V);
         // Before the `Response` unwrap, because one of the things it
@@ -1568,6 +1611,13 @@ fn checkOptionalInside(comptime pattern: []const u8, comptime V: type) void {
     comptime {
         if (@typeInfo(V) != .optional) return;
         const Inner = @typeInfo(V).optional.child;
+        if (statusunion.is(Inner)) @compileError(
+            "nilo: the handler for route \"" ++ pattern ++ "\" returns " ++ naming.of(V) ++
+                ", and the `?` has to go inside the arm it is about.\n" ++
+                "  A union of answers names a status for each arm, and a `?` outside it has no " ++
+                "status to be a 404 beside. Write `Status(200, ?T)` on the arm whose value may " ++
+                "not be there, or return `nilo.fail.notFound(\"there is no {f}\", .{c.path()})`.",
+        );
         if (hasNamedDecl(Inner, "nilo_response")) {
             const Body = Inner.nilo_response;
             const wrapper = if (hasNamedDecl(Inner, "nilo_status"))
@@ -2455,6 +2505,13 @@ fn sendResult(c: *Ctx, spelling: anytype, result: anytype) !void {
     const T = @TypeOf(value);
 
     if (T == void) return;
+    // A union of `Status(code, T)` arms (ADR 286): one switch on the tag,
+    // and the arm goes out through the path a bare `Status` takes, so its
+    // writer, headers and trailers are the ones a plain handler has. Not
+    // compiled into a handler that returns anything else.
+    if (comptime statusunion.is(T)) switch (value) {
+        inline else => |arm| return sendResult(c, spelling, arm),
+    };
     // Before `nilo_response`, and carrying no body of its own: a redirect
     // is a status and a Location, and its `headers` are how a sign-in sends
     // a `Set-Cookie` on the way out (ADR 031).

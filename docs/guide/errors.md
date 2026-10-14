@@ -29,7 +29,7 @@ Each of them stores the status and the message where the request will find them,
 | `fail.internal(…)` | 500, and the message **is sent** to the client, so keep the database's words and anything else internal out of it |
 | `fail.status(code, …)` | any status you like |
 
-The message is formatted into a fixed slot of **240 bytes**, with no allocation. A longer message is cut short, not refused; a list of field names in a body's 400 is shortened to `…, and 6 more` before it can be. The message is for the person reading the response, so say what was wrong and what would work: `fail.notFound("no user {d}", .{id})` is better than `fail.notFound("not found", .{})`.
+The message is formatted into a fixed slot of **240 bytes**, with no allocation. A longer one is kept whole in the request's arena, up to **16 KiB**, so a 400 that lists everything an operator has to fix reaches them to the last item ([ADR 286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md)). Outside a request (work registered with `app.before`, a plain test) there is no arena, and the message is cut at 240 bytes; it is cut at a character, never inside one, and never refused. A gRPC call is told the first KiB of it. A list of field names in a body's 400 is shortened to `…, and 6 more` before it can be. The message is for the person reading the response, so say what was wrong and what would work: `fail.notFound("no user {d}", .{id})` is better than `fail.notFound("not found", .{})`.
 
 [ADR 004](../adr/004-http-errors-via-fail-functions.md) and [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md) explain how the message gets back to the response without a `Ctx`.
 
@@ -119,6 +119,45 @@ try expectEqualStrings("no user 99", parsed.value.object.get("error").?.string);
 ```
 
 The message is the sentence any other client would get. The code comes from the error first, `error.AlreadyExists` as `already_exists` and `error.RolledBack` as `aborted`, and from the status otherwise, by the table [gRPC](./grpc.md#errors-and-grpc-status-codes) uses. The status stays the one nilo chose, so your logs and metrics read the same either way. Connect's shape wins over one you named with `app.failures`, because a Connect client reads nothing else; every request without the header still gets yours ([ADR 257](../adr/257-a-connect-client-is-told-its-failure-in-connect-words.md)).
+
+## One handler, several typed answers
+
+**When a second status has a body of its own, say so in the return type.** A `fail` call is a status and a sentence. A search bar that underlines the token a query went wrong at needs a 400 with an `offset` beside the sentence, and a form that is told the version it conflicted with needs a 409 with that number. Return a `union(enum)` whose every arm is a `Status(code, T)`:
+
+<!-- compiles -->
+```zig
+const Hits = struct { total: u32 };
+const Invalid = struct { message: []const u8, offset: u32 };
+const Q = struct { q: Str };
+
+const Search = union(enum) {
+    found: nilo.Status(200, Hits),
+    refused: nilo.Status(400, Invalid),
+};
+
+fn search(query: nilo.Query(Q)) !Search {
+    if (std.mem.indexOfScalar(u8, query.value.q.view(), '(')) |at| return .{ .refused = .{
+        .value = .{ .message = "unbalanced parenthesis", .offset = @intCast(at) },
+    } };
+    return .{ .found = .{ .value = .{ .total = 3 } } };
+}
+
+fn routes(app: *nilo.App) !void {
+    try app.get("/search", search);
+}
+```
+
+```
+$ curl -i 'localhost:8787/search?q=a(b'
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"message":"unbalanced parenthesis","offset":1}
+```
+
+Each arm goes out the way a plain `Status` does, with its headers and its JSON, and the document lists one response per arm, each with its schema. A union costs one switch on the tag; a handler that does not return one pays nothing. An error returned with `!` is a `fail` exactly as before. Two arms with one status, an arm that is not a `Status(code, T)`, and `?Search` are each a compile error that names the fix. An arm cannot be a `Response(T)`, whose status is only known while the request runs, which is the one thing the document needs to list it ([ADR 286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md)).
+
+When the route can also be refused by nilo itself with the same status, here a `Query` that does not fit is a 400, the document writes that response as either body (`oneOf` your schema and `Failure`), because a client can meet both.
 
 ## Request ids
 

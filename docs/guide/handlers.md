@@ -57,6 +57,7 @@ A mistake here stops the compiler with a message that names the route and says h
 | `?T` | 200 with the value, or **404** when it is null |
 | `Status(code, T)` | that status, and headers if you set any |
 | `Response(T)` | a status picked while the handler runs, and headers |
+| a `union(enum)` of `Status(code, T)` arms | the arm returned; each arm is a response in the document ([Errors](./errors.md#one-handler-several-typed-answers)) |
 | `Redirect(status)` | that status and a `Location`, no body ([Responses](./responses.md#redirects)) |
 | `FileBody`, `?FileBody` | a file on disk, sent without passing through your process; `?` is the same 404 ([Responses](./responses.md#files)) |
 | a type with `nilo_content_type` and `nilo_write` | whatever it writes, under that content type: XML, CSV, HTML of your own ([Responses](./responses.md#xml-csv-and-other-formats)) |

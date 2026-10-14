@@ -58,7 +58,7 @@ Start here to understand a part of nilo. Each page links into [`docs/adr/`](../a
 
 A topic with only one decision has no page; the ADR is the page.
 
-- config: [ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)
+- config: [ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md), [ADR 289](../adr/289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md)
 - pw: [ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)
 - build-dependencies: [ADR 066](../adr/066-a-lazy-dependency-is-a-request.md)
 - metrics: [ADR 079](../adr/079-the-route-table-is-the-registry.md)

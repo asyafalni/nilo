@@ -17,6 +17,7 @@ nilo.cors.with(.{ .origins = &.{…}, .methods = …, .headers = …,
                    .expose = …, .credentials = false, .max_age = 0 })
 
 nilo.cors.reading(&origins, .{ … })                     // the list read at run time
+nilo.cors.deciding(allows, .{ … })                      // a function asked per request
 
 nilo.csrf.sameOrigin                                    // 403 a cross-site POST, PUT, PATCH, DELETE
 nilo.csrf.with(.{ .origins = &.{…} })                   // …unless it came from one of these
@@ -72,6 +73,14 @@ The variable is a container-level `var` that outlives the App, because the addre
 | `nilo.cors.reading(&o, .{ … })` | the middleware. Passing `.origins` in the options is a compile error, because the list is `o`'s |
 
 **The text is borrowed and has to outlive the server.** The environment block and a `.env` file's text both do. Borrowing is what lets the matched origin be sent without copying, so a cross-origin request still allocates nothing. `"*"` is refused, because that is `cors.permissive`. A list nobody filled rejects every cross-origin request and logs it once.
+
+**`cors.deciding` is the same middleware asking your function per request**, for an origin list that changes while the server runs ([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)). A fact fixed at boot stays `reading`.
+
+| | |
+|---|---|
+| `nilo.cors.deciding(f, .{ … })` | `f` is `fn (services: *S…, origin: []const u8) bool`: up to two services the App provides, then the origin as text. A missing service stops `listen()`. Passing `.origins` is a compile error |
+
+It is called only for a request with an `Origin`, and only with a well-formed one (a scheme, `://`, a host and maybe a port, in lower case): `null`, an empty value, `*`, a path or a capital is treated as no `Origin`. It sees no route: a finer check belongs to the handler. The allowed origin is copied into the request arena. Nothing is added to a route that does not use it.
 
 ### `nilo.csrf`
 
@@ -218,6 +227,33 @@ while (try rows.next()) |row| {
 **The write is clamped too, in one case**: a deadline with less left than `write_timeout_ms` bounds the answer's writes, so a two-second route does not wait thirty seconds on a client that reads nothing. A deadline further off leaves each write on `write_timeout_ms`, which stops a client that has stopped reading but not one that takes a little every few seconds.
 
 A handler that fails while overdue, with nothing sent yet, gets a 503 naming the budget. One that finishes late still answers, because the work is done and correct, and the lateness is logged ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)). `deadline(0)` is a compile error.
+
+### The client leaving
+
+**A handler can ask whether its client is still there, and is not interrupted when it is not** ([ADR 287](../adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)). `c.gone()` is the question, `c.presence()` the three answers, and a loop on a blocking worker asks `nilo.gone()`, which is false outside a request so the same function runs in a plain test:
+
+<!-- compiles -->
+```zig
+fn scan(rows: u32) u32 {
+    var n: u32 = 0;
+    while (n < rows) : (n += 1) {
+        if (nilo.gone()) break; // the client aborted: stop spending the worker
+    }
+    return n;
+}
+
+fn search(c: *nilo.Ctx) !void {
+    const scanned = nilo.blocking(scan, .{1_000_000});
+    if (c.gone()) return error.ClientGone; // answers 499, for the log
+    try c.sendText(200, if (scanned > 0) "done" else "nothing");
+}
+```
+
+**A half-close is not a departure, and a FIN says which only once you write.** A client that sent `Connection: close` and `shutdown(SHUT_WR)` is `half_closed` and is waiting for its answer; a FIN from one that did not say it was finished is `gone`, which is what a closed tab or an aborted `fetch` sends. A reset, an error, an HTTP/2 `RST_STREAM` and a lost HTTP/2 connection are `gone`. The rule has a hole the other way: a keep-alive client that half-closes to say "that was my request" is `gone` and its work is abandoned. Ask `presence()` rather than `gone()` to treat the cases apart.
+
+**It costs a route that does not ask nothing, and 75 ns a question on HTTP/1.1** (one `poll(2)` with `POLLRDHUP`, which a client's earlier bytes do not hide; [the run](../../bench/result/http.md#what-asking-whether-the-client-is-there-costs)), so a loop asks between units of work and not per row. On HTTP/2 it reads what the connection knew already. A client whose TLS `close_notify` arrives with no FIN after it is not seen.
+
+**`c.sleepUnlessGone(ms)` is the wait that ends with it**: `.elapsed` or `.gone`, and `error.Canceled` stays the server's stop and the request's deadline. While it waits a quiet client costs no wakeup before the timer; if the client has sent bytes meanwhile (a pipelined request), the wait looks again once a second instead. A held event stream uses [`events.sleep(ms)`](./streaming.md#events).
 
 ### `nilo.bodyEncodings`
 

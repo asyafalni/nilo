@@ -34,6 +34,8 @@ while (try rows.next()) |row| {
 
 `c.timeLeftMs()` is the same answer as a number. Both answer safely on a route with no deadline: `overdue()` is false and `timeLeftMs()` is null, so asking does not require knowing what the route was registered with.
 
+**The client leaving is the same kind of question** (ADR 287). `c.gone()` is false while the client is there and true once it has reset or closed its connection, `nilo.gone()` is the same from a function on a blocking worker, and `c.sleepUnlessGone(ms)` is `nilo.sleep` that ends when it is. Nothing is interrupted for it either, for the reason above: a loop asks between units of work.
+
 ### The calls a route makes inherit what it has left
 
 **A call that leaves the process takes the shorter of its own bound and the time the route has left**, so `deadline(2000)` on a route is also two seconds on the `nilo_fetch` request, the `nilo_s3` object and the `nilo_sql` statement it makes, which Go's `context.WithTimeout` does by carrying the context into `QueryContext` and `NewRequestWithContext`. The Scope carries it ([ADR 144](144-a-scope-that-crosses-a-function-pointer.md)): a Scope that declares `timeLeftMs() ?u32` has a deadline, `Ctx` does, and `core.within(scope, own_ms)` is the shorter of the two, resolved while compiling, so a `nilo.Run` or an `AnyScope` (no declaration) gets its own bound back untouched and pays nothing. A duration rather than an instant, so the toolkit shares no clock with the Engine.

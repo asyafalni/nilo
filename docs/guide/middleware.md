@@ -158,6 +158,52 @@ Three things to know:
 - **`"*"` is rejected.** To allow anybody, use `cors.permissive`, which needs no list.
 - A list you never filled rejects every cross-origin request, so nilo says so in the log once, the first time it happens.
 
+### CORS origins that change while the server runs
+
+**When the allowed origins are rows your program edits while serving, ask a function with `cors.deciding`.** A collector with per-project allowed domains, or a multi-tenant API that stores each tenant's origins, cannot fill a list before `listen()`. `cors.reading` is for a fact fixed at boot; this is for one that changes ([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)). Your function takes the services it needs (pointers the App provides) and then the request's `Origin` as text, and says whether to allow it. You own the data and its lock (`nilo.Mutex`, which needs no `Io`):
+
+<!-- compiles -->
+```zig
+const Sites = struct {
+    lock: nilo.Mutex = .init,
+    origins: []const []const u8 = &.{},
+
+    /// Your own code replaces the list while the server runs.
+    fn replace(self: *Sites, origins: []const []const u8) void {
+        self.lock.lockUncancelable();
+        defer self.lock.unlock();
+        self.origins = origins;
+    }
+};
+
+fn originAllowed(sites: *Sites, origin: []const u8) bool {
+    // Look the origin up under the lock and release it before returning:
+    // the section copies nothing and waits for nothing.
+    sites.lock.lockUncancelable();
+    defer sites.lock.unlock();
+    for (sites.origins) |allowed| {
+        if (std.mem.eql(u8, allowed, origin)) return true;
+    }
+    return false;
+}
+
+pub fn wire(app: *nilo.App, sites: *Sites) !void {
+    try app.provide(sites);
+    try app.use(nilo.cors.deciding(originAllowed, .{
+        .methods = "POST, OPTIONS",
+        .credentials = true,
+    }));
+}
+```
+
+`.credentials = true` is safe here only because `originAllowed` compares the origin with the list exactly: an origin that is allowed with credentials lets that site read a signed-in user's responses, so a function that returned `true` for anything (`origin.len > 0`, say) would hand every site those responses. Drop `.credentials` if your lookup is any looser than an exact match. `nilo.Mutex` needs no `Io`, which a `decide` function is not given, so it is the lock to use; `lockUncancelable` is right because the section is short and cannot itself wait.
+
+Everything else is compile-time as in `with`, and `Vary: Origin` goes out on every response. A missing service stops `listen()` with the same sentence a typed middleware gets. Things to know:
+
+- **The function sees the services and the origin, not the route.** A preflight is answered before any handler is chosen, so it can only ask whether this origin may talk to the server at all. A finer check (this origin against the app the request's key names) belongs in the handler.
+- **It is called only for a request that carries an `Origin`**, and only ever with a well-formed one: a scheme, `://`, a host and maybe a port, in lower case. `null` (which any site can send), an empty value, `*`, a value with a path and a value with a capital are treated as no `Origin`, so there is no `Access-Control-Allow-Origin` and `Vary: Origin` is still set.
+- **The origin is copied into the request arena** when you allow it, because those bytes are the request's; no allocation reaches the heap.
+
 ## CSRF protection
 
 <!-- compiles: body -->

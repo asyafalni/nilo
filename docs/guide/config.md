@@ -20,7 +20,7 @@ const Settings = struct {
 };
 ```
 
-The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field can be text, a number, a `bool`, an enum, or any of those wrapped in `?`. Anything else is a compile error naming the field.
+The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field can be text, a number, a `bool`, an enum, or any of those wrapped in `?`; a list and a group are below. Anything else is a compile error naming the field.
 
 **Every bad setting is reported at once.** That is the reason to read them into a struct rather than one at a time:
 
@@ -30,6 +30,62 @@ The variable name is the field name in upper case: `database_url` is read from `
   DATABASE_URL is not set
   LOG_LEVEL has to be one of debug, info, warn, not "verbose"
 ```
+
+## A list in one variable
+
+**A setting that is several values is a `config.List(T, max)`, read from one variable with commas in it.** `ALLOWED_ORIGINS=https://a.com, https://b.com` is two entries: spaces around an entry go, an empty entry is skipped.
+
+<!-- compiles -->
+```zig
+const config = @import("nilo_config");
+
+const Brokers = struct {
+    allowed_origins: config.List([]const u8, 4),
+    kafka_brokers: config.List([]const u8, 3),
+    kafka_ports: ?config.List(u16, 3) = null,
+};
+
+fn firstBroker(settings: *const Brokers) []const u8 {
+    return settings.kafka_brokers.items()[0];
+}
+```
+
+The `4` is the room for entries, fixed while compiling, which is how nothing is allocated. More than that is a failure that says so (`ALLOWED_ORIGINS has room for 4 entries, not 5`), never a list quietly short, and a bad entry names its position (`KAFKA_PORTS entry 2 has to be a whole number, not "soon"`). Call `items()` on the settings you keep, not on a copy: the slice points into the struct. A default is `config.List(u16, 3).of(&.{9092})`. A `?List` is `null` when the variable is set to nothing, which is how an operator clears it; a plain `List` is then empty. The entries are the same text `cors.Origins.setSplit` splits (`read.given("allowed_origins")` is the variable as it arrived), so a program may use either.
+
+## A group switched on by presence
+
+**A `?` struct is a group of settings that is off unless one of its variables is set.** Mail is the usual case: no `SMTP_HOST`, no mail; with one, the rest are required.
+
+<!-- compiles -->
+```zig
+const config = @import("nilo_config");
+
+const Mailer = struct {
+    port: u16 = 8080,
+    smtp: ?struct {
+        host: []const u8,        // SMTP_HOST
+        port: u16,               // SMTP_PORT
+        user: []const u8,
+        password: []const u8,
+        starttls: bool = true,
+    } = null,
+};
+
+fn sendsMail(settings: *const Mailer) bool {
+    return settings.smtp != null;
+}
+```
+
+With only `SMTP_HOST=mail.example.com` set, the report is
+
+```
+3 settings could not be read from the environment:
+  SMTP_PORT is not set, and other SMTP_* settings are
+  SMTP_USER is not set, and other SMTP_* settings are
+  SMTP_PASSWORD is not set, and other SMTP_* settings are
+```
+
+A variable set to nothing but spaces does not switch the group on, so an `SMTP_HOST=` left in an example file means no mail. Once the group is on, a blank variable in it counts as not set too: a default is taken, an optional field is `null`, and a required one is reported as missing, so `SMTP_PORT=587` with `SMTP_HOST=` names `SMTP_HOST` instead of sending mail through a host of nothing. The layers combine per variable: `SMTP_HOST` from the environment and `SMTP_PASSWORD` from a `.env` are one group, and a variable in either turns it on. A group does not hold another group; put the second beside the first.
 
 ## A complete `main`
 

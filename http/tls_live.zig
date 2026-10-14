@@ -701,3 +701,97 @@ test "a second WebSocket frame that arrived over TLS with the first is echoed, n
     app.shutdown();
     thread.join();
 }
+
+// ---- a client that leaves while the handler waits (ADR 287) ----
+
+var tls_entered: std.atomic.Value(bool) = .init(false);
+var tls_finished: std.atomic.Value(bool) = .init(false);
+var tls_gone: std.atomic.Value(bool) = .init(false);
+var tls_ended_ns: std.atomic.Value(u64) = .init(0);
+
+fn tlsSleeper(c: *nilo.Ctx) anyerror!void {
+    tls_entered.store(true, .release);
+    const waited = try c.sleepUnlessGone(10_000);
+    tls_gone.store(waited == .gone, .release);
+    tls_ended_ns.store(@import("bulkhead.zig").monotonicNanos(), .release);
+    tls_finished.store(true, .release);
+    if (waited == .gone) return error.ClientGone;
+    try c.sendText(200, "late");
+}
+
+fn tlsWait(flag: *const std.atomic.Value(bool), ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 10) {
+        if (flag.load(.acquire)) return true;
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    return flag.load(.acquire);
+}
+
+/// One TLS request left unanswered, then the client goes the way `how` says.
+fn leavesTls(how: enum { abrupt, close_notify, reset }) !void {
+    hush();
+    tls_entered.store(false, .release);
+    tls_finished.store(false, .release);
+    tls_gone.store(false, .release);
+    tls_ended_ns.store(0, .release);
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/sleep", tlsSleeper);
+
+    var serving: ServingTls = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+    try client.client.writer.writeAll("GET /sleep HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.client.writer.flush();
+    try client.writer.interface.flush();
+    try testing.expect(tlsWait(&tls_entered, 3_000));
+    const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&ts, null);
+
+    const left = @import("bulkhead.zig").monotonicNanos();
+    switch (how) {
+        .abrupt => {},
+        .close_notify => {
+            try client.client.end();
+            try client.writer.interface.flush();
+        },
+        .reset => {
+            const Linger = extern struct { onoff: i32, linger: i32 };
+            const linger: Linger = .{ .onoff = 1, .linger = 0 };
+            _ = std.os.linux.setsockopt(stream.socket.handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.LINGER, std.mem.asBytes(&linger), @sizeOf(Linger));
+        },
+    }
+    stream.close(io);
+
+    try testing.expect(tlsWait(&tls_finished, 4_000));
+    try testing.expect(tls_gone.load(.acquire));
+    try testing.expect((tls_ended_ns.load(.acquire) -| left) / std.time.ns_per_ms < 1_500);
+}
+
+test "a TLS client that closes its socket is gone to the handler that waits for it" {
+    try leavesTls(.abrupt);
+}
+
+test "a TLS client that sends close_notify and then closes is gone, the alert not hiding the FIN" {
+    try leavesTls(.close_notify);
+}
+
+test "a TLS client that resets is gone" {
+    try leavesTls(.reset);
+}

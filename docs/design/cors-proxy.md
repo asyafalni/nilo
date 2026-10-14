@@ -4,7 +4,7 @@
 
 **Guide:** [The ones that come with it](../guide/middleware.md#built-in-logger-and-cors), [Who the client is](../guide/deploying.md#client-ip-address-behind-a-proxy) · **Reference:** [Middleware](../reference/middleware.md), [`listen` options](../reference/app.md#listen-options)
 
-The code is `http/cors.zig` (`Options`, `Origins`, `with`, `reading`, `permissive`), `http/csrf.zig` (`Options`, `with`, `reading`, `sameOrigin`) and `http/proxies.zig` (`Cidr`, `Forwarded`, `holds`).
+The code is `http/cors.zig` (`Options`, `Origins`, `with`, `reading`, `deciding`, `permissive`), `http/csrf.zig` (`Options`, `with`, `reading`, `sameOrigin`) and `http/proxies.zig` (`Cidr`, `Forwarded`, `holds`).
 
 ## Overview
 
@@ -38,6 +38,8 @@ All three answer the same kind of question: which of several possible answers is
 5. **`*` next to a named origin, an empty list, an empty entry, and `credentials` together with `*` are all rejected while compiling.** The last one is what makes credentials safe without a separate check: the combination browsers themselves reject cannot be built. [ADR 078](../adr/078-one-allow-origin-header-means-the-list-is-matched-not-formatted.md), [ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)
 6. **A front end's address belongs to the deployment, not the program, so `cors.reading(&origins, .{…})` reads its list from a variable the caller fills before `listen()`**, the same way `nilo_config` reads any other setting. Everything else (methods, headers, credentials, max age) stays compile-time, because none of it differs between deployments of the same service. [ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)
 6a. **The same holds for a rate limit's numbers and a CSP: `nilo.Late(T)` is a value stated in the program or the address of one filled before `listen()`**, one idiom for `cors.reading`'s cousin `maxBody`, `allowance` and `secure`. What cannot be refused while compiling is refused on the first request as a 500. [ADR 264](../adr/264-a-deployment-fact-is-a-late-value.md)
+
+6b. **An origin list that changes while the server runs is a service, asked per request: `cors.deciding(f, .{…})` calls `f(services…, origin) bool`.** A fact fixed at boot stays `reading`; one that changes is the program's own data behind its own lock. `f` sees services and the origin, never the route (a preflight has none), and is never given `null`. [ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)
 7. **The list is borrowed, not copied**, so its text must live as long as the server, like `.env` text and the environment block. That is what lets a matched origin go out through `setStaticHeader`, and it keeps a cross-origin request at zero allocations under `reading`, the same as under `with`. [ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)
 8. **A list nobody filled rejects every cross-origin request and logs it once**, using an atomic flag on a path a correctly configured server never reaches. [ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)
 9. **`X-Forwarded-For` is trusted by listing which machines may have written it, not by counting hops.** `.trusted_proxies` takes CIDRs, single addresses, or the names `"private"` and `"loopback"`, and it wins over the older `.trusted_hops` when both are set. `host()` and `scheme()` trust `X-Forwarded-Host` and `X-Forwarded-Proto` by the same rule, so no accessor believes a header another one rejects. [ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)
@@ -59,7 +61,7 @@ All three answer the same kind of question: which of several possible answers is
 | ADR | What it decides |
 |---|---|
 | [078](../adr/078-one-allow-origin-header-means-the-list-is-matched-not-formatted.md) | `origins` is a list to match, not a string to format, and what happens when nothing matches |
-| [088](../adr/088-an-origin-is-a-fact-about-the-deployment.md) | `cors.reading`, a list read at run time for the one setting that differs by deployment |
+| [088](../adr/088-an-origin-is-a-fact-about-the-deployment.md) | `cors.reading`, a list read at run time for the one setting that differs by deployment, and `cors.deciding` for one that changes while running |
 | [264](../adr/264-a-deployment-fact-is-a-late-value.md) | `nilo.Late(T)`: a value stated in the program or filled before `listen()`, for the rate limit and the CSP as well |
 | [102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md) | `trusted_proxies`: trust by address instead of by hop count |
 | [224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md) | `csrf`: a request that changes something is checked against `Sec-Fetch-Site` and `Origin`, and why not a token |

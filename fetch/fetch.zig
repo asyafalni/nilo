@@ -328,6 +328,33 @@ pub const Client = struct {
         /// ([ADR 272](../docs/adr/272-a-call-names-the-socket-it-goes-over.md)).
         /// A `Target` takes the path once, in `Open.unix_socket`.
         unix_socket: ?[]const u8 = null,
+        /// Whether an `https://` call checks the certificate. **`.verified`,
+        /// the default, checks the chain and the name**, and a certificate
+        /// the client does not trust is `error.TlsInitializationFailed`,
+        /// which is what std makes of a handshake that did not complete,
+        /// certificate failures included. **`.unverified` is the answer for a call that asks "does
+        /// it answer" and not "is its certificate good"**: an uptime or health
+        /// check of an appliance on its factory certificate. It trusts whoever
+        /// answers, so it is a per-call word and nowhere else: not on a
+        /// `Target`, not in `Settings`, which is why a default cannot be made
+        /// of it by accident. A call to a private authority's service wants
+        /// `Settings.roots`, not this. See `Tls` for what else it costs
+        /// ([ADR 290](../docs/adr/290-a-call-can-skip-the-certificate-check-and-only-that-call.md)).
+        tls: Tls = .verified,
+    };
+
+    /// Whether an `https://` call checks the certificate. See `Call.tls`.
+    pub const Tls = enum {
+        /// The chain against the client's roots and the name against the
+        /// URL's host. The default.
+        verified,
+        /// Nothing is checked, and **no server name is sent**:
+        /// `std.crypto.tls.Client` takes the name for the handshake and for
+        /// the check from the same option, so a host that picks its
+        /// certificate by name answers with its default one. Connections are
+        /// pooled apart from verified ones (a verified call never receives
+        /// one), and a followed redirect to another origin is verified again.
+        unverified,
     };
 
     pub const Error = error{
@@ -382,6 +409,13 @@ pub const Client = struct {
         /// is what the transport's own permissions already protect
         /// ([ADR 272](../docs/adr/272-a-call-names-the-socket-it-goes-over.md)).
         TlsOverSocket,
+        /// An `.unverified` `https://` call to a host that is not a name,
+        /// an IPv6 literal. std's TLS client takes the name for the
+        /// handshake from the same option that switches the check off, so
+        /// there is nothing to hand it, and the call is refused rather than
+        /// quietly verified ([ADR 290](../docs/adr/290-a-call-can-skip-the-certificate-check-and-only-that-call.md)).
+        /// An IPv4 literal is a valid host name and is answered.
+        UnverifiedNeedsHostName,
         /// `Call.unix_socket` is not an absolute path a socket address can
         /// hold (at most 107 bytes, no NUL).
         InvalidSocket,
@@ -483,7 +517,7 @@ pub const Client = struct {
 
     /// `p` as the `std.http.Client.Proxy` both std clients carry as their
     /// `http_proxy`. Only `http_proxy`: an `https://` call is tunnelled by
-    /// `Exchange.dialTunnel`, and `https_proxy` stays null so that std
+    /// `Exchange.dialTls`, and `https_proxy` stays null so that std
     /// cannot route one by itself, its tunnel being the one that sends text. `supports_connect` is false,
     /// so an `http://` call is sent to the proxy as std's forward-proxy form
     /// (the full URL on the request line, `Proxy-Authorization` after the
@@ -760,6 +794,7 @@ pub const Client = struct {
             .user_agent = if (given.user_agent) null else standing.user_agent,
             .timeout_ms = call.timeout_ms,
             .unix_socket = call.unix_socket,
+            .tls = call.tls,
             .route_left_ms = core.timeLeftOf(c),
             .stall_ms = call.stall_ms,
             .redirects = .{ .follow = &redirect_buffer },
@@ -1100,6 +1135,9 @@ pub const Exchange = struct {
         transfer_buffer: []u8 = &.{},
         /// `Call.unix_socket`, for a caller that drives an `Exchange`.
         unix_socket: ?[]const u8 = null,
+        /// `Call.tls`, for a caller that drives an `Exchange`. A followed
+        /// redirect to another origin is `.verified` again (ADR 290).
+        tls: Client.Tls = .verified,
     };
 
     /// What a 3xx with a `Location` means to a call. See `Begin.redirects`.
@@ -1108,7 +1146,7 @@ pub const Exchange = struct {
         refuse,
         /// The answer comes back as itself, 302 and all.
         expose,
-        /// Followed, at most three deep, with the `Location` resolved in
+        /// Followed, at most ten deep, with the `Location` resolved in
         /// this buffer; `head.redirected` says where it ended, and its text
         /// lives here (ADR 183).
         follow: []u8,
@@ -1357,14 +1395,15 @@ pub const Exchange = struct {
         // the decision (ADR 183).
         var here = uri;
         var hop = opts;
-        var rest = opts.redirects.buffer();
+        const room = opts.redirects.buffer();
+        var used: usize = 0;
         var left: u8 = max_redirects;
         var owned: []const std.http.Header = &.{};
         defer if (owned.len != 0) client.inner.allocator.free(owned);
         try self.dispatch(client, here, hop);
         while (opts.redirects == .follow and self.redirects()) {
             if (left == 0) return error.TooManyHttpRedirects;
-            try self.follow(&here, &hop, &rest, &owned);
+            try self.follow(&here, &hop, room, &used, &owned);
             left -= 1;
             try self.dispatch(client, here, hop);
         }
@@ -1414,6 +1453,7 @@ pub const Exchange = struct {
 
         self.announced = head.content_length;
         self.inner = self.res.reader(opts.transfer_buffer);
+        self.tap.vtable = &tap_vtable;
         self.reader = if (self.stall_ms != 0) &self.tap else self.inner;
         return head;
     }
@@ -1465,15 +1505,22 @@ pub const Exchange = struct {
         self: *Exchange,
         here: *std.Uri,
         hop: *Begin,
-        rest: *[]u8,
+        room: []u8,
+        used: *usize,
         owned: *[]const std.http.Header,
     ) Client.Error!void {
         const head = self.res.head;
         const said = head.location orelse return error.HttpRedirectLocationMissing;
+        // The buffer holds the URL the last hop ended at (`used` bytes from
+        // its start) and, after it, this hop's working room: the Location,
+        // what `resolveInPlace` merges, and the compacted result. Nothing of
+        // an earlier hop stays, so the buffer bounds one URL plus one
+        // Location and not the chain (ADR 183).
+        var rest = room[used.*..];
         if (said.len > rest.len) return error.HttpRedirectLocationOversize;
-        const location = rest.*[0..said.len];
+        const location = rest[0..said.len];
         @memcpy(location, said);
-        const next = here.resolveInPlace(location.len, rest) catch |err| switch (err) {
+        var next = here.resolveInPlace(location.len, &rest) catch |err| switch (err) {
             error.NoSpaceLeft => return error.HttpRedirectLocationOversize,
             else => return error.HttpRedirectLocationInvalid,
         };
@@ -1498,6 +1545,8 @@ pub const Exchange = struct {
         if (crossing == .other_origin) {
             next_hop.authorization = null;
             next_hop.host = null;
+            // Trust given to one origin is not given to the next (ADR 290).
+            next_hop.tls = .verified;
         }
         const lines = try trimmed(
             self.client.inner.allocator,
@@ -1520,8 +1569,49 @@ pub const Exchange = struct {
         self.open = false;
         self.announced = null;
 
+        used.* = try compact(room, room.len - rest.len, &next);
         here.* = next;
         hop.* = next_hop;
+    }
+
+    /// Move every piece of `uri` to the start of `room`, so the next hop
+    /// finds the buffer holding one URL and not the chain walked. The
+    /// pieces point into this hop's Location, into what `resolveInPlace`
+    /// merged and into the URL before, all in `room` below `scratch`, so
+    /// they are copied to `scratch` first and slid down after: the two
+    /// regions may overlap, which `copyForwards` allows because the
+    /// destination is lower. Returns the bytes the URL now takes.
+    fn compact(room: []u8, scratch: usize, uri: *std.Uri) Client.Error!usize {
+        var parts: [7]*[]const u8 = undefined;
+        var count: usize = 0;
+        parts[count] = &uri.scheme;
+        count += 1;
+        inline for (.{ &uri.user, &uri.password, &uri.host, &uri.query, &uri.fragment }) |field| {
+            if (field.*) |*component| {
+                parts[count] = switch (component.*) {
+                    inline else => |*text| text,
+                };
+                count += 1;
+            }
+        }
+        parts[count] = switch (uri.path) {
+            inline else => |*text| text,
+        };
+        count += 1;
+
+        var total: usize = 0;
+        for (parts[0..count]) |text| total += text.len;
+        if (total > room.len - scratch) return error.HttpRedirectLocationOversize;
+        var at: usize = 0;
+        var offsets: [7]usize = undefined;
+        for (parts[0..count], 0..) |text, i| {
+            @memcpy(room[scratch + at ..][0..text.len], text.*);
+            offsets[i] = at;
+            at += text.len;
+        }
+        std.mem.copyForwards(u8, room[0..total], room[scratch..][0..total]);
+        for (parts[0..count], 0..) |text, i| text.* = room[offsets[i]..][0..text.len];
+        return total;
     }
 
     /// What a redirect from one request's address to the next means for the
@@ -1643,6 +1733,33 @@ pub const Exchange = struct {
         .discard = tapDiscard,
     };
 
+    /// The tap of a body going out. Its stream goes `upload_step` bytes at a
+    /// time and is flushed down to the socket before the clock moves, so
+    /// the clock measures bytes the peer took and not bytes read from a
+    /// file: with the 64 KiB body writer buffer, a stamp per read was a
+    /// stamp per 64 KiB, and a healthy upload slower than 13 KB/s was
+    /// `Stalled` under a `stall_ms` of five seconds (ADR 056).
+    const upload_tap_vtable: std.Io.Reader.VTable = .{
+        .stream = uploadStream,
+        .discard = tapDiscard,
+    };
+
+    /// How much of a streamed body one stamp covers under a `stall_ms`:
+    /// the slowest healthy peer is `upload_step` over `stall_ms`, which is
+    /// 3.3 KB/s at five seconds. Read size is this too, while the clock is
+    /// on; without a `stall_ms` it is the whole `upload_chunk`.
+    const upload_step = 16 << 10;
+
+    fn uploadStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Exchange = @alignCast(@fieldParentPtr("tap", r));
+        const n = try self.inner.stream(w, limit.min(.limited(upload_step)));
+        // Down to the connection, which blocks while the peer's window is
+        // shut and so holds the stamp back with it.
+        try w.flush();
+        self.mark();
+        return n;
+    }
+
     fn tapStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *Exchange = @alignCast(@fieldParentPtr("tap", r));
         const n = try self.inner.stream(w, limit);
@@ -1685,7 +1802,7 @@ pub const Exchange = struct {
         const std_client = if (opts.body == .stream) &client.fresh else &client.inner;
         self.reused = false;
         self.heard = false;
-        const picked = try pickConnection(client, std_client, uri, opts.unix_socket);
+        const picked = try pickConnection(client, std_client, uri, opts.unix_socket, opts.tls);
         const pooled = picked.conn;
         self.req = std_client.request(opts.method, uri, .{
             .connection = pooled,
@@ -1783,7 +1900,7 @@ pub const Exchange = struct {
     ///
     /// With `Settings.proxy`, three more things are decided here and nowhere
     /// else (ADR 267). An `https://` call the proxy carries is tunnelled by
-    /// `dialTunnel`, because the tunnel std builds for it never starts TLS
+    /// `dialTls`, because the tunnel std builds for it never starts TLS
     /// and sends the request in the clear; one through a proxy that is
     /// itself `https://` is `error.TlsThroughProxy`, before anything is
     /// dialled. A call to a host on the
@@ -1796,7 +1913,7 @@ pub const Exchange = struct {
     /// `attempt`'s, which is on the stack for as long as a call waits
     /// (ADR 062). `attempt`'s frame is 0x718 bytes before this change in a
     /// stripped `ReleaseFast` program and 0x568 after.
-    noinline fn pickConnection(client: *const Client, std_client: *std.http.Client, uri: std.Uri, socket: ?[]const u8) !Pick {
+    noinline fn pickConnection(client: *const Client, std_client: *std.http.Client, uri: std.Uri, socket: ?[]const u8, tls: Client.Tls) !Pick {
         if (socket) |path| {
             // Before the proxy, which a socket never meets, and keyed by the
             // path as std's `connectUnix` would have keyed it (ADR 272).
@@ -1810,12 +1927,19 @@ pub const Exchange = struct {
         }
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return .{};
         var name: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = std.Io.net.HostName.fromUri(uri, &name) catch return .{};
+        const host = std.Io.net.HostName.fromUri(uri, &name) catch {
+            // A host that is not a name (an IPv6 literal) cannot be pooled
+            // under the marked key, and falling through to std would verify
+            // the call it was told not to (ADR 290).
+            if (protocol == .tls and tls == .unverified) return error.UnverifiedNeedsHostName;
+            return .{};
+        };
         const port = uri.port orelse switch (protocol) {
             .plain => @as(u16, 80),
             .tls => 443,
         };
         const pool = &std_client.connection_pool;
+        if (protocol == .tls and tls == .unverified) return pickUnverified(client, std_client, host, port);
         if (std_client.http_proxy) |proxy| {
             if (!client.skipsProxy(host.bytes)) {
                 if (protocol == .tls) {
@@ -1907,7 +2031,44 @@ pub const Exchange = struct {
     ) !Pick {
         const found = try std_client.connection_pool.findConnection(std_client.io, .{ .host = host, .port = port, .protocol = .tls });
         if (found) |conn| return .{ .conn = conn, .reused = true };
-        return .{ .conn = try dialTunnel(std_client, proxy, host, port) };
+        return .{ .conn = try dialTls(std_client, proxy, host, host, port, .verified) };
+    }
+
+    /// The mark that keeps an unverified connection apart in the pool. The
+    /// pool finds a connection by host, port and protocol and knows nothing
+    /// of verification, so an unverified connection is **stored under
+    /// `!host`**: no name a URL can carry begins with `!`, so a verified
+    /// call looking for `host` can never be handed it, and an unverified
+    /// call looking for `!host` can never be handed a verified one. The
+    /// key is the only place the difference lives, which is what makes the
+    /// separation structural rather than a branch somebody has to remember
+    /// (ADR 290). A host of 255 bytes has no room for the mark (a name is
+    /// 253 at most), and is refused.
+    const unverified_mark = "!";
+
+    /// An unverified `https://` call's connection: the one pooled under the
+    /// marked key, or a new one, through the proxy when `Settings.proxy`
+    /// carries the host and directly when not. Not inlined, for the reason
+    /// `pickConnection` is not.
+    noinline fn pickUnverified(
+        client: *const Client,
+        std_client: *std.http.Client,
+        host: std.Io.net.HostName,
+        port: u16,
+    ) !Pick {
+        if (host.bytes.len >= std.Io.net.HostName.max_len) return error.TlsInitializationFailed;
+        var key_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        key_buf[0] = unverified_mark[0];
+        @memcpy(key_buf[1..][0..host.bytes.len], host.bytes);
+        const key: std.Io.net.HostName = .{ .bytes = key_buf[0 .. host.bytes.len + 1] };
+        const found = try std_client.connection_pool.findConnection(std_client.io, .{ .host = key, .port = port, .protocol = .tls });
+        if (found) |conn| return .{ .conn = conn, .reused = true };
+        const proxy: ?*const std.http.Client.Proxy = if (std_client.http_proxy) |p|
+            if (client.skipsProxy(host.bytes)) null else p
+        else
+            null;
+        if (proxy) |p| if (p.protocol == .tls) return error.TlsThroughProxy;
+        return .{ .conn = try dialTls(std_client, proxy, host, key, port, .unverified) };
     }
 
     /// The node std's `Connection.Tls` is, field for field. std's own is
@@ -1953,11 +2114,13 @@ pub const Exchange = struct {
     /// A copy of a private layout is pinned like `dialUnix`'s: a
     /// `@compileError` unless the Zig is 0.17, and a test that dials, pools
     /// and closes one under the testing allocator (ADR 267).
-    noinline fn dialTunnel(
+    noinline fn dialTls(
         std_client: *std.http.Client,
-        proxy: *const std.http.Client.Proxy,
+        proxy: ?*const std.http.Client.Proxy,
         host: std.Io.net.HostName,
+        key: std.Io.net.HostName,
         port: u16,
+        verify: Client.Tls,
     ) !*std.http.Client.Connection {
         comptime if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17)
             @compileError("nilo: fetch lays out a tunnelled TLS Connection as std.http.Client.Connection.Tls does (std/http/Client.zig, Zig 0.17); " ++
@@ -1965,21 +2128,33 @@ pub const Exchange = struct {
         if (std.http.Client.disable_tls) return error.TlsInitializationFailed;
         const io = std_client.io;
         const gpa = std_client.allocator;
-        try ensureRoots(std_client);
+        // An unverified connection checks no certificate, so it has no use
+        // for the system's authorities and does not pay for scanning them:
+        // it takes the time from the clock (ADR 290).
+        const now: std.Io.Timestamp = switch (verify) {
+            .verified => blk: {
+                try ensureRoots(std_client);
+                break :blk std_client.now.?;
+            },
+            .unverified => std.Io.Clock.real.now(io),
+        };
 
-        var socket = try proxy.host.connect(io, proxy.port, .{ .mode = .stream });
+        var socket = if (proxy) |p|
+            try p.host.connect(io, p.port, .{ .mode = .stream })
+        else
+            try host.connect(io, port, .{ .mode = .stream });
         errdefer socket.close(io);
 
-        const alloc_len = TunnelTls.allocLen(std_client, host.bytes.len);
+        const alloc_len = TunnelTls.allocLen(std_client, key.bytes.len);
         const base = try gpa.alignedAlloc(u8, .of(TunnelTls), alloc_len);
         errdefer gpa.free(base);
-        const host_buffer = base[@sizeOf(TunnelTls)..][0..host.bytes.len];
+        const host_buffer = base[@sizeOf(TunnelTls)..][0..key.bytes.len];
         const tls_read_buffer = host_buffer.ptr[host_buffer.len..][0 .. std_client.tls_buffer_size + std_client.read_buffer_size];
         const tls_write_buffer = tls_read_buffer.ptr[tls_read_buffer.len..][0..std_client.tls_buffer_size];
         const socket_write_buffer = tls_write_buffer.ptr[tls_write_buffer.len..][0..std_client.write_buffer_size];
         const socket_read_buffer = socket_write_buffer.ptr[socket_write_buffer.len..][0..std_client.tls_buffer_size];
         std.debug.assert(base.ptr + alloc_len == socket_read_buffer.ptr + socket_read_buffer.len);
-        @memcpy(host_buffer, host.bytes);
+        @memcpy(host_buffer, key.bytes);
         const node: *TunnelTls = @ptrCast(base.ptr);
         node.connection = .{
             .client = std_client,
@@ -1987,13 +2162,13 @@ pub const Exchange = struct {
             .stream_reader = socket.reader(io, socket_read_buffer),
             .pool_node = .{},
             .port = port,
-            .host_len = @intCast(host.bytes.len),
+            .host_len = @intCast(key.bytes.len),
             .proxied = false,
             .closing = false,
             .protocol = .tls,
         };
 
-        try openTunnel(&node.connection.stream_reader.interface, &node.connection.stream_writer.interface, host.bytes, port, proxy.authorization);
+        if (proxy) |p| try openTunnel(&node.connection.stream_reader.interface, &node.connection.stream_writer.interface, host.bytes, port, p.authorization);
 
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         io.random(&entropy);
@@ -2001,18 +2176,24 @@ pub const Exchange = struct {
             &node.connection.stream_reader.interface,
             &node.connection.stream_writer.interface,
             .{
-                .host = .{ .explicit = host.bytes },
-                .ca = .{ .bundle = .{
-                    .gpa = gpa,
-                    .io = io,
-                    .lock = &std_client.ca_bundle_lock,
-                    .bundle = &std_client.ca_bundle,
-                } },
+                .host = switch (verify) {
+                    .verified => .{ .explicit = host.bytes },
+                    .unverified => .no_verification,
+                },
+                .ca = switch (verify) {
+                    .verified => .{ .bundle = .{
+                        .gpa = gpa,
+                        .io = io,
+                        .lock = &std_client.ca_bundle_lock,
+                        .bundle = &std_client.ca_bundle,
+                    } },
+                    .unverified => .no_verification,
+                },
                 .ssl_key_log = std_client.ssl_key_log,
                 .read_buffer = tls_read_buffer,
                 .write_buffer = socket_write_buffer,
                 .entropy = &entropy,
-                .realtime_now = std_client.now.?,
+                .realtime_now = now,
                 // HTTP says how long a body is, which is what detects a
                 // truncation; std makes the same choice for a direct call.
                 .allow_truncation_attacks = true,
@@ -2068,7 +2249,7 @@ pub const Exchange = struct {
     }
 
     /// What `std.http.Client.request` does before it picks a connection for
-    /// an `https://` call, which `dialTunnel` has to do itself because it
+    /// an `https://` call, which `dialTls` has to do itself because it
     /// runs first: unless the caller gave roots (`Settings.roots` sets
     /// `now` at start), scan the system's once and set `now`.
     fn ensureRoots(std_client: *std.http.Client) !void {
@@ -2129,6 +2310,9 @@ pub const Exchange = struct {
         self.res = res;
     }
 
+    /// How much of a streamed body is read at a time (ADR 056).
+    const upload_chunk = 64 << 10;
+
     /// The head and the body, with no opinion about what a failure means.
     fn send(self: *Exchange, opts: Begin) !void {
         const framed = opts.method.requestHasBody();
@@ -2155,18 +2339,34 @@ pub const Exchange = struct {
                 // every chunk that leaves it moves the silence clock: nothing
                 // arrives from the peer while a body goes out, and without
                 // this a transfer longer than `stall_ms` would be `Stalled`
-                // however fast it moved. The write buffer is a kilobyte, so
-                // a chunk out of the source is a chunk on its way to the
-                // socket, and a peer that stopped reading blocks the write
-                // and stops the stamps (ADR 056). `inner` is the body reader
-                // after the head arrives, and is this until then.
+                // however fast it moved. The body writer's buffer is 64 KiB,
+                // so a read is not a chunk on the wire; `uploadStream` reads
+                // `upload_step` at a time and flushes each before it stamps,
+                // so a peer that stopped reading blocks the flush and stops
+                // the stamps, and one that reads slowly keeps them coming
+                // (ADR 056). `inner` is the body reader after the head
+                // arrives, and is this until then.
                 const source = if (self.stall_ms != 0) src: {
                     self.inner = src.reader;
+                    self.tap.vtable = &upload_tap_vtable;
                     break :src &self.tap;
                 } else src.reader;
                 if (framed) {
                     self.req.transfer_encoding = .{ .content_length = src.len };
-                    var w = try self.req.sendBody(&.{});
+                    // **The body writer is given a buffer**, because a reader
+                    // that is not a slice already in memory asks its writer for
+                    // room to read into: a `File.Reader` does, and against a
+                    // writer of no capacity that is an assertion in std's
+                    // `defaultRebase`, not an error. It is also the size of one
+                    // read: a file is read `upload_chunk` bytes at a time, not
+                    // the kilobyte of the connection's own buffer. Heap, for
+                    // the life of this send, and only here: a stack buffer would
+                    // stay in the fiber's high-water mark for as long as the
+                    // connection lives (ADR 062), and a call that sends a body
+                    // from a reader is already a long one (ADR 056).
+                    const chunk = try self.client.inner.allocator.alloc(u8, upload_chunk);
+                    defer self.client.inner.allocator.free(chunk);
+                    var w = try self.req.sendBody(chunk);
                     // Exactly the length that was announced, and nothing else. A
                     // source that runs out early fails here rather than sending a
                     // body that disagrees with the head describing it.
@@ -2520,9 +2720,10 @@ pub const Exchange = struct {
         return @TypeOf(@call(.auto, f, @as(Args, undefined)));
     }
 
-    /// The most redirects one call follows. std's number, kept where the
-    /// head can tell a walked chain from an unwalked one.
-    const max_redirects = 3;
+    /// The most redirects one call follows: ten, what Go's `net/http` and
+    /// reqwest follow, and the bound on a loop (`error.TooManyHttpRedirects`)
+    /// as much as on a long chain (ADR 183).
+    const max_redirects = 10;
 
     /// Which of std's own six headers `Begin.headers` carries, so the slot
     /// can be left out and the caller's line sent once (ADR 182).

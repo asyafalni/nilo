@@ -561,7 +561,7 @@ pub noinline fn serveRequest(
     // and its id only if one is written (`log.zig`). Cleared on every way
     // out, so a line between two requests on a connection carries none.
     in_flight.request = &c;
-    in_flight.read_request = readRequest;
+    in_flight.request_ops = &request_ops;
     defer in_flight.request = null;
 
     // `listen()`'s deadline for every request, before the chain runs so a
@@ -967,7 +967,16 @@ const RESPONSE_501 = http1.staticResponse(501, failure_content_type, staticFailu
 
 const failure_content_type = "application/json";
 
-/// What `fail.InFlight.read_request` calls: a part of the Ctx it was given.
+/// What a fail function asks of the request through the slot: a part of it,
+/// and bytes from its arena for a message that does not fit the slot (ADR 024).
+const request_ops: fail.InFlight.RequestOps = .{ .read = readRequest, .alloc = allocRequest };
+
+fn allocRequest(p: *anyopaque, n: usize) ?[]u8 {
+    const c: *ctx_mod.Ctx = @ptrCast(@alignCast(p));
+    return c._arena.alloc(u8, n) catch null;
+}
+
+/// What `fail.InFlight.request_ops.read` calls: a part of the Ctx it was given.
 /// The id is made on the first ask and kept (`Ctx.requestId`).
 fn readRequest(p: *anyopaque, part: fail.InFlight.Part) []const u8 {
     const c: *ctx_mod.Ctx = @ptrCast(@alignCast(p));
@@ -993,10 +1002,15 @@ const RESPONSE_503_SHED: http1.Static = blk: {
     };
 };
 
-/// Room for the longest failure body there can be: a message at the Failure's
-/// ceiling where every byte needs the six-character `\u00xx` escape, plus the
-/// wrapper around it — nilo's own is 32 bytes, and a shape the application
-/// named (ADR 024) gets 256 for its envelope.
+/// How much of a failure's message a gRPC call is told (ADR 024).
+const grpc_message_max = 1024;
+
+/// Room on the stack for the longest failure body a message in the Failure's
+/// slot can make: a message at the slot's ceiling where every byte needs the
+/// six-character `\u00xx` escape, plus the wrapper around it; nilo's own is
+/// 32 bytes, and a shape the application named (ADR 024) gets 256 for its
+/// envelope. A longer message, kept whole in the request arena, has its body
+/// built in the arena too, so this frame is the size it always was.
 const failure_body_max = fail.max_message * 6 + 256;
 
 /// A failure body for a message known while compiling — no escaping, because
@@ -1019,6 +1033,23 @@ fn writeFailureBody(w: *std.Io.Writer, status: u16, message: []const u8) !void {
     // ADR 024 exists to prevent: so a byte that is not text becomes U+FFFD.
     try json.writeLossyString(w, message);
     try w.print(",\"status\":{d}}}", .{status});
+}
+
+/// The bytes a long failure's body needs in the arena: the larger of nilo's
+/// own shape and the application's, each measured by writing it nowhere. The
+/// shape is written in this pass as well as in the real one, so it has to give
+/// the same bytes both times, as every `nilo_failure` writer does.
+fn failureBodyLen(c: *Ctx, shape: ?failurebody.Write, status: u16, message: []const u8) usize {
+    var own = std.Io.Writer.Discarding.init(&.{});
+    writeFailureBody(&own.writer, status, message) catch {};
+    var most: usize = @intCast(own.fullCount());
+    if (shape) |write| {
+        var custom = std.Io.Writer.Discarding.init(&.{});
+        if (write(status, lossyMessage(c, message), &custom.writer)) |_| {
+            most = @max(most, @as(usize, @intCast(custom.fullCount())));
+        } else |_| {}
+    }
+    return most;
 }
 
 /// `message` as text a JSON writer cannot be handed a bad byte by, for a
@@ -1521,7 +1552,7 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
 /// program that has a message route (ADR 257).
 noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, app: *const App) !void {
     const status = fail.resolveStatus(failure, err);
-    const message: []const u8 = if (fail.failed(failure, err)) failure.message() else blk: {
+    var message: []const u8 = if (fail.failed(failure, err)) failure.message() else blk: {
         if (status == 500) {
             std.log.warn(
                 "handler {s} {s} failed: {s}",
@@ -1545,11 +1576,19 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, ap
         c.setStaticHeader("WWW-Authenticate", std.mem.span(with)) catch {};
     };
 
-    var buf: [failure_body_max]u8 = undefined;
-    var body: std.Io.Writer = .fixed(&buf);
+    var stack: [failure_body_max]u8 = undefined;
     // A Connect call is told in Connect's words whatever shape the App has,
     // since its client reads nothing else (ADR 257).
     const shape = if (app.failure_connect) |pick| pick(c._head, err) orelse app.failure_write else app.failure_write;
+    // A message too long for the slot was kept whole in the arena (ADR 024),
+    // and its body is built there as well, sized exactly by a counting pass
+    // over both shapes it may be written in. If the arena has no room now, the
+    // message is cut to the slot's, as it was when it was said.
+    const buf: []u8 = if (message.len <= fail.max_message) &stack else c._arena.alloc(u8, failureBodyLen(c, shape, status, message)) catch blk: {
+        message = message[0..fail.wholeCharacters(message[0..fail.max_message])];
+        break :blk &stack;
+    };
+    var body: std.Io.Writer = .fixed(buf);
     // A shape of the application's can outgrow the buffer — an envelope past
     // its 256 bytes — and then nilo's own shape goes out instead, with the
     // sentence intact: the first failure in development shows the wrong
@@ -1558,7 +1597,7 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, ap
     // (2,121 with two `{d}`s) for a line an App with no shape can never
     // reach, on every App.
     if (shape) |write| write(status, lossyMessage(c, message), &body) catch {
-        body = .fixed(&buf);
+        body = .fixed(buf);
         writeFailureBody(&body, status, message) catch unreachable; // sized for it, below
     };
     // The buffer is sized for the longest message a Failure can hold, so
@@ -1566,7 +1605,10 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, ap
     // far would not be JSON, and the status alone is better than that.
     // Said to the framing as well as written, so an envelope with codes of
     // its own can choose one from the error (ADR 220).
-    try c._framing.failed(err, message);
+    // A `grpc-message` is a header, percent-encoded to up to three times its
+    // length, and a client's limit on a header list is commonly 8 KiB, so a
+    // call is told the first KiB of a long message and an HTTP answer all of it.
+    try c._framing.failed(err, message[0..fail.wholeCharacters(message[0..@min(message.len, grpc_message_max)])]);
     if (shape == null) writeFailureBody(&body, status, message) catch {
         return sendDirect(c, status, "", "");
     };

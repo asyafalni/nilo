@@ -1,12 +1,14 @@
 //! An `https://` call through an egress proxy, against a real TLS server and a
-//! real `CONNECT` proxy ([ADR 267](../docs/adr/267-a-call-can-go-through-a-proxy-and-trust-a-private-authority.md)).
+//! real `CONNECT` proxy ([ADR 267](../docs/adr/267-a-call-can-go-through-a-proxy-and-trust-a-private-authority.md)),
+//! and a call that does not verify the certificate, against the same server
+//! when the client trusts nothing ([ADR 290](../docs/adr/290-a-call-can-skip-the-certificate-check-and-only-that-call.md)).
 //!
 //! `fetch/live.zig` has no TLS server, so until this file the claim that
 //! std's tunnel never starts TLS was a reading of `std.http.Client.connect`
 //! and not a run. The first test here is the run: std's own path, handed a
 //! proxy that supports `CONNECT`, is watched sending `GET` as text where a
 //! handshake belongs. It stays as a canary for the day std fixes it, when
-//! `Exchange.dialTunnel` can go.
+//! `Exchange.dialTls` can go.
 //!
 //! The server is nilo's own TLS listener on `http/testdata/tls/localhost.pem`,
 //! a self-signed certificate for `localhost` and `127.0.0.1`, which is also
@@ -41,6 +43,25 @@ fn hello() []const u8 {
     return "hello over tls\n";
 }
 
+/// A redirect that leaves the origin: `127.0.0.1` for the `localhost` the
+/// test called, on the same port. Written once the server is up, before
+/// any request, so the handler reads a settled value.
+var away_location: [64]u8 = undefined;
+var away_len: usize = 0;
+
+fn away() nilo.Redirect(302) {
+    return .to(away_location[0..away_len]);
+}
+
+/// A handler that redirects to `to`, one per hop of a chain.
+fn hopTo(comptime to: []const u8) fn () nilo.Redirect(302) {
+    return struct {
+        fn h() nilo.Redirect(302) {
+            return .to(to);
+        }
+    }.h;
+}
+
 /// The nilo TLS server on a thread of its own.
 const Server = struct {
     app: nilo.App,
@@ -50,6 +71,15 @@ const Server = struct {
     fn start(self: *Server, io: std.Io) !u16 {
         self.app = nilo.App.init(testing.allocator);
         try self.app.get("/", hello);
+        // A chain of five hops inside one origin, a loop, and a way out.
+        try self.app.get("/c5", hopTo("/c4"));
+        try self.app.get("/c4", hopTo("/c3"));
+        try self.app.get("/c3", hopTo("/c2"));
+        try self.app.get("/c2", hopTo("/c1"));
+        try self.app.get("/c1", hopTo("/"));
+        try self.app.get("/loop-a", hopTo("/loop-b"));
+        try self.app.get("/loop-b", hopTo("/loop-a"));
+        try self.app.get("/away", away);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         for (0..500) |_| {
             if (self.app.boundPort()) |port| return port;
@@ -227,6 +257,7 @@ const Rig = struct {
         const io = rig.threaded.io();
         rig.server_port = try rig.server.start(io);
         rig.proxy = try Proxy.open(io, rig.server_port);
+        away_len = (try std.fmt.bufPrint(&away_location, "https://127.0.0.1:{d}/", .{rig.server_port})).len;
         rig.roots = .empty;
         try rig.roots.addCertsFromFilePath(testing.allocator, io, std.Io.Clock.real.now(io), std.Io.Dir.cwd(), cert_path);
     }
@@ -429,4 +460,238 @@ test "a body streamed over a tunnel uses the client that pools nothing and still
     try testing.expect(head.status != .ok);
     ex.end();
     try testing.expectEqual(@as(u32, 1), rig.proxy.connects.load(.acquire));
+}
+
+// ---- a call that does not verify the certificate (ADR 290) ----
+
+/// A client that trusts no authority at all, so the server's self-signed
+/// certificate is refused by a verified call whatever the host's own store
+/// holds. `proxy` is the CONNECT proxy of the rig, or none.
+fn trustingNothing(io: std.Io, rig: *Rig, through_proxy: bool) !fetch.Client {
+    var url: [96]u8 = undefined;
+    var client: fetch.Client = .init(testing.allocator, .{
+        .roots = &no_roots,
+        .proxy = if (through_proxy) .{ .url = try std.fmt.bufPrint(&url, "http://127.0.0.1:{d}", .{rig.proxy.port}) } else null,
+    });
+    errdefer client.deinit();
+    try client.nilo_start(io, .none);
+    return client;
+}
+
+const no_roots: std.crypto.Certificate.Bundle = .empty;
+
+fn rigUrl(buf: []u8, rig: *const Rig, host: []const u8, path: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "https://{s}:{d}{s}", .{ host, rig.server_port, path });
+}
+
+test "a certificate the client does not trust is refused, and an unverified call to the same host is answered" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+    const target = try rigUrl(&buf, &rig, "localhost", "/");
+
+    // The control: verified, the certificate is nobody's.
+    try testing.expectError(error.TlsInitializationFailed, client.get(&scope, target, .{}));
+
+    const res = try client.get(&scope, target, .{ .tls = .unverified });
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expectEqualStrings("hello over tls\n", res.body.view());
+
+    // A name the certificate does not carry is no obstacle either, which
+    // is the other half of what is skipped.
+    var other: [64]u8 = undefined;
+    const wrong_name = try rigUrl(&other, &rig, "127.0.0.1", "/");
+    try testing.expectError(error.TlsInitializationFailed, client.get(&scope, wrong_name, .{}));
+    _ = try client.get(&scope, wrong_name, .{ .tls = .unverified });
+}
+
+test "an unverified call to an IPv6 literal is refused by name, not quietly verified" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buf, "https://[::1]:{d}/", .{rig.server_port});
+    try testing.expectError(error.UnverifiedNeedsHostName, client.get(&scope, target, .{ .tls = .unverified }));
+}
+
+test "a connection opened unverified is never handed to a verified call, and is kept for the next unverified one" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+    const target = try rigUrl(&buf, &rig, "localhost", "/");
+    const pool = &client.inner.connection_pool;
+
+    _ = try client.get(&scope, target, .{ .tls = .unverified });
+    // Kept, under the marked name and nowhere else.
+    try testing.expectEqual(@as(usize, 1), pool.free_len);
+    const kept: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", pool.free.first.?));
+    try testing.expectEqualStrings("!localhost", kept.host().bytes);
+
+    // The verified call to the same host, port and protocol does not take
+    // it: it dials, and the handshake is refused.
+    try testing.expectError(error.TlsInitializationFailed, client.get(&scope, target, .{}));
+    try testing.expectEqual(@as(usize, 1), pool.free_len);
+
+    // The next unverified call rides the one it left, not a second.
+    _ = try client.get(&scope, target, .{ .tls = .unverified });
+    try testing.expectEqual(@as(usize, 1), pool.free_len);
+}
+
+test "a connection opened verified is not the unverified call's, and the verified one is still pooled" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    // Trusting the server's certificate, so a verified call succeeds.
+    var client: fetch.Client = .init(testing.allocator, .{ .roots = &rig.roots });
+    defer client.deinit();
+    try client.nilo_start(io, .none);
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+    const target = try rigUrl(&buf, &rig, "localhost", "/");
+    const pool = &client.inner.connection_pool;
+
+    _ = try client.get(&scope, target, .{});
+    try testing.expectEqual(@as(usize, 1), pool.free_len);
+    _ = try client.get(&scope, target, .{ .tls = .unverified });
+    try testing.expectEqual(@as(usize, 2), pool.free_len);
+    _ = try client.get(&scope, target, .{});
+    _ = try client.get(&scope, target, .{ .tls = .unverified });
+    try testing.expectEqual(@as(usize, 2), pool.free_len);
+}
+
+test "an unverified call through a proxy is tunnelled and answered, and pooled apart from a verified one" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+    try rig.proxy.begin();
+
+    {
+        var client = try trustingNothing(io, &rig, true);
+        defer client.deinit();
+        var scope: core.Run = .init(testing.allocator);
+        defer scope.deinit();
+        var buf: [64]u8 = undefined;
+        const target = try rigUrl(&buf, &rig, "localhost", "/");
+
+        for (0..2) |_| {
+            const res = try client.get(&scope, target, .{ .tls = .unverified });
+            try testing.expectEqualStrings("hello over tls\n", res.body.view());
+        }
+        // One tunnel for both, and the verified call opens its own, which
+        // the server's certificate then fails.
+        try testing.expectEqual(@as(u32, 1), rig.proxy.connects.load(.acquire));
+        try testing.expectError(error.TlsInitializationFailed, client.get(&scope, target, .{}));
+    }
+    rig.proxy.finish();
+    try testing.expect(std.mem.startsWith(u8, rig.proxy.request(), "CONNECT localhost:"));
+}
+
+test "a followed redirect inside the origin stays unverified, five hops deep" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+
+    // `/c5` to `/c4` to `/c3` to `/c2` to `/c1` to `/`: five hops, past
+    // the three the limit used to be (ADR 183).
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    var redirect: [1 << 10]u8 = undefined;
+    const head = try ex.begin(&client, .{
+        .method = .GET,
+        .url = try rigUrl(&buf, &rig, "localhost", "/c5"),
+        .tls = .unverified,
+        .redirects = .{ .follow = &redirect },
+    });
+    try testing.expect(head.ok());
+    var where: [96]u8 = undefined;
+    var want: [64]u8 = undefined;
+    try testing.expectEqualStrings(try rigUrl(&want, &rig, "localhost", "/"), (try head.location(&where)).?);
+    const body = try ex.take(&scope, 1 << 10);
+    try testing.expectEqualStrings("hello over tls\n", body.view());
+}
+
+test "a followed redirect to another origin is verified again, and the certificate there is refused" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var scope: core.Run = .init(testing.allocator);
+    defer scope.deinit();
+    var buf: [64]u8 = undefined;
+
+    // `localhost` to `127.0.0.1`: another origin, so the permission
+    // given to the first does not follow.
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    var redirect: [1 << 10]u8 = undefined;
+    try testing.expectError(error.TlsInitializationFailed, ex.begin(&client, .{
+        .method = .GET,
+        .url = try rigUrl(&buf, &rig, "localhost", "/away"),
+        .tls = .unverified,
+        .redirects = .{ .follow = &redirect },
+    }));
+}
+
+test "a redirect loop ends at the limit with the documented error" {
+    var rig: Rig = undefined;
+    try rig.up();
+    defer rig.down();
+    const io = rig.loop();
+
+    var client = try trustingNothing(io, &rig, false);
+    defer client.deinit();
+    var buf: [64]u8 = undefined;
+
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    var redirect: [1 << 10]u8 = undefined;
+    try testing.expectError(error.TooManyHttpRedirects, ex.begin(&client, .{
+        .method = .GET,
+        .url = try rigUrl(&buf, &rig, "localhost", "/loop-a"),
+        .tls = .unverified,
+        .redirects = .{ .follow = &redirect },
+    }));
+}
+
+test "no setting and no target can turn verification off, only a call" {
+    try testing.expect(@hasField(fetch.Client.Call, "tls"));
+    try testing.expect(!@hasField(fetch.Client.Settings, "tls"));
+    const T = fetch.Target("probe", .{});
+    const Open = @FieldType(std.meta.ArgsTuple(@TypeOf(T.open)), "1");
+    try testing.expect(!@hasField(Open, "tls"));
+    try testing.expect(!@hasField(@TypeOf(T.options), "tls"));
 }

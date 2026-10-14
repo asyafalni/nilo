@@ -365,6 +365,42 @@ pub const Inbox = struct {
         return self.failure;
     }
 
+    /// Sleep for `ms`, or until the client has gone: `departed` is set by the
+    /// connection's fiber before it calls `fail`, which wakes this park. For
+    /// a call that waits and asks for no body (ADR 287); it neither sets
+    /// `failure` nor counts as blocked, as a plain `sleep` would not. A call
+    /// with nothing to park on, run with no Engine, sleeps plain.
+    pub fn sleepUnlessDeparted(self: *Inbox, ms: u32, departed: *const std.atomic.Value(bool), also: ?*const std.atomic.Value(bool)) error{Canceled}!bulkhead.Waited {
+        if (departed.load(.acquire)) return .gone;
+        if (also) |a| if (a.load(.acquire)) return .gone;
+        if (!self.can_park) {
+            try bulkhead.sleep(ms);
+            return if (departed.load(.acquire)) .gone else .elapsed;
+        }
+        const until = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        self.link.monitor.enter();
+        defer self.link.monitor.leave();
+        while (true) {
+            if (departed.load(.acquire)) return .gone;
+            if (also) |a| if (a.load(.acquire)) return .gone;
+            const now = bulkhead.monotonicNanos();
+            if (now >= until) return .elapsed;
+            const left_ms = (until - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+            self.wake.wait(self.link.monitor, left_ms) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.TimedOut => {},
+            };
+        }
+    }
+
+    /// Wake a call parked in `sleepUnlessDeparted`, after the flag it reads
+    /// has been stored.
+    pub fn nudge(self: *Inbox) void {
+        self.link.monitor.enter();
+        defer self.link.monitor.leave();
+        self.wakeLocked();
+    }
+
     /// Park until woken or `deadline_ns` (0 for no bound of its own), whichever
     /// is first, clamped to the request's deadline. The monitor is held on the
     /// way in and out. False when the bound passed: `failure` is set then.

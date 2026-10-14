@@ -113,6 +113,10 @@ pub const Canned = struct {
     /// `requestBody` reads it out.
     body_seen: [1024]u8 = undefined,
     body_seen_len: usize = 0,
+    /// A Wyhash (seed 0) and a count of every body byte `serveWithBody` read, the 1 KiB kept or not: a body that lost a
+    /// block in the middle matches in the bytes kept and in nothing else.
+    body_hash: u64 = 0,
+    body_total: u64 = 0,
     /// How many connections have been accepted — see `serveEach`.
     accepted: usize = 0,
     /// Set by `serveReapThenBody` once it has closed the first connection, so
@@ -498,6 +502,22 @@ pub const Canned = struct {
         const body_len = try self.readHead(&reader.interface);
         self.body_seen_len = @min(body_len, self.body_seen.len);
         try reader.interface.readSliceAll(self.body_seen[0..self.body_seen_len]);
+        var hash: std.hash.Wyhash = .init(0);
+        hash.update(self.body_seen[0..self.body_seen_len]);
+        // The rest is read and dropped, as `serveOne` does: a server that
+        // answers and closes with a body unread resets the connection under
+        // a client still writing, and a test of a large upload sees that
+        // instead of the answer. It goes through the hash on its way.
+        var left: u64 = body_len - self.body_seen_len;
+        var scratch: [16 << 10]u8 = undefined;
+        while (left != 0) {
+            const n: usize = @intCast(@min(left, scratch.len));
+            try reader.interface.readSliceAll(scratch[0..n]);
+            hash.update(scratch[0..n]);
+            left -= n;
+        }
+        self.body_hash = hash.final();
+        self.body_total = body_len;
 
         var out_buf: [4 << 10]u8 = undefined;
         var writer = stream.writer(self.io, &out_buf);

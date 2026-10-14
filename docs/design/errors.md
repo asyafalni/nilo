@@ -11,7 +11,7 @@ The code is `http/fail.zig` (`Failure`, `InFlight`, `fail.*`), `http/serve.zig` 
 ```
   handler body
      │
-     ├─ fail.notFound("no user {d}", .{id})   ──► Failure (240-byte buffer, bound to the fiber)
+     ├─ fail.notFound("no user {d}", .{id})   ──► Failure (240-byte slot, bound to the fiber)
      │                                                │
      ├─ an ordinary Zig error (db, allocator, …) ─────┤
      │                                                ▼
@@ -25,11 +25,12 @@ The code is `http/fail.zig` (`Failure`, `InFlight`, `fail.*`), `http/serve.zig` 
 
 1. **A fail function stores a message and returns an error, and it can be called without a `*Ctx`.** `fail.notFound("no user {d}", .{id})` works in any function a handler calls, so the typed layer does not collapse into everything needing a Ctx. [ADR 004](../adr/004-http-errors-via-fail-functions.md)
 2. **An ordinary Zig error is still answered.** Any error a handler returns that did not come from a fail function goes through a mapping table; an unknown error becomes a 500 and is logged by name. [ADR 004](../adr/004-http-errors-via-fail-functions.md)
-3. **The message is stored in a fixed 240-byte buffer on the `Failure`, not in the request arena.** Failing must not be able to fail, so a longer message is truncated instead of risking an allocation. [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md)
+3. **The message is stored in a fixed 240-byte slot on the `Failure`; one that does not fit is kept whole in the request arena, up to 16 KiB, when a request holds one.** Failing must not be able to fail, so the common message never allocates, the slot never grows, and outside a request, or when the arena has no room, the message is cut at 240 bytes as it always was. [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md), [ADR 286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md)
 4. **The `Failure` is tied to the fiber (through `zio.TaskLocal`), never to the OS thread.** Many fibers share a thread, and a handler that sleeps can resume on a different one. With a `threadlocal`, fiber A's message could end up in fiber B's response, leaking data between users. [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md)
 5. **Each connection has one `Failure`, cleared at the start of every request.** A message from a previous request on a reused connection can never carry over. [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md)
 6. **Outside the Engine, a threadlocal fallback stands in for the fiber slot.** Unit tests call `App` directly with no fiber and no socket. On a real server the fiber slot always exists and always takes priority. [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md)
 7. **`!?T` means the value may be missing: returning null answers 404, and the return type says so.** The API document reads this exactly as it reads the success type, so there is nothing extra to keep in sync (full rule on [`openapi`](./openapi.md)). [ADR 023](../adr/023-a-failure-mode-belongs-in-the-return-type.md)
+8. **A handler may return a `union(enum)` of `Status(code, T)` arms**, and the document lists one response per arm; two arms with one status are a compile error. [ADR 286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md)
 8. **`Status(code, T)` puts a chosen status in the type; `Response(T)` keeps it a runtime field.** Both carry the same headers and behave the same at run time; only the first lets the document show the real code instead of `default`. [ADR 023](../adr/023-a-failure-mode-belongs-in-the-return-type.md)
 9. **Every failure answers as JSON, `{"error": "…", "status": …}` by default.** It uses the same fixed stack buffer and the same send path as a handler's own answer, so a 405 keeps its `Allow` header and a 401 its challenge. [ADR 024](../adr/024-every-failure-answers-as-json.md)
 10. **`app.failures(T)` lets the application define its own error shape once.** `T.nilo_failure(status, message) T` fills it in, nilo writes it with the same JSON writer a handler's answer uses, and the document builds `components.schemas.Failure` from `T`'s fields, so the wire and the document cannot disagree. Calling it a second time returns `error.FailureShapeAlreadySet`. [ADR 024](../adr/024-every-failure-answers-as-json.md)
@@ -43,8 +44,9 @@ The code is `http/fail.zig` (`Failure`, `InFlight`, `fail.*`), `http/serve.zig` 
 | ADR | What it decides |
 |---|---|
 | [004](../adr/004-http-errors-via-fail-functions.md) | Fail functions, callable from anywhere, storing a message for the request currently running |
-| [006](../adr/006-failure-box-bound-to-the-fiber.md) | The `Failure` is tied to the fiber, not the thread, and capped at 240 bytes with no allocation |
+| [006](../adr/006-failure-box-bound-to-the-fiber.md) | The `Failure` is tied to the fiber, not the thread; its slot is 240 bytes with no allocation, and a longer message goes to the request arena (286) |
 | [023](../adr/023-a-failure-mode-belongs-in-the-return-type.md) | `!?T` documents a 404 and `Status(code, T)` a chosen status; every other failure is a body-only `fail.*` call |
+| [286](../adr/286-a-handler-may-answer-in-several-typed-statuses.md) | A union of `Status` arms answers in several typed statuses, one response each in the document; a fail message past 240 bytes is kept whole in the request arena up to 16 KiB |
 | [024](../adr/024-every-failure-answers-as-json.md) | Every failure answers as JSON; `app.failures(T)` lets the application define its own shape once |
 | [257](../adr/257-a-connect-client-is-told-its-failure-in-connect-words.md) | A Connect call's failure is `{"code","message"}`, over the App's shape (topic framing) |
 | [074](../adr/074-a-type-says-its-own-name.md) | A nilo type carries `nilo_type_name`, so a message names the type the reader imported |
@@ -53,4 +55,4 @@ Related topics: a panic stopping the process and naming the request, instead of 
 
 ## Open questions
 
-- **The API document shows one failure per route, and real endpoints have several.** `!?T` puts a 404 in the document because the signature says so; a `fail.conflict` on a duplicate email is a line inside a function and stays invisible. This is kept as the rule rather than treated as a gap, because widening it would mean a second place to declare a failure. It would be reopened only by a way to state a failure in the type. Recorded in [`docs/decided.md`](../decided.md).
+- **A `fail.conflict` on a duplicate email is a line inside a function and stays out of the document.** `!?T` puts a 404 there because the signature says so, and a `union(enum)` of `Status` arms puts each of its statuses there (ADR 286); a failure thrown from a body is still a sentence the document does not see. A per-field failure list (ADR 024, ADR 034) and an App-wide error-to-status table (`fail.statusFor`) are the two pieces of the roadmap direction "A failure is a type" not yet built; ADR 286 says how each sits on this.

@@ -1203,3 +1203,248 @@ test "an event stream handed to an HTTP/2 connection is sent comments while it i
     try testing.expectEqual(@as(?u32, @backingInt(h2.ErrorCode.no_error)), wire.goaway_code);
     try waitSeats(io, &room, 0);
 }
+
+// ---- a client that leaves an HTTP/2 call (ADR 287) ----
+
+var g_entered: std.atomic.Value(bool) = .init(false);
+var g_finished: std.atomic.Value(bool) = .init(false);
+/// 0 nothing yet, 1 `.elapsed`, 2 `.gone`.
+var g_outcome: std.atomic.Value(u8) = .init(0);
+var g_ended_ns: std.atomic.Value(u64) = .init(0);
+var g_presence: std.atomic.Value(u8) = .init(255);
+var g_units: std.atomic.Value(u32) = .init(0);
+
+fn gReset() void {
+    g_entered.store(false, .release);
+    g_finished.store(false, .release);
+    g_outcome.store(0, .release);
+    g_ended_ns.store(0, .release);
+    g_presence.store(255, .release);
+    g_units.store(0, .release);
+}
+
+fn gRecord(c: *nilo.Ctx, w: bulkhead.Waited) void {
+    g_outcome.store(if (w == .gone) 2 else 1, .release);
+    g_ended_ns.store(bulkhead.monotonicNanos(), .release);
+    g_presence.store(@intFromEnum(c.presence()), .release);
+}
+
+fn goneSleeper(c: *nilo.Ctx) anyerror!void {
+    g_entered.store(true, .release);
+    const w = try c.sleepUnlessGone(10_000);
+    gRecord(c, w);
+    g_finished.store(true, .release);
+    if (w == .gone) return error.ClientGone;
+    try c.sendText(200, "late");
+}
+
+fn goneBrief(c: *nilo.Ctx) anyerror!void {
+    g_entered.store(true, .release);
+    const w = try c.sleepUnlessGone(400);
+    gRecord(c, w);
+    g_finished.store(true, .release);
+    try c.sendText(200, "answered");
+}
+
+fn goneSearch() u32 {
+    var n: u32 = 0;
+    while (n < 1_000) : (n += 1) {
+        if (nilo.gone()) return n;
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    return n;
+}
+
+fn goneSearcher(c: *nilo.Ctx) anyerror!void {
+    g_entered.store(true, .release);
+    const n = nilo.blocking(goneSearch, .{});
+    g_units.store(n, .release);
+    g_ended_ns.store(bulkhead.monotonicNanos(), .release);
+    g_finished.store(true, .release);
+    try c.sendText(200, "done");
+}
+
+fn gWait(flag: *const std.atomic.Value(bool), io: std.Io, ms: u64) bool {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 10) {
+        if (flag.load(.acquire)) return true;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return flag.load(.acquire);
+}
+
+fn gSinceMs(t_ns: u64) u64 {
+    return (g_ended_ns.load(.acquire) -| t_ns) / std.time.ns_per_ms;
+}
+
+/// A server with the four routes above, on a unix socket.
+const GoneServer = struct {
+    where: live.SocketDir,
+    app: nilo.App,
+    serving: live.Serving,
+    thread: std.Thread,
+
+    fn up(self: *GoneServer, io: std.Io, name: []const u8) !void {
+        live.hush();
+        gReset();
+        self.where = try live.SocketDir.init(std.heap.smp_allocator, name);
+        self.app = nilo.App.init(std.heap.smp_allocator);
+        try self.app.get("/sleep", goneSleeper);
+        try self.app.get("/brief", goneBrief);
+        try self.app.get("/search", goneSearcher);
+        self.serving = .{ .app = &self.app, .path = self.where.path };
+        self.thread = try std.Thread.spawn(.{}, live.Serving.run, .{&self.serving});
+        try self.serving.waitUntilUp(io);
+    }
+
+    fn down(self: *GoneServer) void {
+        if (self.serving.bound.load(.acquire)) self.app.shutdown();
+        self.thread.join();
+        self.app.deinit();
+        self.where.deinit(std.heap.smp_allocator);
+    }
+};
+
+fn openGet(w: *std.Io.Writer, path: []const u8) !void {
+    try w.writeAll(h2.preface);
+    try h2.writeSettings(w, &.{});
+    try writeGet(w, 1, path);
+    try w.flush();
+}
+
+test "a reset stream is gone at once to a call that sleeps and to a function on a worker, and a client's GOAWAY is neither" {
+    var server: GoneServer = undefined;
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try server.up(io, "h2gone-reset.sock");
+    defer server.down();
+
+    // RST_STREAM while the call sleeps.
+    {
+        var stream = try live.connect(io, server.where.path);
+        defer stream.close(io);
+        var out_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &out_buf);
+        var in_buf: [4096]u8 = undefined;
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
+        const w = &writer.interface;
+        var wire = Wire.init(std.heap.smp_allocator);
+        defer wire.deinit();
+        try openGet(w, "/sleep");
+        try testing.expect(gWait(&g_entered, io, 3_000));
+        try wire.pump(&reader.interface, w, stream.socket.handle, 100);
+        const left = bulkhead.monotonicNanos();
+        try h2.writeRstStream(w, 1, .cancel);
+        try w.flush();
+        try testing.expect(gWait(&g_finished, io, 3_000));
+        try testing.expectEqual(@as(u8, 2), g_outcome.load(.acquire));
+        try testing.expect(gSinceMs(left) < 1_000);
+        try testing.expectEqual(@as(u8, @intFromEnum(nilo.Presence.gone)), g_presence.load(.acquire));
+    }
+
+    // RST_STREAM while a function on a worker polls `nilo.gone()`.
+    gReset();
+    {
+        var stream = try live.connect(io, server.where.path);
+        defer stream.close(io);
+        var out_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &out_buf);
+        var in_buf: [4096]u8 = undefined;
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
+        const w = &writer.interface;
+        var wire = Wire.init(std.heap.smp_allocator);
+        defer wire.deinit();
+        try openGet(w, "/search");
+        try testing.expect(gWait(&g_entered, io, 3_000));
+        try wire.pump(&reader.interface, w, stream.socket.handle, 100);
+        const left = bulkhead.monotonicNanos();
+        try h2.writeRstStream(w, 1, .cancel);
+        try w.flush();
+        try testing.expect(gWait(&g_finished, io, 5_000));
+        try testing.expect(g_units.load(.acquire) < 100);
+        try testing.expect(gSinceMs(left) < 500);
+    }
+
+    // The client's GOAWAY only forbids new streams: the call is here, sleeps
+    // its time, and is answered.
+    gReset();
+    {
+        var stream = try live.connect(io, server.where.path);
+        defer stream.close(io);
+        var out_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &out_buf);
+        var in_buf: [4096]u8 = undefined;
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
+        const w = &writer.interface;
+        var wire = Wire.init(std.heap.smp_allocator);
+        defer wire.deinit();
+        wire.keep_body = true;
+        try openGet(w, "/brief");
+        try testing.expect(gWait(&g_entered, io, 3_000));
+        try h2.writeGoaway(w, 1, .no_error);
+        try w.flush();
+        for (0..50) |_| {
+            if (wire.finished) break;
+            wire.pump(&reader.interface, w, stream.socket.handle, 100) catch break;
+        }
+        try testing.expect(wire.finished);
+        try testing.expectEqual(@as(u8, 1), g_outcome.load(.acquire));
+        try testing.expectEqualStrings("answered", wire.body.items);
+    }
+}
+
+test "a connection whose input ended with a call running is half-closed and is still answered, and a reset connection is gone" {
+    var server: GoneServer = undefined;
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try server.up(io, "h2gone-eof.sock");
+    defer server.down();
+
+    // shutdown(SHUT_WR): the request is in and the client is reading.
+    {
+        var stream = try live.connect(io, server.where.path);
+        defer stream.close(io);
+        var out_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &out_buf);
+        var in_buf: [4096]u8 = undefined;
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
+        const w = &writer.interface;
+        var wire = Wire.init(std.heap.smp_allocator);
+        defer wire.deinit();
+        wire.keep_body = true;
+        try openGet(w, "/brief");
+        try testing.expect(gWait(&g_entered, io, 3_000));
+        // The server's SETTINGS are acknowledged while this side can still write.
+        try wire.pump(&reader.interface, w, stream.socket.handle, 100);
+        _ = std.os.linux.shutdown(stream.socket.handle, std.os.linux.SHUT.WR);
+        for (0..80) |_| {
+            if (wire.finished) break;
+            wire.pump(&reader.interface, w, stream.socket.handle, 100) catch break;
+        }
+        try testing.expect(wire.finished);
+        try testing.expectEqual(@as(u8, 1), g_outcome.load(.acquire));
+        try testing.expectEqual(@as(u8, @intFromEnum(nilo.Presence.half_closed)), g_presence.load(.acquire));
+        try testing.expectEqualStrings("answered", wire.body.items);
+    }
+
+    // The connection reset under a sleeping call.
+    gReset();
+    {
+        var stream = try live.connect(io, server.where.path);
+        var out_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &out_buf);
+        const w = &writer.interface;
+        try openGet(w, "/sleep");
+        try testing.expect(gWait(&g_entered, io, 3_000));
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+        // Closed with the server's SETTINGS unread: a unix socket resets.
+        const left = bulkhead.monotonicNanos();
+        stream.close(io);
+        try testing.expect(gWait(&g_finished, io, 3_000));
+        try testing.expectEqual(@as(u8, 2), g_outcome.load(.acquire));
+        try testing.expect(gSinceMs(left) < 1_000);
+    }
+}

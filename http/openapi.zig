@@ -254,6 +254,10 @@ pub const Answer = struct {
     /// is `T`'s; what this adds is the header on the 200 and the 304 beside
     /// it, which is the half a client that caches has to see.
     versioned: bool = false,
+    /// The other responses of a handler that returns a union of `Status`
+    /// arms, each with its own status and schema (ADR 286). The first arm is
+    /// this answer; these are the rest, in the order the union names them.
+    also: []const Answer = &.{},
 };
 
 /// How a request body is expected to arrive on the wire. The shape is
@@ -331,6 +335,38 @@ pub const Operation = struct {
     /// Null is the derived name below
     /// ([ADR 119](../docs/adr/119-a-route-can-say-its-own-name.md)).
     name: ?[]const u8 = null,
+
+    /// Whether any response of this route is the 404 `?T` means (ADR 023),
+    /// the first arm's or another's.
+    fn notFound(op: Operation) bool {
+        if (op.answer.not_found) return true;
+        for (op.answer.also) |a| if (a.not_found) return true;
+        return false;
+    }
+
+    /// Whether a union of `Status` arms names `code` itself (ADR 286). Then
+    /// the document does not add its generic response for that code beside
+    /// it: a key twice in an object keeps one of them.
+    fn declares(op: Operation, code: u16) bool {
+        if (op.answer.status == code) return true;
+        for (op.answer.also) |a| if (a.status == code) return true;
+        return false;
+    }
+
+    /// Whether nilo itself may also answer `a.status` on this route, with
+    /// the failure shape, so the response for that status is the arm's body
+    /// or the failure's (ADR 286).
+    fn sharedWith(op: Operation, a: Answer) bool {
+        const code = a.status orelse return false;
+        return switch (code) {
+            400 => op.can_reject,
+            401 => op.security != .none or op.guarded,
+            404 => op.notFound(),
+            409 => op.idempotent,
+            422 => op.idempotent or op.misfit,
+            else => false,
+        };
+    }
 };
 
 /// The two schemes `nilo.Authorization(…)` reads. Both are `type: http` in
@@ -902,6 +938,7 @@ const Components = struct {
             for (op.query) |f| try self.add(f.schema);
             if (op.body) |b| try self.add(b);
             if (op.answer.schema) |s| try self.add(s);
+            for (op.answer.also) |a| if (a.schema) |s| try self.add(s);
         }
     }
 
@@ -1162,10 +1199,15 @@ const Components = struct {
     }
 
     /// Whether anything in this document promises a failure, and so whether
-    /// the shape those failures take has to be described.
+    /// the shape those failures take has to be described. **Every condition
+    /// under which `writeResponses` or `writeAnswer` writes a `$ref` to it is
+    /// here** (`sharedWith`'s, ADR 286, and the generic 401, 409 and 422): a
+    /// reference to a component nobody wrote is a document no client
+    /// generator opens.
     fn anyFailure(ops: []const Operation) bool {
         for (ops) |op| {
-            if (op.can_reject or op.answer.not_found or op.security != .none) return true;
+            if (op.can_reject or op.notFound() or op.security != .none) return true;
+            if (op.guarded or op.idempotent or op.misfit) return true;
         }
         return false;
     }
@@ -1393,16 +1435,21 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
     }
 
     try w.writeAll(",\"responses\":{");
-    try writeAnswer(w, components, op.answer);
+    try writeAnswer(w, components, op.answer, op.sharedWith(op.answer));
+    // A union of `Status` arms: one response each (ADR 286).
+    for (op.answer.also) |a| {
+        try w.writeByte(',');
+        try writeAnswer(w, components, a, op.sharedWith(a));
+    }
     if (op.security != .none) {
-        try writeFailure(w, "401", "no Authorization header, or not the scheme this endpoint " ++
+        if (!op.declares(401)) try writeFailure(w, "401", "no Authorization header, or not the scheme this endpoint " ++
             "takes; WWW-Authenticate says which");
     } else if (op.guarded) {
-        try writeFailure(w, "401", "refused by the guard in front of this endpoint: no session " ++
+        if (!op.declares(401)) try writeFailure(w, "401", "refused by the guard in front of this endpoint: no session " ++
             "cookie, or not one it accepts");
     }
     if (op.idempotent) {
-        try writeFailure(w, "409", "a request with this Idempotency-Key is still being answered");
+        if (!op.declares(409)) try writeFailure(w, "409", "a request with this Idempotency-Key is still being answered");
     }
     // Not a failure: no body, and the `ETag` the 200 carries. Only where a
     // client can be told it: a GET or a HEAD, because a write has run by
@@ -1413,18 +1460,20 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
             "\"schema\":{\"type\":\"string\"}}}}");
     }
     if (op.can_reject) {
-        try writeFailure(w, "400", "the request did not fit what this endpoint takes; " ++
+        if (!op.declares(400)) try writeFailure(w, "400", "the request did not fit what this endpoint takes; " ++
             "the body says which part");
     }
-    if (op.answer.not_found) {
-        try writeFailure(w, "404", "there is no such thing");
+    if (op.notFound()) {
+        if (!op.declares(404)) try writeFailure(w, "404", "there is no such thing");
     }
     // One key for both 422s a route can give, because a JSON object read
     // twice keeps one of them.
-    if (op.idempotent) {
-        try writeFailure(w, "422", if (op.misfit) both_422 else both_422[0..reused_key_len]);
-    } else if (op.misfit) {
-        try writeFailure(w, "422", both_422[both_422.len - misfit_len ..]);
+    if (!op.declares(422)) {
+        if (op.idempotent) {
+            try writeFailure(w, "422", if (op.misfit) both_422 else both_422[0..reused_key_len]);
+        } else if (op.misfit) {
+            try writeFailure(w, "422", both_422[both_422.len - misfit_len ..]);
+        }
     }
     try w.writeAll("}}");
 }
@@ -1447,7 +1496,7 @@ fn writeFailure(w: *std.Io.Writer, status: []const u8, description: []const u8) 
         error_schema_name ++ "\"}}}}");
 }
 
-fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer) !void {
+fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer, shared: bool) !void {
     // A handler that writes its own response has told this document nothing,
     // and saying so is the only honest thing left. `default` with no content
     // is OpenAPI's way of writing "an answer, unspecified" — which beats the
@@ -1483,7 +1532,16 @@ fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer)
     }
 
     if (answer.schema == null) {
-        try w.writeAll("\"an empty response\"}");
+        if (!shared) {
+            try w.writeAll("\"an empty response\"}");
+            return;
+        }
+        // The arm's own answer is empty, but nilo can answer this status
+        // with the failure body, and a client has to be able to read it
+        // (ADR 286).
+        try w.writeAll("\"an empty response from the handler; nilo's own failure body when it " ++
+            "refuses the request with this status\",\"content\":{\"application/json\":{\"schema\":" ++
+            "{\"$ref\":\"#/components/schemas/" ++ error_schema_name ++ "\"}}}}");
         return;
     }
     try w.writeAll(if (answer.status == null)
@@ -1493,7 +1551,11 @@ fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer)
     try w.writeAll(",\"content\":{");
     try writeString(w, answer.content_type);
     try w.writeAll(":{\"schema\":");
+    // The status nilo also answers with its failure shape: either body can
+    // arrive (ADR 286).
+    if (shared) try w.writeAll("{\"oneOf\":[");
     try writeSchema(w, components, answer.schema.?);
+    if (shared) try w.writeAll(",{\"$ref\":\"#/components/schemas/" ++ error_schema_name ++ "\"}]}");
     // A message answers in the spelling it was asked in (ADR 256).
     for (answer.more_types) |content_type| {
         try w.writeAll("},");
@@ -2524,4 +2586,75 @@ test "a route that can answer 422 two ways lists it once, saying both" {
     try testing.expect(std.mem.indexOf(u8, doc, "\"description\":\"the body is JSON that does not fit") != null);
     // Text that is not JSON is still a 400 on both.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, doc, "\"400\":"));
+}
+
+test "a bodiless arm on a status nilo also answers with the failure carries the failure body" {
+    const Body = struct { id: u32 };
+    const ops = comptime [_]Operation{.{
+        .method = .GET,
+        .pattern = "/things",
+        .params = &.{},
+        .query = &.{},
+        .body = null,
+        .answer = .{
+            .status = 200,
+            .content_type = "application/json",
+            .schema = schemaOf(Body),
+            .also = &.{.{ .status = 400, .content_type = "application/json", .schema = null }},
+        },
+        .can_reject = true,
+    }};
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(testing.allocator, &out.writer, &ops, .{});
+    const doc = out.written();
+    // The arm's own answer is empty, the failure body is what a client can
+    // receive on that status too, and the key is there once.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        doc,
+        "\"400\":{\"description\":\"an empty response from the handler; nilo's own failure body when it " ++
+            "refuses the request with this status\",\"content\":{\"application/json\":{\"schema\":" ++
+            "{\"$ref\":\"#/components/schemas/Failure\"}}}}",
+    ) != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, doc, "\"400\":"));
+}
+
+test "a guarded or idempotent route with a 401 or 409 arm has the failure component the arm refers to" {
+    const Body = struct { id: u32 };
+    const arms = comptime [_]Answer{
+        .{ .status = 401, .content_type = "application/json", .schema = schemaOf(Body) },
+        .{ .status = 409, .content_type = "application/json", .schema = schemaOf(Body) },
+    };
+    const ops = comptime [_]Operation{
+        .{
+            .method = .GET,
+            .pattern = "/guarded",
+            .params = &.{},
+            .query = &.{},
+            .body = null,
+            .answer = .{ .status = 200, .content_type = "application/json", .schema = schemaOf(Body), .also = arms[0..1] },
+            .can_reject = false,
+            .guarded = true,
+        },
+        .{
+            .method = .POST,
+            .pattern = "/idempotent",
+            .params = &.{},
+            .query = &.{},
+            .body = null,
+            .answer = .{ .status = 200, .content_type = "application/json", .schema = schemaOf(Body), .also = arms[1..2] },
+            .can_reject = false,
+            .idempotent = true,
+        },
+    };
+    for (ops) |op| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try write(testing.allocator, &out.writer, &.{op}, .{});
+        const doc = out.written();
+        try testing.expect(std.mem.indexOf(u8, doc, "\"$ref\":\"#/components/schemas/Failure\"") != null);
+        try testing.expect(std.mem.indexOf(u8, doc, "\"Failure\":{") != null);
+    }
 }

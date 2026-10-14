@@ -56,17 +56,38 @@ same gap), unless it also has a bare `?`, which takes the next free number
 and which Postgres reads as an operator; then, and for a named struct of
 values, the driver reads it.
 
-`db.exec` takes its text at run time and sends it as written. Its
-statements are DDL and `PRAGMA` almost without exception, and rewriting a
-run-time string is an allocation on a path that did not ask for one.
+`db.exec` takes its text at run time and cannot be respelled without a copy,
+so the SQLite Wire prepares it as written and **binds by what each
+placeholder is called**: after the prepare it reads
+`sqlite3_bind_parameter_name` for every slot. `$N` and `?N` take value N, so `$n` means in `exec` what it
+means in `raw`, and Postgres reads `$n` natively. A statement of only bare `?` binds by position. **If any slot has a
+name, every slot must have one**: SQLite gives a bare `?` and the slots a `?5`
+skips over the same NULL name, and a bare `?` among numbered ones takes the
+largest number so far plus one, not its position, so a statement that mixes
+them or skips a number is refused with one message, and that is what makes
+refusing an unused value sound. A `:name` or `@name` is
+refused (`exec` takes a tuple and has no names), and so is a placeholder past
+the values given and a value no placeholder names, as `QueryFailed` with a
+message naming the placeholder, the same two mistakes `raw` refuses while
+compiling. A struct of values keeps zqlite's by-field binding. The cost is
+one `sqlite3_bind_parameter_count` call and, per placeholder, one `_name` call
+and a short parse, no allocation unless it refuses; run-time text is not
+cached, so it is paid on every call, on a path that is DDL and maintenance.
 
 ## What was rejected
 
-**Binding by name in the SQLite Wire.** `sqlite3_bind_parameter_index(stmt,
-"$k")` for each value, falling back to position. It would have covered
-`exec` too, and it costs a string search per value per execution, on the
-path a prepared statement exists to make cheap. The text is comptime for
-every other call, so the work can be done once.
+**Binding by name in the SQLite Wire for every call.**
+`sqlite3_bind_parameter_index(stmt, "$k")` for each value, falling back to
+position. It costs a string search per value per execution, on the path a
+prepared statement exists to make cheap, and the text is comptime for every
+other call, so the work is done once while compiling. It is used for `exec`
+alone, the one call whose text is not known then, and reads names slot by
+slot instead of searching for them.
+
+**Sending `exec` text as written and teaching `?1`.** That was the rule until
+a `$2` before a `$1` in an `exec` changed no row and said nothing; the doc
+said to write `?1`, and the same `$n` spelling that is right in `raw` was
+accepted and meant something else.
 
 **Refusing `$n` on SQLite.** A refusal would have made the guide's every
 raw statement a compile error on the second database, for a difference the

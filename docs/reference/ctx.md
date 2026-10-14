@@ -47,6 +47,9 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.clientIp()` | `Str`: the client, looking through `trusted_proxies` or `trusted_hops`. Empty on a unix socket with neither set |
 | `c.stopping()` | `bool`: the server has been told to stop and is draining. What the health page answers `stopping` on |
 | `c.overdue()` | whether the deadline `nilo.deadline(ms)` gave this route has passed. Always false without one |
+| `c.presence()` | `nilo.Presence`: `here`, `half_closed` or `gone`. Asked of the socket's kernel state (one `poll(2)`) or the HTTP/2 stream, not kept: ask again after a write. A FIN is `gone` from a client that did not say `Connection: close`, `half_closed` from one that did. See [the client leaving](./middleware.md#the-client-leaving) |
+| `c.gone()` | `presence() == .gone`. `nilo.gone()` is the same where no `*Ctx` is held, a function on a blocking worker above all, and is false outside a request |
+| `c.sleepUnlessGone(ms)` | `error{Canceled}!enum { elapsed, gone }`: `nilo.sleep` that ends when the client does. A `half_closed` client does not end it |
 | `c.timeLeftMs()` | `?u32`: milliseconds left, rounded up so any time left reads at least 1, `null` without a deadline, `0` once it has gone |
 | `c.giveDeadline(ms)` | set one by hand. `nilo.deadline(ms)` is what normally calls this |
 | `c.readBodyAsSent()` | hand `body()` and `bodyStream()` the bytes as they arrived, whatever `Content-Encoding` they are under. What `nilo.bodyEncodings` calls; before the body is read |
@@ -232,4 +235,4 @@ The scheme word is matched without regard to case. A header with another scheme 
 | `fail.internal(…)` | 500; the message is sent to the client like every other fail function's |
 | `fail.status(code, fmt, args)` | any status |
 
-**All of them return `error.Failed`.** The message goes into a 240-byte slot with no allocation, and is sent as `{"error": "…", "status": 404}`, the same shape for every failure whatever the endpoint returns when it succeeds, or as the struct `app.failures(T)` named, filled from the same status and message ([ADR 024](../adr/024-every-failure-answers-as-json.md)). The guide page is [Errors](../guide/errors.md).
+**All of them return `error.Failed`.** The message goes into a 240-byte slot with no allocation, or, when it is longer and a request is in flight, whole into the request arena up to 16 KiB (outside a request it is cut at 240; a gRPC call is told the first KiB), and is sent as `{"error": "…", "status": 404}`, the same shape for every failure whatever the endpoint returns when it succeeds, or as the struct `app.failures(T)` named, filled from the same status and message ([ADR 024](../adr/024-every-failure-answers-as-json.md)). The guide page is [Errors](../guide/errors.md).

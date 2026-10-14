@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field may be text, a number, a `bool`, an enum, or any of those wrapped in `?`. Any other type is a Refusal.
+The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field may be text, a number, a `bool`, an enum, a `config.List` of those, or any of those wrapped in `?`; a `?` struct is a group. Any other type is a Refusal.
 
 ### `config.fromEnv` and `config.from`
 
@@ -50,12 +50,56 @@ The variable name is the field name in upper case: `database_url` is read from `
 | `r.report(w)` | every failure, one per line, into a `*std.Io.Writer`. Writes nothing when there are none |
 | `r.failed()`, `r.failedCount()` | |
 | `r.failures()` | an iterator of `Failure`, in the order the struct declares the fields |
-| `r.given("port")` | the text that arrived, whether it converted or not. The field name is checked while compiling |
-| `r.nameOf("port")` | `"PORT"`, prefix included |
+| `r.given("port")` | the text that arrived, whether it converted or not. The field name is checked while compiling; a setting in a group is `"smtp.port"` |
+| `r.nameOf("port")` | `"PORT"`, prefix included; `r.nameOf("smtp.port")` is `"SMTP_PORT"` |
 
 ### `Failure`
 
-A `Failure` has `.field`, `.name`, `.reason`, `.given` and `.expected`, and `.say(w)` writes nilo's own sentence for it. `Reason` is one of `missing`, `not_a_number`, `not_true_or_false` and `not_a_choice`. There are four and there will stay four: whether a port is one this machine may bind is your application's question.
+A `Failure` has `.field`, `.name`, `.reason`, `.given` and `.expected`, and `.say(w)` writes nilo's own sentence for it. For an entry of a list `.entry` is its position from 1, and for `too_many` how many there were, with `.capacity` the room the list has; for a setting in a group `.group` is the prefix its variables share (`SMTP_`). `.field` is `smtp.port` for a setting inside a group. `Reason` is one of `missing`, `not_a_number`, `not_true_or_false`, `not_a_choice` and `too_many`. There are five and there will stay five: whether a port is one this machine may bind is your application's question.
+
+### Lists
+
+`config.List(T, max)` is one variable with commas in it ([ADR 289](../adr/289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md)). `T` is text, a number, a `bool` or an enum; `max` is how many entries it has room for, and is at least 1.
+
+```zig
+const config = @import("nilo_config");
+
+const Settings = struct {
+    allowed_origins: config.List([]const u8, 8),               // ALLOWED_ORIGINS=https://a.com, https://b.com
+    kafka_brokers: config.List([]const u8, 3),
+    broker_ports: config.List(u16, 3) = .of(&.{9092}),         // a default is a list literal
+    signals: ?config.List(enum { traces, logs }, 2) = null,    // absent, and cleared by an empty variable
+};
+```
+
+| | |
+|---|---|
+| `l.items()` | `[]const T`, the entries in order. `l` is a pointer: the slice points into the struct |
+| `config.List(T, max).of(&.{ … })` | a default, checked while compiling |
+| `.Item`, `.capacity` | `T` and `max` |
+
+Entries are trimmed and empty ones are skipped. Text entries point into the source text, as a `[]const u8` field does. More than `max` entries is `too_many`: `ALLOWED_ORIGINS has room for 4 entries, not 5`. A bad entry is named by its position: `KAFKA_PORTS entry 2 has to be a whole number, not "soon"`. A variable set to nothing is an empty list; for a `?List` it is `null`, the default included. Whether a list may be empty, or hold duplicates, is your application's question.
+
+### Groups
+
+A `?Struct` field is a group of settings that is off unless one of its variables is set ([ADR 289](../adr/289-a-setting-can-be-a-list-and-a-group-can-be-switched-on-by-presence.md)).
+
+```zig
+const config = @import("nilo_config");
+
+const Settings = struct {
+    port: u16 = 8080,
+    smtp: ?struct {
+        host: []const u8,        // SMTP_HOST
+        port: u16,               // SMTP_PORT
+        user: []const u8,
+        password: []const u8,
+        starttls: bool = true,
+    } = null,
+};
+```
+
+The variables are the field name, an underscore and the inner field, under the prefix if there is one (`APP_SMTP_HOST`). The group is `null` while none of its variables is set to anything but blank. When one is, the group is read like any struct, and a blank variable inside it reads as not set (a default is taken, an optional field is `null`, a required one is `missing`): `SMTP_PORT is not set, and other SMTP_* settings are` for a required field left out, defaults and `?` as everywhere. Layers combine per variable, so `SMTP_HOST` from the environment and `SMTP_PORT` from a `.env` make one group. A group does not nest, has at least one field, and no two settings may read one variable (`smtp_host` beside the group `smtp`, or `a.b_c` beside `a_b.c`): each is a Refusal.
 
 ### Sources
 

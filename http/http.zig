@@ -290,6 +290,14 @@ pub const blockingReserved = @import("bulkhead.zig").blockingReserved;
 /// which maps to a 503 the way `Mutex.lock` does.
 pub const sleep = @import("bulkhead.zig").sleep;
 
+/// Whether the client of the request this code runs for has gone, from
+/// anywhere, a blocking worker above all; false outside a request
+/// (ADR 287). `c.gone()` is the same with a `*Ctx` in hand.
+pub const gone = @import("ctx.zig").gone;
+
+/// `here`, `half_closed` or `gone`: `c.presence()` (ADR 287).
+pub const Presence = @import("bulkhead.zig").Presence;
+
 /// Bytes from the operating system's entropy source, off the event loop —
 /// what `Ctx.entropy` is underneath, for a buffer you are already holding
 /// or for work outside a request (ADR 042).
@@ -1164,6 +1172,7 @@ test {
     // Last, and the only one here that stands a real server up. Nothing else
     // in this suite opens a socket at all (ADR 028).
     _ = @import("live.zig");
+    _ = @import("gone_live.zig");
     _ = @import("liveclient.zig");
     // Except this, in a build that has TLS in it: the same server with a
     // certificate, talked to by std's own TLS client (ADR 212). Under a

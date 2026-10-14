@@ -1841,3 +1841,133 @@ test "a post that crosses a frame arriving loses neither, however often they cro
         } else return error.UnexpectedFrame;
     }
 }
+
+/// Boot work that takes a while and says when it finished.
+const SlowBoot = struct {
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(_: *nilo.Run, self: *SlowBoot) !void {
+        try nilo.sleep(200);
+        self.done.store(true, .release);
+    }
+};
+
+test "Live.start returns once the boot work is done, not once the port is bound" {
+    hush();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    var boot: SlowBoot = .{};
+    try app.before(SlowBoot.run, .{&boot});
+
+    const live = try nilo.testing.Live.start(gpa, &app, .{ .threads = 1 });
+    defer live.stop() catch {};
+    // The port is stored before `before` runs, so a start that returned on
+    // it would find this still false for another 200 ms.
+    try testing.expect(boot.done.load(.acquire));
+}
+
+test "an App that listens again after stop reports the new run's port, not the old one" {
+    hush();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    var boot: SlowBoot = .{};
+    try app.before(SlowBoot.run, .{&boot});
+    try app.get("/ping", struct {
+        fn h(c: *nilo.Ctx) anyerror!void {
+            try c.sendText(200, "pong");
+        }
+    }.h);
+
+    const first = try nilo.testing.Live.start(gpa, &app, .{ .threads = 1 });
+    try testing.expect(boot.done.load(.acquire));
+    try first.stop();
+    // The first run's port and `boot_done` are still stored here, and the
+    // second `start` must not return on them. Nothing clears the stop
+    // request a shutdown left, so a restart clears it by hand.
+    app.stop.requested.store(false, .release);
+    const second = try nilo.testing.Live.start(gpa, &app, .{ .threads = 1 });
+    defer second.stop() catch {};
+    const answer = try ask(gpa, second.port, "GET /ping HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    defer answer.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("pong", answer.body);
+}
+
+/// Parses the body straight off the connection with `std.json.Reader`, a
+/// 256-byte buffer between the two, and answers how many numbers it held.
+fn sumStreamed(c: *nilo.Ctx) anyerror!void {
+    var incoming = try c.bodyStream();
+    var buf: [256]u8 = undefined;
+    var json_reader: std.json.Reader = .init(c.arena(), try incoming.buffered(&buf));
+    const parsed = std.json.parseFromTokenSourceLeaky(
+        struct { numbers: []const u32 },
+        c.arena(),
+        &json_reader,
+        .{},
+    ) catch |err| return incoming.explain(if (err == error.ReadFailed) err else error.ReadFailed);
+    var sum: u64 = 0;
+    for (parsed.numbers) |n| sum += n;
+    try c.sendJson(200, .{ .count = parsed.numbers.len, .sum = sum, .seen = incoming.seen() });
+}
+
+/// Counts NDJSON lines off a chunked body through `takeDelimiter`.
+fn countLines(c: *nilo.Ctx) anyerror!void {
+    var incoming = try c.bodyStream();
+    var buf: [64]u8 = undefined;
+    const r = try incoming.buffered(&buf);
+    var lines: u32 = 0;
+    while (r.takeDelimiter('\n') catch |err| return incoming.explain(err)) |_| lines += 1;
+    try c.sendJson(200, .{ .lines = lines });
+}
+
+test "a streamed body is parsed by std.json.Reader and by takeDelimiter on a real connection" {
+    hush();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/sum", sumStreamed);
+    try app.post("/lines", countLines);
+    const live = try nilo.testing.Live.start(gpa, &app, .{ .threads = 1 });
+    defer live.stop() catch {};
+
+    // About 40 KB of JSON through a 256-byte buffer.
+    var doc: std.Io.Writer.Allocating = .init(gpa);
+    defer doc.deinit();
+    try doc.writer.writeAll("{\"numbers\":[");
+    var want: u64 = 0;
+    for (0..6000) |i| {
+        if (i != 0) try doc.writer.writeAll(",");
+        try doc.writer.print("{d}", .{i});
+        want += i;
+    }
+    try doc.writer.writeAll("]}");
+    const request = try std.fmt.allocPrint(
+        gpa,
+        "POST /sum HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ doc.written().len, doc.written() },
+    );
+    defer gpa.free(request);
+    const answer = try ask(gpa, live.port, request);
+    defer answer.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200"));
+    const expected = try std.fmt.allocPrint(gpa, "{{\"count\":6000,\"sum\":{d},\"seen\":{d}}}", .{ want, doc.written().len });
+    defer gpa.free(expected);
+    try testing.expectEqualStrings(expected, answer.body);
+
+    const lines = try ask(
+        gpa,
+        live.port,
+        "POST /lines HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+            "8\r\n{\"a\":1}\n\r\n10\r\n{\"b\":2}\n{\"c\":3}\n\r\n0\r\n\r\n",
+    );
+    defer lines.deinit(gpa);
+    try testing.expectEqualStrings("{\"lines\":3}", lines.body);
+}

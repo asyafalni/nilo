@@ -47,6 +47,7 @@ const hpack = @import("hpack.zig");
 const http1 = @import("http1.zig");
 const inbound = @import("inbound.zig");
 const outbound = @import("outbound.zig");
+const bulkhead = @import("bulkhead.zig");
 const Lease = @import("lease.zig").Lease;
 pub const http2_built = @import("nilo_build").http2;
 
@@ -310,6 +311,35 @@ pub const Framing = union(enum) {
             // touches the socket (ADR 260).
             .http2 => |collected| if (comptime !http2_built) unreachable else {
                 if (collected.inbound) |pipe| pipe.askContinue();
+            },
+        }
+    }
+
+    /// Whether the client of an HTTP/2 call is still there, and null on
+    /// HTTP/1.1, whose answer is the socket's to give (`Waker.hangup`).
+    pub fn presence(self: *const Framing) ?bulkhead.Presence {
+        return switch (self.*) {
+            .http1 => null,
+            .http2 => |c| if (comptime !http2_built) unreachable else {
+                if (c.departed) |d| if (d.load(.acquire)) return .gone;
+                if (c.input_ended) |e| if (e.load(.acquire)) return .half_closed;
+                return .here;
+            },
+        };
+    }
+
+    /// `sleep` that ends when the call's stream is reset or its connection
+    /// lost, on HTTP/2. Only asked of a `.http2` framing.
+    pub fn sleepUnlessDeparted(self: *const Framing, ms: u32, endless: bool) error{Canceled}!bulkhead.Waited {
+        switch (self.*) {
+            .http1 => unreachable,
+            .http2 => |c| {
+                if (comptime !http2_built) unreachable;
+                const parker = c.parker orelse {
+                    try bulkhead.sleep(ms);
+                    return .elapsed;
+                };
+                return parker.sleepUnlessDeparted(ms, c.departed.?, if (endless) c.input_ended else null);
             },
         }
     }
@@ -613,6 +643,15 @@ pub const Collected = struct {
     /// The pipe the request's body arrives through, when it has one: how the
     /// framing reaches the connection to ask for a `100 Continue`.
     inbound: ?*inbound.Inbox = null,
+    /// Whether the client is still there (ADR 287), as the connection's fiber
+    /// writes it and the call reads it from any thread: the stream was reset
+    /// or the connection lost, and the connection's input ended with the call
+    /// still running (a client that stopped sending and may still be
+    /// reading). `parker` is the pipe a sleeping call parks on, which a reset
+    /// already wakes. Null for a `Collected` a test built.
+    departed: ?*const std.atomic.Value(bool) = null,
+    input_ended: ?*const std.atomic.Value(bool) = null,
+    parker: ?*inbound.Inbox = null,
     /// The error the answer is a failure for, when it is one (`Framing.failed`).
     failure: ?anyerror = null,
     /// The sentence that failure carried, nilo's own words.

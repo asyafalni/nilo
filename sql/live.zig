@@ -3755,6 +3755,43 @@ test "a uuid bound bare to db.exec reaches the column without a text cast" {
     try testing.expectEqualSlices(u8, &token.bytes, &back[0].token.?.bytes);
 }
 
+test "db.exec reads a $2 before a $1 on Postgres the way it does on SQLite, and refuses a $3 given two values" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const scratch = "nilo_live_exec_order_" ++ mode_suffix;
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ scratch ++ "\"", .{});
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ scratch ++ "\"", .{}) catch {};
+    _ = try stack.db.exec(&run, "CREATE TABLE \"" ++ scratch ++ "\" (name TEXT PRIMARY KEY, a TEXT, b TEXT)", .{});
+    _ = try stack.db.exec(&run, "INSERT INTO \"" ++ scratch ++ "\" VALUES ('one', 'x', 'y')", .{});
+
+    try testing.expectEqual(@as(usize, 1), try stack.db.exec(
+        &run,
+        "UPDATE \"" ++ scratch ++ "\" SET a = $2, b = $3 WHERE name = $1",
+        .{ "one", "new-a", "new-b" },
+    ));
+    const Back = struct {
+        pub const nilo_table = .{ .name = scratch, .key = .name };
+        name: nilo.Str,
+        a: nilo.Str,
+        b: nilo.Str,
+    };
+    const back = try stack.db.raw(Back, &run, "SELECT name, a, b FROM \"" ++ scratch ++ "\" WHERE name = $1", .{"one"});
+    try testing.expectEqual(@as(usize, 1), back.len);
+    try testing.expectEqualStrings("new-a", back[0].a.view());
+    try testing.expectEqualStrings("new-b", back[0].b.view());
+
+    try testing.expectError(error.QueryFailed, stack.db.exec(
+        &run,
+        "UPDATE \"" ++ scratch ++ "\" SET a = $3 WHERE name = $1",
+        .{ "one", "x" },
+    ));
+}
+
 test "a uuid array goes out to a column and comes back the same array" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;

@@ -79,7 +79,7 @@ defer live.stop() catch {};
 
 | | |
 |---|---|
-| `Live.start(gpa, app, options)` | starts `app.tryListen` as an `io.concurrent` task of a `std.Io.Threaded` the value owns, returns a `*Live` once `app.boundPort()` answers; `options` is a `nilo.Options`, whose `port` (forced to 0) and `stop_on_signal` (forced off) are overridden |
+| `Live.start(gpa, app, options)` | starts `app.tryListen` as an `io.concurrent` task of a `std.Io.Threaded` the value owns, returns a `*Live` once `app.boundPort()` answers and the boot work (services started, `before` run, checks passed) is over, under the same three-second bound, or the error the boot failed with; `options` is a `nilo.Options`, whose `port` (forced to 0) and `stop_on_signal` (forced off) are overridden |
 | `live.port` | the port the kernel chose, on 127.0.0.1 |
 | `live.clientIo()` | the `std.Io` of the pool the listener runs on, for a client the test writes; not the server's loop |
 | `live.stop()` | shuts the server down the way a deployed one is, waits for the listener, and frees the value; `error.ServerDidNotStop` after ten seconds, when the value is left alive |
