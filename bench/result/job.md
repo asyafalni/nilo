@@ -117,3 +117,72 @@ What `.in("Europe/Berlin")` adds to a program and to a tick ([ADR 161](../../doc
 **Decision it moved.** A zone costs 6 KB once and 150 bytes after, so zones are compiled in for the names a program gives and not behind a build flag; and the data is a swappable module because the reason it goes stale is a government and not a bug.
 
 **Not measured.** Instructions a tick under cachegrind (no valgrind on this machine): `bench/release/job_zoned.zig` is the program `bench/release.py` will count it with, and its row reads n/a for any tag before this change.
+
+
+## The claim over a backlog: probing each priority, 2026-10-12
+
+Whether a bulk enqueue slows every claim, and whether the index ADR 214 turned down is the wrong one for one ordering and the right one for another. The `docs/todo.md` entry asked for both shapes at a backlog of 1, 50,000 and 200,000 due rows beside 300,000 done ones.
+
+**Machine and tree.** Intel Xeon Platinum 8255C @ 2.50GHz, **2 vCPUs**, Ubuntu, kernel 6.8.0-110. Postgres 17.10 (Ubuntu pgdg build, `shared_buffers` 1985MB) in the Docker container `nodeflux-os-db-1`, a scratch database made for the run and dropped after. Commit `1676b58`; the tree had uncommitted changes outside `job/` (`jwt/`, `sql/`, `http/`, docs) and nothing under `job/` was touched. No `zig` process was running. **pgbench ran inside the container over TCP loopback** (`-h 127.0.0.1 -M prepared`), so a statement costs no Docker-port round trip. That flatters every shape that takes more than one statement; the published port costs about 350 µs a trip (the empty-claim row at the top of this file).
+
+**What was built.** `nilo_jobs` as `job/table.zig`'s `Row` declares it: `id bigserial` key, `kind`, `payload` (100 bytes), `state` as text, `run_at`, `lease_until`, `attempts`, `priority smallint`, `unique_key`, `last_error`, `created_at`, `finished_at`, unique on `(kind, unique_key)`. Two copies of the same rows: `jobs_a` with today's index `(state, run_at)`, `jobs_b` with `(state, priority, run_at)`. 300,000 `done` rows, then N `queued` rows due in the last hour, all shuffled together on disk, `VACUUM ANALYZE` after the load and between runs. Three kinds, and the claim names all three. Two spreads of priority: **mix** (80% normal, 10% high, 10% low) and **normal** (every due row normal, which is a queue whose kinds never say a priority, the common one). Each claim is `BEGIN; <claim>; ROLLBACK`, so the backlog does not shrink, `pgbench -n -M prepared -T 8`, 1 client and 4 clients (on 2 cores), three runs of each in a fixed rotation (A, A0, B, B0, BL for one run, then the next) with a `VACUUM` before each. 0 failed transactions in 240 runs.
+
+**The shapes.**
+
+- **A** today's statement, verbatim (`ORDER BY priority, run_at LIMIT 1 FOR UPDATE SKIP LOCKED`, the `kind = ANY`, and the lease arm `OR (state = 'running' AND lease_until <= $1)`), on `(state, run_at)`.
+- **A0** the same without the lease arm (`state = 'queued' AND run_at <= $1` only), which is the statement ADR 214 measured.
+- **B** one probe per priority on `(state, priority, run_at)`, `WHERE priority = $p … ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED`, three statements stopping at the first hit, with A's whole `WHERE` including the lease arm.
+- **B0** the same probes without the lease arm.
+- **BL** one statement: `VALUES (0), (1), (2)` cross joined to a `LATERAL` subquery that is the B0 probe. The join stops at the first row (`LIMIT 1`), `VALUES` is the outer side so it is probed in priority order, and `SKIP LOCKED` is legal because the lock sits inside the subquery and not in a `UNION`. This is the form that is not three statements or a CTE a priority.
+- **BL2** BL with the lease arm kept as its own probe per priority (six `VALUES` rows, `(0,'queued'), (0,'running'), (1,'queued') …`), 8 non-expired `running` rows in the table.
+
+**Claim latency, ms, one client, three runs (min to max).** Beside 300,000 done rows.
+
+| due rows | spread | A (today) | A0 | B | B0 | BL |
+|---|---|---|---|---|---|---|
+| 1 | mix | 0.78 to 0.81 | 0.24 to 0.25 | 0.85 to 0.89 | 0.33 to 0.35 | 0.25 |
+| 50,000 | mix | 90 to 97 | 98 to 109 | 5.4 to 6.0 | 0.26 to 0.27 | 0.26 to 0.27 |
+| 200,000 | mix | 344 to 369 | 432 to 445 | 20 to 22 | 0.26 to 0.27 | 0.27 |
+| 1 | normal | 0.78 to 0.80 | 0.24 to 0.25 | 0.84 to 0.86 | 0.33 | 0.25 |
+| 50,000 | normal | 94 to 102 | 76 to 88 | 65 to 72 | 0.35 to 0.37 | 0.27 to 0.28 |
+| 200,000 | normal | 357 to 376 | 320 to 347 | 219 to 230 | 0.34 to 0.36 | 0.27 to 0.28 |
+
+**Four clients on two cores** (latency a claim; the rows are different jobs because `SKIP LOCKED` skips the ones in flight):
+
+| due rows | spread | A (today) | B | B0 | BL |
+|---|---|---|---|---|---|
+| 1 | mix | 1.7 to 1.9 | 2.4 to 2.7 | 1.5 to 1.6 | 0.88 to 1.0 |
+| 50,000 | mix | 334 to 353 | 23 to 27 | 1.1 to 1.2 | 1.1 to 1.3 |
+| 200,000 | mix | 1,380 to 1,610 | 77 to 91 | 1.1 to 1.2 | 1.2 to 1.3 |
+| 50,000 | normal | 309 to 354 | 262 to 288 | 1.4 to 1.7 | 1.2 to 1.3 |
+| 200,000 | normal | 1,510 to 1,760 | 841 to 874 | 1.4 to 1.5 | 1.1 to 1.2 |
+
+With 200,000 *future-dated* queued rows beside the 50,000 due (mix, one client): A 88 to 110, A0 102 to 114, B 6.2 to 6.9, B0 0.26 to 0.27, BL 0.27 to 0.29. At 1 due row it is the same as with none (A 0.77, BL 0.26). BL2 with 8 running rows, 200,000 due, one client: 0.27 (mix) and 0.29 to 0.30 (normal); four clients 1.0 to 1.2. A row whose lease expired at priority 0 was claimed first in a check by hand.
+
+**Plans (`EXPLAIN (ANALYZE, BUFFERS)`, 200,000 due, mix).**
+
+| shape | execution | buffers | what it did |
+|---|---|---|---|
+| A | 393 ms | 13,257 | `BitmapOr` of the queued range and `state = 'running'`, heap-fetch all 200,000, top-N sort on `(priority, run_at)` |
+| A0 | 644 ms | 201,024 | `Index Scan` of `(state, run_at)` fetching all 200,000 due rows by random heap access (the `kind` filter is applied after), then sort |
+| B, one probe at priority 1 | 235 ms | about 10,600 | the same `BitmapOr`, because the `OR` stops the index giving rows in `run_at` order |
+| B0, one probe at priority 1 | 0.13 ms | 23 | `Index Scan` of `(state, priority, run_at)`, the first entry |
+| BL | 0.19 ms | 22 | `Values Scan` and one index probe a priority until a hit |
+| BL2 | 0.38 to 0.51 ms | 32 | the same, six probes |
+
+**What this shows.**
+
+1. **The suspicion in the todo entry is right, and larger than it said.** Today's claim at 200,000 due rows is 344 to 376 ms on one connection and over a second with four, and it costs 0.78 ms with 1 due row. It fetches and sorts the whole due set on every claim, so a bulk enqueue slows every worker until the backlog is drained, and the slowdown grows with the backlog: at 200,000 a claim takes longer than most jobs run.
+2. **The lease arm is half of the problem and the index is the other half.** B, which keeps the `OR`, is no better than A when every due row is normal (219 to 230 ms against 357 to 376) because the planner cannot give rows in `run_at` order across an `OR` of two states, so the index it was given does nothing. With the arm taken out (B0, BL) the wide index is an ordered probe that reads 23 buffers whatever the backlog is. A0 on the narrow index is not faster than A either, so dropping the arm alone is no help: it is the pair, per-priority equality and no `OR`, that makes the scan ordered.
+3. **The wide index loses ADR 214's argument for the shape that probes.** ADR 214 measured the wide index with a `priority, run_at` sort and one statement, and that is still true here (the same A statement on `(state, priority, run_at)` is 373 to 402 ms against 349 to 373 on the narrow, three runs each at 200,000 normal rows with 8 running). The finding was about the ordering the statement asked for. A probe that fixes `priority` makes the index `(equality, equality, range)`, and then future-dated rows are not walked at all (the 200,000 future rows added nothing).
+4. **One statement beats several.** BL costs the same as B0 when the first priority hits and saves a round trip per empty priority otherwise. With every row at `normal`, the common queue, B0 is two statements and BL one: at the 350 µs a trip the published port costs, that is the difference between 0.7 ms and 0.35 ms on top of the 0.27 ms. Not measured through the published port; computed from the trip cost above.
+
+**Decision it moved.** The claim should be one statement with a `LATERAL` probe a priority over `VALUES (0), (1), (2)`, on an index of `(state, priority, run_at)`, with the lease arm as its own probe per priority (BL2) rather than an `OR`. It changes two things a caller sees: a `CREATE INDEX` on `(state, priority, run_at)` (and the old `(state, run_at)` dropped), and the order inside one priority, which is now every due queued row first and an expired lease second, where today the two compete on `run_at`. A queue that never loses a worker sees no difference in order. `job/table.zig` is **not** changed by this run and ADR 214 still says the rule the code holds; the todo entry, ranked P2, is the work, and the order inside a priority is the decision it waits on.
+
+**Not measured, and how far it can be pushed.**
+
+- **Through the published port**, which adds a round trip to B, B0 and to nothing in BL. The reasoning is above.
+- **Contention that the rolled-back claim cannot make.** Every client claims the top row of the same ordered scan, and `SKIP LOCKED` hops over the in-flight ones; eight real workers on a box with cores are the todo list's other entry.
+- **A `kind` filter that matches little.** A worker that handles one rare kind, with the due backlog all of another kind, walks the whole due set under the probe too (the index does not carry `kind`). The same is true of today's claim, so it is not a regression, but it is the next place this has a cliff.
+- **Many running rows.** BL2 was measured with 8. The running probe reads every `running` row of a priority; a pool of thousands of workers would want `lease_until` in an index.
+- **Autovacuum.** Rolled-back claims leave dead tuples, so each run was preceded by a `VACUUM`.

@@ -81,6 +81,10 @@ Nothing is open at this tier.
 
 **Needs:** the workflow to keep the server's log and say which of the two runs did not stop, then the cause found and fixed; and a base the run can build when the Zig version moved between two releases, or the report saying so in one line instead of failing.
 
+**A misspelt optional `nilo_*` marker compiles and does nothing, and a misspelt mandatory one is refused with a message that never names the typo.** Probed with the refusal steps' wiring at `1676b58`: a handler body declaring `nilo_jsn` compiles and is read with its Zig field names, a Row with `nilo_table` and `nilo_agregate` compiles and is read ungrouped, and a Row declaring `nilo_tabel` stops at "has no `nilo_table`" (`sql/row.zig:1605`). About 55 markers across `sql/` and `http/` are looked up by name with `@hasDecl` or `hasNamedDecl`; the contents of one are checked (`http/jsonmark.zig:250` refuses an unknown key in `nilo_json`), its name never is.
+
+**Needs:** one list of the marker names where both `nilo_sql` and `nilo_http` can read it, which by [ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md) is `core/`; a walk over the public declarations of a type nilo reads (`assertRow`, and the argument and answer classifiers in `http/typed.zig`) answering an unknown `nilo_` name with the nearest known one; and a refusal file and row in each of the two tables.
+
 ### `nilo_config`
 
 **Settings that are not scalars: a list, and a group switched on by presence.** A field is text, a number, a `bool`, an enum or any of those in `?`, and the port of a service with real deployment rules found what that leaves out: a comma-separated list (`PROMOTED_ATTRIBUTES=a,b`); a group of settings that turns on when one variable is present (`DURABLE_ENDPOINT` set means `DURABLE_BUCKET` and `DURABLE_REGION` are now required, inheriting what the file set); and two spellings of `bool` in one program. The first two would be a list type and a "set by presence" section in `Read(T)`. The third is not proposed: `bool` is `true` or `false` and nothing else, and the module keeps its four `Reason`s ([the reference](./reference/config.md#failure)). The program reads its rules by hand today, about sixty lines tested case by case, and says what it gains from the module only for the scalars.
@@ -94,6 +98,10 @@ Nothing is open at this tier.
 **Needs:** a way of being cheap in a test suite that is not also a way of being cheap in production.
 
 ### `nilo_job`
+
+**A backlog slows every claim: with 200,000 due rows the claim takes 344 to 369 ms on one connection and over a second on four, because it sorts every due row each time.** `ORDER BY priority, run_at LIMIT 1` over `(state, run_at)` reads the whole due set, and the lease arm's `OR (state = 'running' AND lease_until <= $1)` keeps any index from handing rows over in order. One statement probing each priority, `VALUES (0), (1), (2)` joined `LATERAL` to `WHERE priority = $p … ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED` on `(state, priority, run_at)`, with the lease arm as a probe of its own, took 0.26 to 0.30 ms at 1, 50,000 and 200,000 due rows and 1.0 to 1.3 ms on four connections; `SKIP LOCKED` is legal there because the lock is inside the subquery ([`job.md`](../bench/result/job.md), "The claim over a backlog"). ADR 214's finding that the wide index is slower holds for the single `ORDER BY` and not for the probe.
+
+**Needs:** a decision on the one change of behaviour, that inside a priority every due queued row goes before every expired lease where today they compete on `run_at`; then `claimSql` in `job/table.zig` written as the probe, the index widened with a `CHANGELOG.md` line naming the migration, ADR 214 edited in place, and a test that holds the order. SQLite is not measured.
 
 **A kind cannot say how many of it run at once, so a job that calls a rate-limited service either takes every worker or waits inside one.** `workers` bounds the whole queue (`job.Settings`), and the reference's answer for a limit per kind is a `nilo.Gate` inside `run`, which waits while holding its worker: four rows of a kind gated to one leave three workers parked on the Gate and the other kinds unserved. river gives each queue its own `MaxWorkers`, and asynq weights its queues. The claim already names the kinds it takes (`kind IN (…)`, [ADR 215](./adr/215-a-worker-claims-only-what-it-can-run.md)), so a kind at its limit can be left out of the claim rather than taken and parked.
 
@@ -192,6 +200,10 @@ Nothing is open at this tier.
 **Needs:** the conflict target named by a unique the Row's table already declares, its predicate included, so nothing is taken on trust; and whether `nilo_table` can declare a partial unique yet.
 
 ### `nilo_http`
+
+**`test-all` fails on a quiet machine at `1676b58` with nothing changed: the static follower's test does not see a deleted file within its five seconds.** "a directory that follows the disk answers a file replaced, added or removed, …" (`http/static.zig`) ends in `error.NeverFollowed` after the delete, past the replace and the add. On the 2-core Xeon it failed in `test-all` at `1676b58` and in two of three runs of the ReleaseSafe suite on its own, and passed five of five in Debug, so it is the ReleaseSafe build and not a loaded box. Nothing in the test says whether the follower missed the change or reloaded and kept the file.
+
+**Needs:** the follower's reload counted in the test, so a failure says which of the two it was, then the cause found; until then CI's `test-all` can go red on any change.
 
 **One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.** Whether a field may be absent is now one comptime rule (`http/field.zig`), and a number described in a query and not in JSON is still open. Path prefixes are matched three ways (`middleware.underPrefix`, `static.underPrefix`, the router) and disagree on `//` and on a param, which is how `useOn` came to skip a `*` route until the chain was resolved per request for one. A JSON string is written by `json.zig` and again by `writeFailureBody`, and only one checks UTF-8. `If-None-Match`, `If-Range` and `Range` are answered in `serve.zig`, `sendfile.zig` and through `Versioned`. `fieldList` exists twice with different output. Each is a fix that closes its defects for good, where a patch to each copy closes them until the next copy.
 
@@ -391,12 +403,6 @@ Nothing is open at this tier.
 
 **Needs:** an upstream issue or patch for client authentication in `std.crypto.tls.Client`, or a decision to own an HTTP/1.1 client on tls.zig behind `-Dtls`; either held by a live test against a listener that requires a certificate.
 
-### `nilo_job`
-
-**A bulk enqueue may slow every claim, because the claim sorts the whole due backlog.** `ORDER BY priority, run_at LIMIT 1` over `(state, run_at)` sorts every due row; probing each priority on an index of `(state, priority, run_at)` would not, and [ADR 214](./adr/214-a-job-says-how-urgent-it-is.md)'s finding that the wide index is slower was for that one ordering, not for one `ORDER BY run_at LIMIT 1` a priority. The `nilo_job` audit at `1738286` ran both once in a scratch container and wrote nothing down, and `SKIP LOCKED` is refused inside a `UNION ALL`, so the shape is up to three statements or a CTE a priority.
-
-**What would settle it:** both shapes on Postgres at a backlog of 1, 50k and 200k due rows beside 300k done ones, into [`job.md`](../bench/result/job.md), and ADR 214 edited in place with the result. An afternoon.
-
 ### `nilo_s3`
 
 **A file over 5 GiB, or one sent over a connection that drops, cannot be uploaded from a browser straight to the bucket.** `presignPost` is one POST, which S3 caps at 5 GiB and which starts again from nothing when it fails, and `putMultipart` streams through this process. Uppy's S3 multipart plugin and the AWS SDKs hand the browser a presigned `UploadPart` URL a part, so a large upload resumes from its last part and never touches the server. The server's half is four calls: create the upload, presign a part, list the parts, complete. A presigned part carries no size condition, so the bound has to be checked at completion, from the parts' sizes, before the object exists.
@@ -532,10 +538,6 @@ Nothing is open at this tier.
 **A held `nilo.Late` value, and a `Path(T)` read by a resolver a bare middleware calls through `c.resolve`, are checked at the first request rather than at `listen()`.** A zero count on an allowance or an empty CSP answers 500 until fixed, and a route without the param answers 500 naming the resolver. A typed middleware's needs are held at `listen()` already; a bare one gives `listen()` nothing to read, and no middleware has a hook there.
 
 **Needs:** a hook a middleware can give `listen()`, or a decision that the three cases are enough to leave to the first request.
-
-**Whether a misspelt `nilo_*` declaration is refused has not been checked, and nothing found by reading refuses one.** The markers are looked up by name (`nilo_table`, `nilo_json`, `nilo_parse`, `nilo_service` and the rest), and the only place found that reads a declaration by its `nilo_` prefix is `http/metrics.zig:467`, which refuses a metric name. A type declaring `nilo_jsn` would then behave as one with no marker, and compile.
-
-**What would settle it:** a refusal file declaring a misspelt marker on a Row and on a body type. If it compiles, a check listing the known names that answers with the nearest one, and this entry moves to P2.
 
 **The figures of the second HTTP optimisation round were measured with two other benchmarks on the same machine.** The fiber reuse on HTTP/2, the idle connection's 512 bytes, the tagged union read once and the TLS page margin were each timed under a shared lock and pinned to their own cores, but beside builds and tests that shared the L3; the first round's figures were measured again serially before they went on the record, and these were not ([`http.md`](../bench/result/http.md#a-fiber-that-finishes-a-call-takes-the-next-one-waiting), [`http.md`](../bench/result/http.md#a-tagged-union-is-read-once-when-its-tag-comes-first)). The idle bytes are counts, not timings, and do not depend on it.
 
