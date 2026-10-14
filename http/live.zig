@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const nilo = @import("http.zig");
+const liveclient = @import("liveclient.zig");
 const bulkhead = @import("bulkhead.zig");
 const watchdog = @import("watchdog.zig");
 
@@ -398,7 +399,7 @@ test "a stop does not wait on a keep-alive connection that is only waiting for i
     var out_buf: [256]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     // Two requests with a quiet spell between them, past the peek, so the
     // connection has been idle once and is about to be again.
@@ -477,7 +478,7 @@ test "a stop closes the listener before it waits for the requests in flight" {
 
     // And the request that was already in flight is still answered.
     var in_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     try readOneOk(&reader.interface);
 
     thread.join();
@@ -600,7 +601,7 @@ fn converse(
     try writer.interface.flush();
 
     var in_buf: [8192]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     var whole: std.Io.Writer.Allocating = .init(gpa);
     defer whole.deinit();
     _ = reader.interface.streamRemaining(&whole.writer) catch {};
@@ -694,9 +695,9 @@ fn pong(c: *nilo.Ctx) anyerror!void {
 }
 
 /// Read from `stream` until `text` has turned up `times` times, or the read
-/// fails. Bounded by a receive timeout on the socket, set with std's own
-/// `setsockopt`, so a server that never sends the second answer fails the
-/// test instead of holding the suite (`CLAUDE.md`).
+/// fails. Bounded by `liveclient.Reader`, so a server that never sends the
+/// second answer fails the test with `error.TestReceiveTimedOut` instead of
+/// holding the suite (`CLAUDE.md`).
 fn readUntilSeen(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -704,13 +705,10 @@ fn readUntilSeen(
     text: []const u8,
     times: usize,
 ) !void {
-    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
-
     var in_buf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     while (std.mem.count(u8, whole.written(), text) < times) {
-        _ = reader.interface.stream(&whole.writer, .limited(in_buf.len)) catch return error.AnswerNeverCame;
+        _ = reader.interface.stream(&whole.writer, .limited(in_buf.len)) catch return reader.err orelse error.AnswerNeverCame;
     }
 }
 
@@ -772,10 +770,8 @@ test "two requests sent together are answered together, and the second is not he
 /// inside the bound, which is what a client that was told `Connection: close`
 /// sees once the answer is read.
 fn serverHungUp(io: std.Io, stream: std.Io.net.Stream) !bool {
-    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
     var in_buf: [64]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     var sink: [64]u8 = undefined;
     var discard = std.Io.Writer.fixed(&sink);
     _ = reader.interface.stream(&discard, .limited(sink.len)) catch |err| return err == error.EndOfStream;
@@ -1679,10 +1675,10 @@ fn wsEcho(c: *nilo.Ctx) anyerror!void {
 
 /// A WebSocket client over std's own socket, so what it hears is the server's
 /// frames and not two halves of one library agreeing. Every read is bounded by
-/// a receive limit on the socket: a server that never answers fails the test.
+/// `liveclient.Reader`: a server that never answers fails the test.
 const WsClient = struct {
     stream: std.Io.net.Stream,
-    reader: std.Io.net.Stream.Reader,
+    reader: liveclient.Reader,
     writer: std.Io.net.Stream.Writer,
     in_buf: [4096]u8 = undefined,
     out_buf: [512]u8 = undefined,
@@ -1691,9 +1687,7 @@ const WsClient = struct {
         const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         self.stream = try address.connect(io, .{ .mode = .stream });
         errdefer self.stream.close(io);
-        const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-        try std.posix.setsockopt(self.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
-        self.reader = self.stream.reader(io, &self.in_buf);
+        self.reader = liveclient.Reader.init(self.stream, io, &self.in_buf, @src().fn_name);
         self.writer = self.stream.writer(io, &self.out_buf);
         try self.raw("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");

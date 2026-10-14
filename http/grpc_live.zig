@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const nilo = @import("http.zig");
+const liveclient = @import("liveclient.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 
@@ -127,10 +128,8 @@ const Call = struct {
 };
 
 /// Read frames until every stream in `calls` has its trailers, decoding
-/// headers as they come. The socket has a receive timeout on it, so a server
-/// that never answers fails here rather than leaving the suite waiting; std's
-/// reader takes the `EAGAIN` that timeout produces for a programmer's mistake
-/// and panics, so the failure is a crashed test rather than a failed one.
+/// headers as they come. The reader is a `liveclient.Reader`, so a server
+/// that never answers fails here rather than leaving the suite waiting.
 fn readAnswers(a: std.mem.Allocator, r: *std.Io.Reader, w: *std.Io.Writer, calls: []Call) !void {
     var decoder = hpack.Decoder.init(a);
     defer decoder.deinit();
@@ -170,10 +169,7 @@ fn readAnswers(a: std.mem.Allocator, r: *std.Io.Reader, w: *std.Io.Writer, calls
 
 pub fn connect(io: std.Io, path: []const u8) !std.Io.net.Stream {
     const address = try std.Io.net.UnixAddress.init(path);
-    const stream = try address.connect(io);
-    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
-    return stream;
+    return address.connect(io);
 }
 
 test "a gRPC listener answers a unary call on a running server, beside a plain port" {
@@ -203,7 +199,7 @@ test "a gRPC listener answers a unary call on a running server, beside a plain p
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});
@@ -224,10 +220,7 @@ fn hi(c: *nilo.Ctx) anyerror!void {
 
 fn connectTcp(io: std.Io, port: u16) !std.Io.net.Stream {
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    const stream = try address.connect(io, .{ .mode = .stream });
-    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
-    return stream;
+    return address.connect(io, .{ .mode = .stream });
 }
 
 /// One HTTP/1.1 request that asks to be closed after, and what came back
@@ -241,7 +234,7 @@ fn getWith(io: std.Io, stream: *std.Io.net.Stream, out: []u8, extra: []const u8)
     var out_buf: [512]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream.*, io, &in_buf, @src().fn_name);
     try writer.interface.writeAll("GET /hi HTTP/1.1\r\nHost: t\r\nConnection: close\r\n");
     try writer.interface.writeAll(extra);
     try writer.interface.writeAll("\r\n");
@@ -307,7 +300,7 @@ test "one plain port answers HTTP/1.1 and an HTTP/2 gRPC call, and so does a uni
         var out_buf: [1024]u8 = undefined;
         var writer = stream.writer(io, &out_buf);
         var in_buf: [32 * 1024]u8 = undefined;
-        var reader = stream.reader(io, &in_buf);
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
         try writer.interface.writeAll(h2.preface[0..9]);
         try writer.interface.flush();
@@ -363,7 +356,7 @@ test "two calls on one connection run at once, and the quick one is not held beh
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});
@@ -411,7 +404,7 @@ test "calls queued behind a fiber are given their own once it parks, and a burst
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});
@@ -511,7 +504,7 @@ test "a typed route whose service may wait keeps its fiber, and the quick one be
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});
@@ -565,7 +558,7 @@ test "a route promised never to wait that does is named, and from then on gets a
         var out_buf: [1024]u8 = undefined;
         var writer = stream.writer(io, &out_buf);
         var in_buf: [32 * 1024]u8 = undefined;
-        var reader = stream.reader(io, &in_buf);
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
         try writer.interface.writeAll(h2.preface);
         try h2.writeSettings(&writer.interface, &.{});
         try writeCall(&writer.interface, 1, "/test.Sum/Lied", sum_message);
@@ -588,7 +581,7 @@ test "a route promised never to wait that does is named, and from then on gets a
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});
     try writeCall(&writer.interface, 1, "/test.Sum/Lied", sum_message);
@@ -824,7 +817,7 @@ test "rapid reset: a call the client cancels still counts against the cap until 
     var out_buf: [64 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     const nilo_h2conn = @import("h2conn.zig");
     const burst = nilo_h2conn.max_streams + 50;
@@ -886,15 +879,15 @@ test "a client that holds its window at zero is let go of once the write limit p
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{.{ .initial_window_size, 0 }});
     try writeCall(&writer.interface, 1, "/test.Echo/Say", "an answer with nowhere to go");
     try writer.interface.flush();
 
-    // Everything until the server closes; the socket's own five-second
-    // receive limit is what fails this if it never does.
+    // Everything until the server closes; the reader's own five-second
+    // bound is what fails this if it never does.
     const started = std.Io.Clock.awake.now(io);
     var data_frames: usize = 0;
     while (true) {
@@ -939,7 +932,7 @@ test "a zero window is let go of on time however often the client sends a frame"
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{.{ .initial_window_size, 0 }});
@@ -1002,7 +995,7 @@ test "a call whose message never finishes arriving is cancelled, and the connect
     var out_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
 
     try writer.interface.writeAll(h2.preface);
     try h2.writeSettings(&writer.interface, &.{});

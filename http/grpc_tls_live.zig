@@ -14,6 +14,7 @@
 const std = @import("std");
 const tls = @import("tls");
 const nilo = @import("http.zig");
+const liveclient = @import("liveclient.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 
@@ -67,15 +68,12 @@ const Serving = struct {
     }
 };
 
-/// A TCP connection with a five-second receive limit, so a server that never
-/// answers fails the test (std's reader panics on the timeout, see
-/// `grpc_live.zig`) rather than leaving the suite waiting.
+/// A TCP connection to the port. The readers made over it are
+/// `liveclient.Reader`s, so a server that never answers fails the test rather
+/// than leaving the suite waiting.
 fn connect(io: std.Io, port: u16) !std.Io.net.Stream {
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    const stream = try address.connect(io, .{ .mode = .stream });
-    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
-    return stream;
+    return address.connect(io, .{ .mode = .stream });
 }
 
 fn handshake(io: std.Io, r: *std.Io.Reader, w: *std.Io.Writer, alpn: []const []const u8) !tls.Connection {
@@ -116,7 +114,7 @@ test "a TLS listener answers a unary gRPC call to a client that offers h2" {
     defer stream.close(io);
     var raw_in: [tls.input_buffer_len]u8 = undefined;
     var raw_out: [tls.output_buffer_len]u8 = undefined;
-    var reader = stream.reader(io, &raw_in);
+    var reader = liveclient.Reader.init(stream, io, &raw_in, @src().fn_name);
     var writer = stream.writer(io, &raw_out);
     var conn = try handshake(io, &reader.interface, &writer.interface, &.{ "h2", "http/1.1" });
     try testing.expectEqualStrings("h2", conn.alpn_protocol.?);
@@ -175,7 +173,7 @@ const Client = struct {
     raw_out: [tls.output_buffer_len]u8 = undefined,
     clear_in: [16 * 1024]u8 = undefined,
     clear_out: [4 * 1024]u8 = undefined,
-    reader: std.Io.net.Stream.Reader = undefined,
+    reader: liveclient.Reader = undefined,
     writer: std.Io.net.Stream.Writer = undefined,
     conn: tls.Connection = undefined,
     cr: tls.Connection.Reader = undefined,
@@ -185,7 +183,7 @@ const Client = struct {
     fn open(self: *Client, io: std.Io, port: u16, alpn: []const []const u8) !void {
         self.stream = try connect(io, port);
         self.connected = true;
-        self.reader = self.stream.reader(io, &self.raw_in);
+        self.reader = liveclient.Reader.init(self.stream, io, &self.raw_in, @src().fn_name);
         self.writer = self.stream.writer(io, &self.raw_out);
         self.conn = try handshake(io, &self.reader.interface, &self.writer.interface, alpn);
         self.cr = self.conn.reader(&self.clear_in);
@@ -534,7 +532,7 @@ fn serveSplit(gpa: std.mem.Allocator, io: std.Io, alpn: []const u8, partial: usi
     defer poster.join();
 
     // The post has to be heard while the second record is still incomplete.
-    // The client's receive limit is five seconds, so a server stuck in a
+    // The client's reads are bounded by five seconds, so a server stuck in a
     // read for the rest of it fails here rather than waiting.
     var seen: std.ArrayList(u8) = .empty;
     while (std.mem.indexOf(u8, seen.items, "hello") == null) {

@@ -197,10 +197,6 @@ Nothing is open at this tier.
 
 ### `nilo_http`
 
-**A test client's receive bound panics rather than failing, so a test that waits too long crashes the suite with `programmer bug caused syscall error: AGAIN` and says nothing about what it waited for.** `SO_RCVTIMEO` is set by three helpers in `http/live.zig`, two in `grpc_live.zig` and one in `grpc_tls_live.zig`, and std's `Threaded` reads the `EAGAIN` it returns as a programmer bug (`errnoBug`). The Room crossing test met it for weeks over posts the room dropped by policy ([history](./history.md#a-suite-that-hangs-and-a-build-that-looks-stuck)), and the panic is what hid that.
-
-**Needs:** each client bound made one that returns an error naming what was waited for, a deadline on the read through the `Io` or a poll before it, so the next stall is a failed test that says so.
-
 **One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.** Whether a field may be absent is now one comptime rule (`http/field.zig`), and a number described in a query and not in JSON is still open. Path prefixes are matched three ways (`middleware.underPrefix`, `static.underPrefix`, the router) and disagree on `//` and on a param, which is how `useOn` came to skip a `*` route until the chain was resolved per request for one. A JSON string is written by `json.zig` and again by `writeFailureBody`, and only one checks UTF-8. `If-None-Match`, `If-Range` and `Range` are answered in `serve.zig`, `sendfile.zig` and through `Versioned`. `fieldList` exists twice with different output. Each is a fix that closes its defects for good, where a patch to each copy closes them until the next copy.
 
 **Needs:** the shape of each shared piece decided — one prefix matcher the router's split defines, one JSON string writer, one conditional-request ladder — and the order, which the defects suggest: the prefix matcher next.

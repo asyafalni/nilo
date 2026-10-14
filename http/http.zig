@@ -1163,6 +1163,7 @@ test {
     // Last, and the only one here that stands a real server up. Nothing else
     // in this suite opens a socket at all (ADR 028).
     _ = @import("live.zig");
+    _ = @import("liveclient.zig");
     // Except this, in a build that has TLS in it: the same server with a
     // certificate, talked to by std's own TLS client (ADR 212). Under a
     // comptime `if` because the file names the option's machinery, which a

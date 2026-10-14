@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const nilo = @import("http.zig");
+const liveclient = @import("liveclient.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const live = @import("grpc_live.zig");
@@ -328,7 +329,7 @@ test "an upload faster than its handler is held to its window, stalls, and then 
     var out_buf: [32 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -427,7 +428,7 @@ test "a stream reset, and a connection closed, while the handler waits for the b
         var out_buf: [4096]u8 = undefined;
         var writer = stream.writer(io, &out_buf);
         var in_buf: [4096]u8 = undefined;
-        var reader = stream.reader(io, &in_buf);
+        var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
         const w = &writer.interface;
         var wire = Wire.init(std.heap.smp_allocator);
         defer wire.deinit();
@@ -576,7 +577,7 @@ test "a large streamed answer and a file reach a client that reads them, byte fo
     var out_buf: [32 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -643,7 +644,7 @@ test "a client that stops reading is cut off at the write deadline, its stream r
     var out_buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -733,7 +734,7 @@ test "a small answer on a connection does not wait for a large one that is being
     var out_buf: [32 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -802,7 +803,7 @@ test "three streamed answers and a whole one share a connection window of the de
     var out_buf: [32 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -880,7 +881,7 @@ test "a large lend that keeps moving is not cut at the write limit, however long
     var out_buf: [32 * 1024]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -936,7 +937,7 @@ test "a client with a window of one byte that answers each byte with two updates
     var out_buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -1059,7 +1060,7 @@ test "event streams handed to an HTTP/2 connection hear a room posted to from an
     var out_buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [32 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
@@ -1149,7 +1150,7 @@ test "an event stream handed to an HTTP/2 connection is sent comments while it i
     var out_buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     var in_buf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &in_buf);
+    var reader = liveclient.Reader.init(stream, io, &in_buf, @src().fn_name);
     const w = &writer.interface;
     const fd = stream.socket.handle;
 
