@@ -683,6 +683,14 @@ const Conn = struct {
     /// stream's arena, which the stream's call may be allocating from on
     /// another thread.
     trailer_block: std.ArrayList(u8) = .empty,
+    /// The id of a forgotten stream whose trailers are arriving in
+    /// `trailer_block`, to be decoded and thrown away: like `continuing`, only
+    /// its CONTINUATION frames may come next. 0 when there are none.
+    ignoring: u31 = 0,
+    /// When that block is out of time, as a call's `collect_until_ns` is for
+    /// its own: the silence limit is no bound on it, every CONTINUATION
+    /// resets that (ADR 220). 0 for none.
+    ignore_until_ns: u64 = 0,
     last_stream: u31 = 0,
     /// Calls this connection may still start before it is sent a GOAWAY, and
     /// whether that has come: the HTTP/2 form of `Connection: close` on the
@@ -951,7 +959,7 @@ const Conn = struct {
     }
 
     fn wait(c: *Conn) Waited {
-        if (c.streams.items.len != 0) {
+        if (c.streams.items.len != 0 or c.ignoring != 0) {
             // Something is in flight. A route that is running is waited for
             // as long as it takes: its own deadline is what bounds it. What
             // the client owes is not: an answer stuck on a window gets the
@@ -960,7 +968,7 @@ const Conn = struct {
             // own bound and `body_ms` between frames. A body being sent is
             // bounded by the read of the call that waits for it (ADR 260).
             const limit = c.inFlightLimitMs() orelse return .stop;
-            if (c.events_open == c.streams.items.len) return c.waitQuiet(limit);
+            if (c.streams.items.len != 0 and c.events_open == c.streams.items.len) return c.waitQuiet(limit);
             // The buffers are held while calls are in flight, so the frames
             // that arrive meanwhile are received into them (ADR 284).
             return switch (c.waker.waitFilling(limit)) {
@@ -1085,6 +1093,10 @@ const Conn = struct {
             collecting = true;
             if (s.collect_until_ns != 0) soonest = @min(soonest, s.collect_until_ns);
         }
+        if (c.ignoring != 0) {
+            collecting = true;
+            if (c.ignore_until_ns != 0) soonest = @min(soonest, c.ignore_until_ns);
+        }
         if (collecting and c.deadlines.body_ms != 0) {
             soonest = @min(soonest, c.last_read_ns +| @as(u64, c.deadlines.body_ms) * std.time.ns_per_ms);
         }
@@ -1101,6 +1113,15 @@ const Conn = struct {
         const now = bulkhead.monotonicNanos();
         if (c.blocked_since != 0 and now -| c.blocked_since >= @as(u64, c.writeLimitMs()) * std.time.ns_per_ms) return .stop;
         var collecting = false;
+        if (c.ignoring != 0) {
+            // Trailers of a forgotten stream, unfinished and too slow: the
+            // connection is sent away, as for a call's header block below.
+            if (c.ignore_until_ns != 0 and now >= c.ignore_until_ns) {
+                c.goaway(.enhance_your_calm) catch {};
+                return .stop;
+            }
+            collecting = true;
+        }
         var i: usize = 0;
         while (i < c.streams.items.len) {
             const s = c.streams.items[i];
@@ -1335,11 +1356,15 @@ const Conn = struct {
         if (c.continuing) |s| {
             if (head.type != .continuation or head.stream != s.id) return error.Protocol;
         }
+        if (c.ignoring != 0) {
+            if (head.type != .continuation or head.stream != c.ignoring) return error.Protocol;
+        }
 
         switch (head.type) {
             .data => try c.onData(head),
             .headers => try c.onHeaders(head),
             .continuation => {
+                if (c.ignoring != 0) return c.ignoreBlock(head);
                 const s = c.continuing orelse return error.Protocol;
                 if (head.len == 0 and !head.has(h2.Flags.end_headers)) try c.control();
                 try c.appendBlockBytes(s, head.len);
@@ -1445,7 +1470,29 @@ const Conn = struct {
             if (head.has(h2.Flags.end_headers)) try c.headersDone(s) else c.continuing = s;
             return;
         }
-        if (head.stream <= c.last_stream) return error.Protocol;
+        if (head.stream <= c.last_stream) {
+            // A stream already forgotten: answered early, refused or reset,
+            // while its client was still sending. Its trailers, which end the
+            // stream (RFC 9113 §8.1), were sent before the client saw that,
+            // as a gRPC client stream does. §5.1 lets a frame on a closed
+            // stream be a connection error, but taking every other call
+            // down for it is more than a late trailer deserves, so the block
+            // is decoded, because the table has to stay in step, and
+            // dropped, as for a stream reset and still running (above).
+            // A HEADERS that does not end the stream is no trailer, and no
+            // new request either (an id is used once, §5.1.1): that stays
+            // the connection error (ADR 260).
+            if (!head.has(h2.Flags.end_stream)) return error.Protocol;
+            try c.control();
+            c.trailer_block.clearRetainingCapacity();
+            const dest = c.trailer_block.addManyAsSlice(c.gpa, len) catch return error.Internal;
+            c.in.readSliceAll(dest) catch return error.Gone;
+            try c.discard(pad);
+            c.ignoring = head.stream;
+            c.ignore_until_ns = c.collectUntil(c.last_read_ns, c.app.max_body);
+            if (head.has(h2.Flags.end_headers)) try c.endIgnored();
+            return;
+        }
         c.last_stream = head.stream;
         if (c.calls_left != 0) {
             c.calls_left -= 1;
@@ -1466,6 +1513,29 @@ const Conn = struct {
         try c.discard(pad);
         s.ends_with_headers = head.has(h2.Flags.end_stream);
         if (head.has(h2.Flags.end_headers)) try c.headersDone(s) else c.continuing = s;
+    }
+
+    /// A CONTINUATION of the trailers of a forgotten stream.
+    fn ignoreBlock(c: *Conn, head: h2.Header) ReadError!void {
+        if (head.len == 0 and !head.has(h2.Flags.end_headers)) try c.control();
+        if (c.trailer_block.items.len + head.len > max_header_block) return error.Calm;
+        const dest = c.trailer_block.addManyAsSlice(c.gpa, head.len) catch return error.Internal;
+        c.in.readSliceAll(dest) catch return error.Gone;
+        if (head.has(h2.Flags.end_headers)) try c.endIgnored();
+    }
+
+    /// The trailers of a forgotten stream are whole: decoded and dropped.
+    fn endIgnored(c: *Conn) ReadError!void {
+        c.ignoring = 0;
+        c.ignore_until_ns = 0;
+        var scratch_arena = std.heap.ArenaAllocator.init(c.gpa);
+        defer scratch_arena.deinit();
+        var scratch: std.ArrayList(hpack.Field) = .empty;
+        _ = c.decoder.decode(c.trailer_block.items, scratch_arena.allocator(), &scratch, max_header_list) catch |err| switch (err) {
+            error.Compression => return error.Compression,
+            error.OutOfMemory => return error.Internal,
+        };
+        c.trailer_block.clearRetainingCapacity();
     }
 
     fn appendBlockBytes(c: *Conn, s: *Stream, len: usize) ReadError!void {
@@ -6471,6 +6541,85 @@ test "trailers in flight to a stream this side reset do not end the connection" 
     var got = try h2test.answerOf(out.written());
     defer got.deinit();
     try testing.expect(got.goaway() == null);
+}
+
+test "trailers sent after the server answered early and forgot the stream are decoded and ignored, and the connection carries on" {
+    const previous = quiet();
+    defer testing.log_level = previous;
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/early", pingRoute);
+    try app.get("/ping", pingRoute);
+    try app.resolveChains();
+    var client = try h2test.TestClient.init();
+    defer client.deinit();
+    // The call, whose body the route never reads, left open by the client.
+    try h2test.requestOn(&client, 1, .{ .method = "POST", .path = "/early", .open = true });
+    // Its trailers in two pieces, a CONTINUATION behind the HEADERS, sent
+    // before the client saw the answer. A field the table learns, so a block
+    // skipped rather than decoded would leave it out of step for the next
+    // call.
+    var block: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer block.deinit();
+    try hpack.writeLiteral(&block.writer, "x-checksum", "1");
+    try h2.writeHeader(client.w(), 6, .headers, h2.Flags.end_stream, 1);
+    try client.w().writeAll(block.written()[0..6]);
+    try h2.writeHeader(client.w(), block.written().len - 6, .continuation, h2.Flags.end_headers, 1);
+    try client.w().writeAll(block.written()[6..]);
+    try h2test.requestOn(&client, 3, .{ .path = "/ping" });
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    var conn = try steppedConn(&app, &in, &out.writer);
+    defer conn.deinit();
+    while (conn.find(1) == null) try conn.readFrame();
+    // The route has run and its answer is written, which does not wait for
+    // the rest of the request, so the stream leaves the table.
+    try conn.writeReady();
+    try testing.expect(conn.find(1) == null);
+    while (in.bufferedLen() > 0) try conn.readFrame();
+    try conn.writeReady();
+    try testing.expect(!conn.goaway_sent);
+    var ex = try h2test.exchangeOf(try h2test.answerOf(out.written()), 3);
+    defer ex.deinit();
+    try testing.expectEqual(@as(?h2.ErrorCode, null), ex.answer.goaway());
+    try testing.expectEqualStrings("pong", ex.body);
+}
+
+test "trailers of a forgotten stream that are never finished send the connection away once their time is up" {
+    const previous = quiet();
+    defer testing.log_level = previous;
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/early", pingRoute);
+    try app.resolveChains();
+    var client = try h2test.TestClient.init();
+    defer client.deinit();
+    try h2test.requestOn(&client, 1, .{ .method = "POST", .path = "/early", .open = true });
+    // The trailers, begun and not ended: HEADERS without END_HEADERS and one
+    // byte of CONTINUATION, which is what a client dribbling them sends.
+    const part = @as([4]u8, @splat(0));
+    try h2.writeHeader(client.w(), part.len, .headers, h2.Flags.end_stream, 1);
+    try client.w().writeAll(&part);
+    try h2.writeHeader(client.w(), 1, .continuation, 0, 1);
+    try client.w().writeByte(0);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    var conn = try steppedConn(&app, &in, &out.writer);
+    defer conn.deinit();
+    while (conn.find(1) == null) try conn.readFrame();
+    try conn.writeReady();
+    try testing.expect(conn.find(1) == null);
+    while (in.bufferedLen() > 0) try conn.readFrame();
+    try testing.expect(conn.ignoring == 1);
+    // The wait the connection would make is bounded by it.
+    _ = conn.inFlightLimitMs().?;
+    conn.ignore_until_ns = 1;
+    try testing.expectEqual(Conn.Waited.stop, conn.overdue());
+    try testing.expect(conn.goaway_sent);
 }
 
 // ---- an answer written in pieces through its pipe (stage 6.2, ADR 260) ----
