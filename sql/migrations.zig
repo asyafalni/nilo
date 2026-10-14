@@ -751,7 +751,7 @@ pub fn renderSql(
                 \\-- A build of this index that failed halfway left it behind, invalid. Drop that one first.
                 \\SELECT format('DROP INDEX CONCURRENTLY %s', indexrelid::regclass) FROM pg_index WHERE indexrelid = to_regclass('
             );
-            try writeSqlLiteral(w, step.index);
+            try ddl.writeEscaped(w, step.index);
             try w.writeAll("') AND NOT indisvalid \\gexec\n\n");
         }
         try w.print("{s};\n\n", .{step.sql});
@@ -764,9 +764,9 @@ pub fn renderSql(
         try w.writeAll(comptime D.quote(f_name));
     }
     try w.print(")\nVALUES ({d}, '", .{version.number});
-    try writeSqlLiteral(w, name);
+    try ddl.writeEscaped(w, name);
     try w.writeAll("', '");
-    try writeSqlLiteral(w, hash);
+    try ddl.writeEscaped(w, hash);
     // Zero milliseconds, because nobody timed it. The column is what an
     // operator reads when they ask which migration is the slow one, and a
     // number invented here would be a worse answer than none.
@@ -818,21 +818,10 @@ fn writeDroppedFilter(w: *std.Io.Writer, steps: []const migrate.Step) !void {
             while (drops.next() catch return) |name| {
                 if (!first) try w.writeAll(", ");
                 first = false;
-                try w.writeAll("'");
-                try writeSqlLiteral(w, name);
-                try w.writeAll("'");
+                try ddl.writeLiteral(w, name);
             }
         }
         try w.writeAll(")");
-    }
-}
-
-/// One piece of text inside a SQL literal, with a quote doubled — the same rule
-/// `ddl.zig` applies to a word out of a snapshot.
-fn writeSqlLiteral(w: *std.Io.Writer, text: []const u8) !void {
-    for (text) |ch| {
-        if (ch == '\'') try w.writeAll("'");
-        try w.writeByte(ch);
     }
 }
 

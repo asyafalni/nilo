@@ -794,13 +794,20 @@ fn writeCheckIdent(w: *std.Io.Writer, table: []const u8, c: Column) Error!void {
 
 /// One word as a SQL literal, with a quote inside it doubled — the same rule
 /// `table.zig` applies while compiling, applied here to text out of a snapshot.
-fn writeLiteral(w: *std.Io.Writer, text: []const u8) Error!void {
+pub fn writeLiteral(w: *std.Io.Writer, text: []const u8) Error!void {
     try w.writeAll("'");
+    try writeEscaped(w, text);
+    try w.writeAll("'");
+}
+
+/// The inside of a SQL literal: the text with every quote doubled. Public for
+/// the migration script, which writes the quotes around it itself because
+/// they sit in the middle of a longer string.
+pub fn writeEscaped(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
     for (text) |ch| {
         if (ch == '\'') try w.writeAll("'");
         try w.writeByte(ch);
     }
-    try w.writeAll("'");
 }
 
 /// `DROP INDEX`, by the name the snapshot recorded.

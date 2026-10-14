@@ -247,13 +247,29 @@ pub fn besideDefault(comptime Row: type, comptime name: []const u8) @FieldType(R
 fn fieldList(comptime Row: type) []const u8 {
     return comptime blk: {
         @setEvalBranchQuota(budget(Row));
-        var out: []const u8 = "";
         const row_info = @typeInfo(Row).@"struct";
-        for (row_info.field_names, 0..) |f_name, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ f_name ++ "`";
-        }
-        break :blk out;
+        break :blk nameList(row_info.field_names);
     };
+}
+
+/// Names as one readable line, for a message: `` `epic_id`, `department_id` ``.
+/// Takes any slice of text, so a field-name list and a column list both come
+/// here rather than each file writing the loop again.
+pub fn nameList(comptime names: anytype) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (names, 0..) |n, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ n ++ "`";
+        return out;
+    }
+}
+
+/// `{ .a, .b }` for a message.
+pub fn columnTuple(comptime columns: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "{ ";
+        for (columns, 0..) |c, i| out = out ++ (if (i > 0) ", " else "") ++ "." ++ c;
+        return out ++ " }";
+    }
 }
 
 // -- what each field is (ADR 218) --------------------------------------
@@ -584,10 +600,7 @@ pub fn isColumnField(comptime Row: type, comptime name: []const u8) bool {
 /// The Row a parent field holds, with the optional taken off, or null when
 /// `T` is not one.
 pub fn parentRowOf(comptime T: type) ?type {
-    const Inner = switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    const Inner = types_mod.bare(T);
     return if (isRow(Inner)) Inner else null;
 }
 
@@ -595,10 +608,7 @@ pub fn parentRowOf(comptime T: type) ?type {
 /// An optional slice answers too, so that it reaches the Refusal that says a
 /// list of children is never null rather than a message about decoding.
 pub fn childRowOf(comptime T: type) ?type {
-    const Slice = switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    const Slice = types_mod.bare(T);
     return switch (@typeInfo(Slice)) {
         .pointer => |p| if (p.size == .slice and isRow(p.child)) p.child else null,
         else => null,
@@ -893,6 +903,54 @@ pub fn qualifiedOf(comptime Row: type) Qualified {
     return comptime qualifiedName(tableOf(Row), @typeName(Row) ++ " names");
 }
 
+/// The Row's table, quoted, with its schema in front when the Row named one.
+/// One function for every `FROM`, `INSERT INTO` and subquery, because they
+/// have to spell the same relation the same way.
+pub fn relation(comptime D: type, comptime Row: type) []const u8 {
+    return comptime blk: {
+        const q = qualifiedOf(Row);
+        break :blk D.qualify(q.schema, q.table);
+    };
+}
+
+/// The value a caller wrote out for one field of a struct literal.
+///
+/// **One field, never the whole struct.** Reading the whole struct's defaults
+/// would demand one from every other field too, and a sibling holding a
+/// runtime value — `.where = .{ .id = some_id }` beside a written-out
+/// `.limit` — has none. Getting that wrong meant a written limit only worked
+/// when everything around it was also written out, which is exactly the kind
+/// of rule nobody could have guessed.
+pub fn writtenValue(comptime T: type, comptime field: []const u8, comptime As: type) As {
+    comptime {
+        const t_info = @typeInfo(T).@"struct";
+        for (t_info.field_names, t_info.field_types, t_info.field_attrs) |f_name, f_type, f_attrs| {
+            if (!std.mem.eql(u8, f_name, field)) continue;
+            const written = f_attrs.default_value_ptr orelse @compileError(
+                "nilo: `." ++ field ++ "` has no value written out where it is used.\n" ++
+                    "  It is settled while compiling, so it has to be a literal " ++
+                    "rather than something worked out at run time.",
+            );
+            return @as(*const f_type, @ptrCast(@alignCast(written))).*;
+        }
+        unreachable;
+    }
+}
+
+/// `writtenValue` for a field whose type is the one it was written with,
+/// which is what a `.where` or an `.on` entry is.
+pub fn fieldValue(comptime T: type, comptime field: []const u8) writtenType(T, field) {
+    return comptime writtenValue(T, field, writtenType(T, field));
+}
+
+fn writtenType(comptime T: type, comptime field: []const u8) type {
+    const t_info = @typeInfo(T).@"struct";
+    for (t_info.field_names, t_info.field_types) |f_name, f_type| {
+        if (std.mem.eql(u8, f_name, field)) return f_type;
+    }
+    return void;
+}
+
 /// The same split, for a table named as text rather than by a Row — which a
 /// `.references` may do when the Row that owns it cannot be imported
 /// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
@@ -1000,13 +1058,7 @@ pub fn isKey(comptime Row: type, comptime column: []const u8) bool {
 
 /// The key's columns as one readable line, for a message.
 pub fn keyList(comptime Row: type) []const u8 {
-    return comptime blk: {
-        var out: []const u8 = "";
-        for (keysOf(Row), 0..) |c, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ c ++ "`";
-        }
-        break :blk out;
-    };
+    return comptime nameList(keysOf(Row));
 }
 
 /// Whether this program builds the table `Row` reads, or only reads it
@@ -1322,13 +1374,7 @@ pub fn noSuchColumn(
 /// The columns of `Row` as one readable line, for a message that has no
 /// better suggestion to make than the whole list.
 pub fn columnList(comptime Row: type) []const u8 {
-    return comptime blk: {
-        var out: []const u8 = "";
-        for (columnsOf(Row), 0..) |c, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ c ++ "`";
-        }
-        break :blk out;
-    };
+    return comptime nameList(columnsOf(Row));
 }
 
 // -- the marker, and the chain it may point along ------------------------

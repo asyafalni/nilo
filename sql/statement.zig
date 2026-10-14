@@ -85,6 +85,23 @@ pub const Direction = enum {
             .asc_nulls_last, .desc_nulls_last => .last,
         };
     }
+
+    /// The end of one order term: ` DESC` or ` ASC`, then the `NULLS` clause
+    /// when the caller asked for one. A slice rather than the array `++` would
+    /// infer, so the caller can join it to a name of any length.
+    ///
+    /// Written only when asked, so an order term that says nothing about NULLs
+    /// compiles to exactly the text it always did. `Row` and `column` are for
+    /// the Dialect that has no `NULLS` clause, whose refusal names them.
+    pub fn suffix(comptime self: Direction, comptime D: type, comptime Row: type, comptime column: []const u8) []const u8 {
+        comptime {
+            var out: []const u8 = if (self.descending()) " DESC" else " ASC";
+            if (self.placement()) |where_nulls| {
+                out = out ++ (D.nulls(where_nulls) orelse dialect_mod.noNullsOrder(D, Row, column));
+            }
+            return out;
+        }
+    }
 };
 
 /// The name a statement is prepared under, on a connection that keeps plans.
@@ -271,16 +288,6 @@ pub fn planNames(comptime stmt: Statement, comptime k: usize) [1 << k][]const u8
             slot.* = base ++ std.fmt.comptimePrint("_{x}", .{mask});
         }
         break :blk out;
-    };
-}
-
-/// The Row's table, quoted, with its schema in front when the Row named one.
-/// One function rather than seven call sites, because a `FROM` and an
-/// `INSERT INTO` have to spell the same relation the same way.
-pub fn relation(comptime D: type, comptime Row: type) []const u8 {
-    return comptime blk: {
-        const q = row_mod.qualifiedOf(Row);
-        break :blk D.qualify(q.schema, q.table);
     };
 }
 
@@ -473,7 +480,7 @@ fn rowsOf(
         // window function is SQL:2003 and SQLite has had them since 3.25.
         const total = if (answers == .page) ", count(*) OVER ()" else "";
         var sql: []const u8 = "SELECT " ++ readList(D, Row) ++ total ++
-            " FROM " ++ relation(D, Row);
+            " FROM " ++ row_mod.relation(D, Row);
 
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
@@ -648,8 +655,8 @@ pub fn afterOf(
             if (!std.mem.eql(u8, x_name, y_name)) same = false;
         };
         if (!same) @compileError(
-            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " has an `.after` over " ++ fieldList(held.field_names) ++
-                " and an `.order` over " ++ fieldList(sorted.field_names) ++ ".\n" ++
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " has an `.after` over " ++ row_mod.nameList(held.field_names) ++
+                " and an `.order` over " ++ row_mod.nameList(sorted.field_names) ++ ".\n" ++
                 "  A cursor holds the last row's value of each column the order sorts by, in the same order.",
         );
         const keys = row_mod.keysIfAnyOf(Row);
@@ -665,7 +672,7 @@ pub fn afterOf(
         );
         var descending: ?bool = null;
         for (sorted.field_names) |f_name| {
-            const direction: Direction = writtenValue(Order, f_name, Direction);
+            const direction: Direction = row_mod.writtenValue(Order, f_name, Direction);
             if (direction.placement() != null) @compileError(
                 "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor, and `.order." ++ f_name ++
                     "` says where NULLs go.\n" ++
@@ -730,14 +737,6 @@ pub fn afterOf(
     }
 }
 
-fn fieldList(comptime names: []const [:0]const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (names, 0..) |name, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ name ++ "`";
-        return out;
-    }
-}
-
 /// The option names an aggregate takes: a condition, and nothing else.
 ///
 /// `.order` on a statement answering one number sorts nothing, and `.limit`
@@ -778,7 +777,7 @@ fn tally(
         dialect_mod.assertDialect(D);
         assertOptions(Row, O, &known_tally, "an aggregate");
 
-        var sql: []const u8 = opening ++ relation(D, Row);
+        var sql: []const u8 = opening ++ row_mod.relation(D, Row);
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
 
@@ -817,7 +816,7 @@ pub fn find(comptime D: type, comptime Row: type, comptime K: type) Statement {
 
         break :blk .{
             .sql = "SELECT " ++ columnList(D, Row) ++
-                " FROM " ++ relation(D, Row) ++
+                " FROM " ++ row_mod.relation(D, Row) ++
                 " WHERE " ++ D.quote(key) ++ " = " ++
                 D.bindAs(D.placeholder(1), row_mod.ColumnType(Row, key), false) ++
                 D.limit("1"),
@@ -921,7 +920,7 @@ fn findComposite(
 
         return .{
             .sql = "SELECT " ++ columnList(D, Row) ++
-                " FROM " ++ relation(D, Row) ++
+                " FROM " ++ row_mod.relation(D, Row) ++
                 " WHERE " ++ conditions ++ D.limit("1"),
             .paths = paths,
             .params = params,
@@ -1032,7 +1031,7 @@ fn deleting(
         budget(Row, O);
         assertOptions(Row, O, &[_][]const u8{"where"}, "a delete");
 
-        var sql: []const u8 = "DELETE FROM " ++ relation(D, Row);
+        var sql: []const u8 = "DELETE FROM " ++ row_mod.relation(D, Row);
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
         var narrowed = false;
@@ -1237,7 +1236,7 @@ pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement 
         }
 
         break :blk .{
-            .sql = "INSERT INTO " ++ relation(D, Row) ++
+            .sql = "INSERT INTO " ++ row_mod.relation(D, Row) ++
                 " (" ++ names ++ ") VALUES (" ++ places ++ ")" ++
                 " RETURNING " ++ columnList(D, Row),
             .paths = paths,
@@ -1330,7 +1329,7 @@ pub fn insertMany(comptime D: type, comptime Row: type, comptime V: type) Statem
         // `names` is also the alias list of the `unnest`, so the select list
         // is the same names again and the ordinal rides one column past them.
         break :blk .{
-            .sql = "INSERT INTO " ++ relation(D, Row) ++
+            .sql = "INSERT INTO " ++ row_mod.relation(D, Row) ++
                 " (" ++ names ++ ") SELECT " ++ names ++
                 " FROM unnest(" ++ arrays ++ ") WITH ORDINALITY AS " ++
                 D.quote(batch_source) ++ "(" ++ names ++ ", " ++ D.quote(batch_ordinal) ++ ")" ++
@@ -1463,7 +1462,7 @@ pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statem
         }
 
         break :blk .{
-            .sql = "UPDATE " ++ relation(D, Row) ++ " AS " ++ batch_target ++
+            .sql = "UPDATE " ++ row_mod.relation(D, Row) ++ " AS " ++ batch_target ++
                 " SET " ++ sets ++
                 " FROM unnest(" ++ arrays ++ ") AS " ++ batch_source ++ "(" ++ aliases ++ ")" ++
                 " WHERE " ++ joined ++
@@ -1650,20 +1649,20 @@ fn assertConflictTarget(comptime D: type, comptime Row: type, comptime targets: 
         // A Row with no key is not one `createMissing` can build, so its
         // marker is not the whole account of its table either.
         if (keys.len == 0) return;
-        if (sameSet(targets, keys)) return;
+        if (table_mod.sameWords(targets, keys)) return;
 
         var folded: ?[]const u8 = null;
         var declared: []const u8 = "";
         for (table_mod.descOf(D, owner).uniques) |u| {
-            if (sameSet(targets, u.columns)) {
+            if (table_mod.sameWords(targets, u.columns)) {
                 if (!u.ignoring_case) return;
                 folded = u.name;
             }
-            declared = declared ++ "\n    ." ++ columnTuple(u.columns) ++
+            declared = declared ++ "\n    ." ++ row_mod.columnTuple(u.columns) ++
                 (if (u.ignoring_case) ", which ignores case" else "");
         }
 
-        const head = "nilo: an upsert on " ++ @typeName(Row) ++ " conflicts on ." ++ columnTuple(targets);
+        const head = "nilo: an upsert on " ++ @typeName(Row) ++ " conflicts on ." ++ row_mod.columnTuple(targets);
         if (folded) |name| @compileError(
             head ++ ", and the unique over it, `" ++ name ++ "`, ignores case.\n" ++
                 "  That unique is an index on lower(…) on Postgres and a COLLATE NOCASE one on " ++
@@ -1676,34 +1675,11 @@ fn assertConflictTarget(comptime D: type, comptime Row: type, comptime targets: 
             head ++ ", and neither its key nor any `.unique` in its marker is over those columns.\n" ++
                 "  The database refuses an `ON CONFLICT` with no constraint behind it, the first " ++
                 "time the statement runs.\n" ++
-                "  The key is ." ++ columnTuple(keys) ++
+                "  The key is ." ++ row_mod.columnTuple(keys) ++
                 (if (declared.len > 0) ", and the uniques are:" ++ declared else ", and there is no `.unique`.") ++
-                "\n  Declare `.unique = .{ ." ++ columnTuple(targets) ++ " }` if the table has one, or " ++
+                "\n  Declare `.unique = .{ ." ++ row_mod.columnTuple(targets) ++ " }` if the table has one, or " ++
                 "`.managed = false` if this program does not build the table.",
         );
-    }
-}
-
-/// Two column lists naming the same columns, in any order. An `ON CONFLICT`
-/// list and a unique index match as sets.
-fn sameSet(comptime a: []const []const u8, comptime b: []const []const u8) bool {
-    comptime {
-        if (a.len != b.len) return false;
-        for (a) |x| {
-            for (b) |y| {
-                if (std.mem.eql(u8, x, y)) break;
-            } else return false;
-        }
-        return true;
-    }
-}
-
-/// `{ .a, .b }` for a message.
-fn columnTuple(comptime columns: []const []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "{ ";
-        for (columns, 0..) |c, i| out = out ++ (if (i > 0) ", " else "") ++ "." ++ c;
-        return out ++ " }";
     }
 }
 
@@ -1736,7 +1712,7 @@ fn assertTargetWritten(
             if (@hasField(V, name)) continue;
             @compileError(
                 "nilo: `" ++ (if (action == .update) "db.insertOrUpdate" else "db.insertOrIgnore") ++
-                    "` on " ++ @typeName(Row) ++ " conflicts on ." ++ columnTuple(targets) ++
+                    "` on " ++ @typeName(Row) ++ " conflicts on ." ++ row_mod.columnTuple(targets) ++
                     ", and the values written do not carry `" ++ name ++ "`.\n" ++
                     "  A row conflicts on the value it is inserted with. Without `" ++ name ++
                     "` it takes its default, which is new every time, so the statement never " ++
@@ -2139,7 +2115,7 @@ fn updating(
                 "  An update that changes no column is not a statement worth sending.",
         );
 
-        var sql: []const u8 = "UPDATE " ++ relation(D, Row) ++ " SET ";
+        var sql: []const u8 = "UPDATE " ++ row_mod.relation(D, Row) ++ " SET ";
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
         var next: usize = 1;
@@ -2280,7 +2256,7 @@ fn lockedBy(comptime D: type, comptime Row: type, comptime O: type) []const u8 {
                 "`.share`, written out where it is used — which lock a read takes " ++
                 "is settled while compiling.",
         );
-        const mode: dialect_mod.Lock = writtenValue(O, "lock", dialect_mod.Lock);
+        const mode: dialect_mod.Lock = row_mod.writtenValue(O, "lock", dialect_mod.Lock);
         return D.lock(mode) orelse dialect_mod.noRowLock(D, Row);
     }
 }
@@ -2329,7 +2305,7 @@ pub fn lastDescending(comptime Order: type) bool {
         const last_name = info.field_names[info.field_names.len - 1];
         const last_type = info.field_types[info.field_names.len - 1];
         if (@typeInfo(last_type) == .@"struct") return lastDescending(last_type);
-        return writtenValue(Order, last_name, Direction).descending();
+        return row_mod.writtenValue(Order, last_name, Direction).descending();
     }
 }
 
@@ -2396,41 +2372,11 @@ fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
                     "say where NULLs go, `.asc_nulls_last` and its three siblings. It is " ++
                     "settled while compiling: a sort chosen at run time is two statements.",
             );
-            const direction: Direction = writtenValue(T, f_name, Direction);
+            const direction: Direction = row_mod.writtenValue(T, f_name, Direction);
             if (i > 0) out = out ++ ", ";
-            out = out ++ D.quote(f_name) ++ (if (direction.descending()) " DESC" else " ASC");
-            // Written only when the caller asked, so an order term that says
-            // nothing about NULLs compiles to exactly the text it always did.
-            if (direction.placement()) |where_nulls| {
-                out = out ++ (D.nulls(where_nulls) orelse
-                    dialect_mod.noNullsOrder(D, Row, f_name));
-            }
+            out = out ++ D.quote(f_name) ++ direction.suffix(D, Row, f_name);
         }
         return out;
-    }
-}
-
-/// The value a caller wrote out for one field of a struct literal.
-///
-/// **One field, never the whole struct.** Reading the whole struct's defaults
-/// would demand one from every other field too, and a sibling holding a
-/// runtime value — `.where = .{ .id = some_id }` beside a written-out
-/// `.limit` — has none. Getting that wrong meant a written limit only worked
-/// when everything around it was also written out, which is exactly the kind
-/// of rule nobody could have guessed.
-pub fn writtenValue(comptime T: type, comptime field: []const u8, comptime As: type) As {
-    comptime {
-        const t_info = @typeInfo(T).@"struct";
-        for (t_info.field_names, t_info.field_types, t_info.field_attrs) |f_name, f_type, f_attrs| {
-            if (!std.mem.eql(u8, f_name, field)) continue;
-            const written = f_attrs.default_value_ptr orelse @compileError(
-                "nilo: `." ++ field ++ "` has no value written out where it is used.\n" ++
-                    "  It is settled while compiling, so it has to be a literal " ++
-                    "rather than something worked out at run time.",
-            );
-            return @as(*const f_type, @ptrCast(@alignCast(written))).*;
-        }
-        unreachable;
     }
 }
 
@@ -2454,7 +2400,7 @@ pub fn boundary(
     comptime {
         const T = @FieldType(O, field);
         if (T == comptime_int) {
-            const value = writtenValue(O, field, comptime_int);
+            const value = row_mod.writtenValue(O, field, comptime_int);
             if (value < 0) @compileError(
                 "nilo: `." ++ field ++ "` is " ++
                     std.fmt.comptimePrint("{d}", .{value}) ++ ".\n" ++

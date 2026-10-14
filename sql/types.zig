@@ -177,14 +177,21 @@ pub const UnixMillis = Unix(.millis);
 /// Unix seconds in an integer column.
 pub const UnixSeconds = Unix(.seconds);
 
+/// `T` without its `?`: the type a column is bound and compared as, whether
+/// or not it may be null. Written once here because every file that asks "is
+/// this text, a decimal, a uuid" asks it of the bare type.
+pub fn bare(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+}
+
 /// Whether `T` is a `Unix(unit)`, optional included. Asked by both Wires and
 /// both Dialects, which treat one as the `i64` it travels as.
 pub fn isUnix(comptime T: type) bool {
     return comptime blk: {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = bare(T);
         break :blk @typeInfo(Inner) == .@"struct" and @hasDecl(Inner, "nilo_unix");
     };
 }
@@ -194,10 +201,7 @@ pub fn isUnix(comptime T: type) bool {
 /// same reason.
 pub fn isDate(comptime T: type) bool {
     return comptime blk: {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = bare(T);
         break :blk Inner == Date;
     };
 }
@@ -327,10 +331,7 @@ pub const Bytes = @import("wire.zig").Bytes;
 /// reason a binary column could not be named until this type existed.
 pub fn isBytes(comptime T: type) bool {
     return comptime blk: {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = bare(T);
         break :blk Inner == Bytes;
     };
 }
@@ -368,10 +369,7 @@ pub fn isNumericText(comptime T: type) bool {
 /// written and never read.
 pub fn asText(comptime T: type) ?[]const u8 {
     return comptime blk: {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = bare(T);
         switch (@typeInfo(Inner)) {
             .@"struct", .@"enum" => {},
             else => break :blk null,
@@ -415,10 +413,7 @@ pub fn asText(comptime T: type) ?[]const u8 {
 /// column is caught by `checking`, which is where every other unreadable
 /// column type is caught.
 pub fn listElement(comptime T: type) ?type {
-    const Inner = switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    const Inner = bare(T);
     const info = @typeInfo(Inner);
     if (info != .pointer) return null;
     if (info.pointer.size != .slice) return null;
@@ -513,7 +508,6 @@ fn textOf(value: anytype, buf: []u8) ![]const u8 {
     try value.writeRfc3339(&w);
     return w.buffered();
 }
-
 
 test "the wire counts from 2000 and the type counts from 1970" {
     // One shift, in the Wire, so nothing above it has to know — the same

@@ -1086,7 +1086,7 @@ pub fn plan(
     // (`viewOrder`), so a view's dependencies are settled before it is.
     const remade = try gpa.alloc(bool, desired.views.len);
     for (desired.views, 0..) |v, i| {
-        const old = findNamed(before.views, v.name);
+        const old = findByName(table_mod.NamedText, before.views, v.name);
         remade[i] = old != null and (!old.?.sameAs(v) or readsAny(v.body, shaped.items) or
             readsRemade(v.body, desired.views[0..i], remade[0..i]));
     }
@@ -1121,7 +1121,7 @@ pub fn plan(
         });
     }
     for (desired.functions) |f| {
-        const old = findNamed(before.functions, f.name);
+        const old = findByName(table_mod.NamedText, before.functions, f.name);
         if (old != null and old.?.sameAs(f)) continue;
         try steps.append(gpa, .{
             .kind = .create_function,
@@ -1136,7 +1136,7 @@ pub fn plan(
 
     // Views after the tables they read are in their final shape.
     for (desired.views, 0..) |v, i| {
-        if (findNamed(before.views, v.name) != null and !remade[i]) continue;
+        if (findByName(table_mod.NamedText, before.views, v.name) != null and !remade[i]) continue;
         try steps.append(gpa, .{
             .kind = .create_view,
             .sql = try ddl.createView(gpa, v),
@@ -1147,7 +1147,7 @@ pub fn plan(
     // have gone with their tables; an extension last of all, and destructive,
     // because dropping one drops every object it made.
     for (before.functions) |old| {
-        if (findNamed(desired.functions, old.name) != null) continue;
+        if (findByName(table_mod.NamedText, desired.functions, old.name) != null) continue;
         try steps.append(gpa, .{
             .kind = .drop_function,
             .sql = try ddl.dropFunction(gpa, old.name),
@@ -1826,9 +1826,9 @@ fn diffIndexes(
     steps: *std.ArrayList(Step),
 ) !void {
     for (t.desc.uniques) |u| {
-        const before = findUnique(old.uniques, u.name);
+        const before = findByName(table_mod.Unique, old.uniques, u.name);
         if (before != null and sameUniqueThrough(before.?, u, renames)) continue;
-        if (comptime D.can_alter_constraint) if (before == null) if (carriedUnique(D, old, t.desc, u, renames)) |was| {
+        if (comptime D.can_alter_constraint) if (before == null) if (try carriedFrom(table_mod.Unique, gpa, old.uniques, t.desc.uniques, u, renames)) |was| {
             try steps.append(gpa, .{
                 .kind = .rename_index,
                 .sql = try ddl.renameIndex(D, gpa, t.desc.schema, was, u.name),
@@ -1846,9 +1846,9 @@ fn diffIndexes(
         });
     }
     for (t.desc.indexes) |x| {
-        const before = findIndex(old.indexes, x.name);
+        const before = findByName(table_mod.Index, old.indexes, x.name);
         if (before != null and try sameIndexThrough(gpa, before.?, x, renames)) continue;
-        if (comptime D.can_alter_constraint) if (before == null) if (try carriedIndex(gpa, D, old, t.desc, x, renames)) |was| {
+        if (comptime D.can_alter_constraint) if (before == null) if (try carriedFrom(table_mod.Index, gpa, old.indexes, t.desc.indexes, x, renames)) |was| {
             try steps.append(gpa, .{
                 .kind = .rename_index,
                 .sql = try ddl.renameIndex(D, gpa, t.desc.schema, was, x.name),
@@ -1906,7 +1906,7 @@ fn dropGoneIndexes(
     steps: *std.ArrayList(Step),
 ) !void {
     for (old.uniques) |u| {
-        if (findUnique(t.desc.uniques, u.name)) |now| {
+        if (findByName(table_mod.Unique, t.desc.uniques, u.name)) |now| {
             if (!sameUniqueThrough(u, now, renames)) try steps.append(gpa, .{
                 .kind = .drop_index,
                 .sql = try ddl.dropIndex(D, gpa, t.desc.schema, u.name),
@@ -1914,7 +1914,7 @@ fn dropGoneIndexes(
             });
             continue;
         }
-        if (renamedUnique(D, u, t.desc, renames)) continue;
+        if (comptime D.can_alter_constraint) if (try renamedIn(table_mod.Unique, gpa, u, t.desc.uniques, renames)) continue;
         try steps.append(gpa, .{
             .kind = .drop_index,
             .sql = try ddl.dropIndex(D, gpa, t.desc.schema, u.name),
@@ -1922,7 +1922,7 @@ fn dropGoneIndexes(
         });
     }
     for (old.indexes) |x| {
-        if (findIndex(t.desc.indexes, x.name)) |now| {
+        if (findByName(table_mod.Index, t.desc.indexes, x.name)) |now| {
             if (!try sameIndexThrough(gpa, x, now, renames)) try steps.append(gpa, .{
                 .kind = .drop_index,
                 .sql = try ddl.dropIndex(D, gpa, t.desc.schema, x.name),
@@ -1930,7 +1930,7 @@ fn dropGoneIndexes(
             });
             continue;
         }
-        if (try renamedIndex(gpa, D, x, t.desc, renames)) continue;
+        if (comptime D.can_alter_constraint) if (try renamedIn(table_mod.Index, gpa, x, t.desc.indexes, renames)) continue;
         try steps.append(gpa, .{
             .kind = .drop_index,
             .sql = try ddl.dropIndex(D, gpa, t.desc.schema, x.name),
@@ -1974,43 +1974,47 @@ fn sameIndexThrough(gpa: std.mem.Allocator, was: table_mod.Index, now: table_mod
         std.mem.eql(u8, try whereThrough(gpa, was.where, renames), now.where);
 }
 
-/// The old unique that `u` is once `renames` have run, when the Dialect
-/// can rename an index and none of the new ones has the old one's name.
-fn carriedUnique(comptime D: type, old: Desc, now: Desc, u: table_mod.Unique, renames: []const table_mod.Rename) ?[]const u8 {
-    if (comptime !D.can_alter_constraint) return null;
+/// Whether `now` is `was` once `renames` have run, for the three kinds of
+/// object a rename can carry along: a unique, an index, a foreign key.
+fn sameThrough(comptime T: type, gpa: std.mem.Allocator, was: T, now: T, renames: []const table_mod.Rename) !bool {
+    return switch (T) {
+        table_mod.Unique => sameUniqueThrough(was, now, renames),
+        table_mod.Index => try sameIndexThrough(gpa, was, now, renames),
+        table_mod.Reference => sameReferenceThrough(was, now, renames),
+        else => @compileError("nilo: no rename comparison for " ++ @typeName(T)),
+    };
+}
+
+/// The name of the old object that `x` is once `renames` have run, under a
+/// name none of `now_list` has. The caller says whether the Dialect can rename
+/// the kind of object at all.
+fn carriedFrom(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    old_list: []const T,
+    now_list: []const T,
+    x: T,
+    renames: []const table_mod.Rename,
+) !?[]const u8 {
     if (renames.len == 0) return null;
-    for (old.uniques) |o| {
-        if (findUnique(now.uniques, o.name) != null) continue;
-        if (sameUniqueThrough(o, u, renames)) return o.name;
+    for (old_list) |o| {
+        if (findByName(T, now_list, o.name) != null) continue;
+        if (try sameThrough(T, gpa, o, x, renames)) return o.name;
     }
     return null;
 }
 
-fn carriedIndex(gpa: std.mem.Allocator, comptime D: type, old: Desc, now: Desc, x: table_mod.Index, renames: []const table_mod.Rename) !?[]const u8 {
-    if (comptime !D.can_alter_constraint) return null;
-    if (renames.len == 0) return null;
-    for (old.indexes) |o| {
-        if (findIndex(now.indexes, o.name) != null) continue;
-        if (try sameIndexThrough(gpa, o, x, renames)) return o.name;
-    }
-    return null;
-}
-
-/// Whether an old unique goes on under a new name, so is renamed and not
+/// Whether an old object goes on under a new name, so is renamed and not
 /// dropped.
-fn renamedUnique(comptime D: type, o: table_mod.Unique, now: Desc, renames: []const table_mod.Rename) bool {
-    if (comptime !D.can_alter_constraint) return false;
+fn renamedIn(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    o: T,
+    now_list: []const T,
+    renames: []const table_mod.Rename,
+) !bool {
     if (renames.len == 0) return false;
-    for (now.uniques) |u| if (sameUniqueThrough(o, u, renames)) return true;
-    return false;
-}
-
-fn renamedIndex(gpa: std.mem.Allocator, comptime D: type, o: table_mod.Index, now: Desc, renames: []const table_mod.Rename) !bool {
-    if (comptime !D.can_alter_constraint) return false;
-    if (renames.len == 0) return false;
-    for (now.indexes) |x| {
-        if (try sameIndexThrough(gpa, o, x, renames)) return true;
-    }
+    for (now_list) |x| if (try sameThrough(T, gpa, o, x, renames)) return true;
     return false;
 }
 
@@ -2034,7 +2038,7 @@ fn diffChecks(
     problems: *std.ArrayList(Problem),
 ) !void {
     for (t.desc.checks) |ck| {
-        const before = findNamed(old.checks, ck.name);
+        const before = findByName(table_mod.NamedText, old.checks, ck.name);
         if (before != null and before.?.sameAs(ck)) continue;
         if (comptime !D.can_alter_constraint) {
             try problems.append(gpa, .{
@@ -2065,7 +2069,7 @@ fn diffChecks(
     }
 
     for (old.checks) |o| {
-        if (findNamed(t.desc.checks, o.name) != null) continue;
+        if (findByName(table_mod.NamedText, t.desc.checks, o.name) != null) continue;
         if (comptime !D.can_alter_constraint) {
             try problems.append(gpa, .{
                 .table = t.desc.table,
@@ -2102,7 +2106,7 @@ fn diffTriggers(
     steps: *std.ArrayList(Step),
 ) !void {
     for (t.desc.triggers) |tr| {
-        const before = findNamed(old.triggers, tr.name);
+        const before = findByName(table_mod.NamedText, old.triggers, tr.name);
         // Already dropped by `dropTriggersNamingRetyped`, so it is made again
         // here whether or not its text moved.
         const down = hasName(early, tr.name);
@@ -2120,7 +2124,7 @@ fn diffTriggers(
     }
 
     for (old.triggers) |o| {
-        if (findNamed(t.desc.triggers, o.name) != null) continue;
+        if (findByName(table_mod.NamedText, t.desc.triggers, o.name) != null) continue;
         if (hasName(early, o.name)) continue;
         try steps.append(gpa, .{
             .kind = .drop_trigger,
@@ -2151,7 +2155,7 @@ fn dropTriggersNamingRetyped(
     if (retyped.len == 0) return &.{};
     var early: std.ArrayList([]const u8) = .empty;
     for (old.triggers) |o| {
-        if (findNamed(t.desc.triggers, o.name)) |now| {
+        if (findByName(table_mod.NamedText, t.desc.triggers, o.name)) |now| {
             if (now.sameAs(o) and !mentionsAny(now.body, retyped) and !mentionsAny(now.tail, retyped)) continue;
         }
         try steps.append(gpa, .{
@@ -2174,9 +2178,11 @@ fn mentionsAny(text: []const u8, names: []const []const u8) bool {
     return false;
 }
 
-fn findNamed(list: []const table_mod.NamedText, name: []const u8) ?table_mod.NamedText {
-    for (list) |n| {
-        if (std.mem.eql(u8, n.name, name)) return n;
+/// The entry of `list` called `name`, for any kind of object a table
+/// description lists by name.
+fn findByName(comptime T: type, list: []const T, name: []const u8) ?T {
+    for (list) |x| {
+        if (std.mem.eql(u8, x.name, name)) return x;
     }
     return null;
 }
@@ -2239,11 +2245,11 @@ fn diffReferences(
     problems: *std.ArrayList(Problem),
 ) !void {
     for (t.desc.references) |r| {
-        const before = findReference(old.references, r.name);
+        const before = findByName(table_mod.Reference, old.references, r.name);
         if (before != null and sameReferenceThrough(before.?, r, renames)) continue;
         // The key of a new column went with the column, in `diffTable`.
         if (before == null and r.columns.len == 1 and columnBefore(old, r.columns[0], renames) == null) continue;
-        if (before == null) if (carriedReference(old, t.desc, r, renames)) |was| {
+        if (before == null) if (try carriedFrom(table_mod.Reference, gpa, old.references, t.desc.references, r, renames)) |was| {
             if (comptime D.can_alter_constraint) try steps.append(gpa, .{
                 .kind = .rename_constraint,
                 .sql = try ddl.renameConstraint(D, gpa, t.desc, was, r.name),
@@ -2269,8 +2275,8 @@ fn diffReferences(
         });
     }
     for (old.references) |o| {
-        if (findReference(t.desc.references, o.name) != null) continue;
-        if (renamedReference(o, t.desc, renames)) continue;
+        if (findByName(table_mod.Reference, t.desc.references, o.name) != null) continue;
+        if (try renamedIn(table_mod.Reference, gpa, o, t.desc.references, renames)) continue;
         try problems.append(gpa, .{
             .table = t.desc.table,
             .column = try plainList(gpa, o.columns),
@@ -2291,23 +2297,6 @@ fn sameReferenceThrough(was: table_mod.Reference, now: table_mod.Reference, rena
         table_mod.sameSchema(was.schema, now.schema) and
         table_mod.sameColumns(was.targets, now.targets) and
         was.on_delete == now.on_delete;
-}
-
-/// The old foreign key `r` is once `renames` have run, under a name no new
-/// key has.
-fn carriedReference(old: Desc, now: Desc, r: table_mod.Reference, renames: []const table_mod.Rename) ?[]const u8 {
-    if (renames.len == 0) return null;
-    for (old.references) |o| {
-        if (findReference(now.references, o.name) != null) continue;
-        if (sameReferenceThrough(o, r, renames)) return o.name;
-    }
-    return null;
-}
-
-fn renamedReference(o: table_mod.Reference, now: Desc, renames: []const table_mod.Rename) bool {
-    if (renames.len == 0) return false;
-    for (now.references) |r| if (sameReferenceThrough(o, r, renames)) return true;
-    return false;
 }
 
 /// `"a", "b"` — the columns of a foreign key as they go inside a statement.
@@ -2331,27 +2320,6 @@ fn plainList(gpa: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
         try aw.writer.writeAll(c);
     }
     return aw.toOwnedSlice();
-}
-
-fn findUnique(list: []const table_mod.Unique, name: []const u8) ?table_mod.Unique {
-    for (list) |u| {
-        if (std.mem.eql(u8, u.name, name)) return u;
-    }
-    return null;
-}
-
-fn findIndex(list: []const table_mod.Index, name: []const u8) ?table_mod.Index {
-    for (list) |x| {
-        if (std.mem.eql(u8, x.name, name)) return x;
-    }
-    return null;
-}
-
-fn findReference(list: []const table_mod.Reference, name: []const u8) ?table_mod.Reference {
-    for (list) |r| {
-        if (std.mem.eql(u8, r.name, name)) return r;
-    }
-    return null;
 }
 
 /// The `CREATE INDEX` for one name, out of the constants the type compiled to.

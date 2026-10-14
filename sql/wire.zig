@@ -821,10 +821,7 @@ pub const Fake = struct {
         col: usize,
         arena: std.mem.Allocator,
     ) Error!L {
-        const Slice = switch (@typeInfo(L)) {
-            .optional => |o| o.child,
-            else => L,
-        };
+        const Slice = types_mod.bare(L);
         const Item = @typeInfo(Slice).pointer.child;
         const out = arena.alloc(Item, 2) catch return error.QueryFailed;
         for (out) |*item| item.* = try self.read(rows, Item, col);

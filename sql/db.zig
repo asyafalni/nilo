@@ -444,22 +444,22 @@ fn constraintSpellings(comptime Row: type, comptime columns: anytype) []const []
         const wanted = columnsNamed(Row, columns);
 
         const keys = row_mod.keysIfAnyOf(owner);
-        if (keys.len > 0 and sameSet(wanted, keys)) {
+        if (keys.len > 0 and table_mod.sameWords(wanted, keys)) {
             const out = [_][]const u8{ pkeyName(desc.table), sqliteSpelling(desc.table, keys) };
             return &out;
         }
         var declared: []const u8 = "";
         for (desc.uniques) |u| {
-            if (sameSet(wanted, u.columns)) {
+            if (table_mod.sameWords(wanted, u.columns)) {
                 const out = [_][]const u8{ u.name, sqliteSpelling(desc.table, u.columns) };
                 return &out;
             }
-            declared = declared ++ "\n    ." ++ tupleOf(u.columns);
+            declared = declared ++ "\n    ." ++ row_mod.columnTuple(u.columns);
         }
         @compileError(
-            "nilo: `sql.violated` asks about " ++ @typeName(Row) ++ "'s ." ++ tupleOf(wanted) ++
+            "nilo: `sql.violated` asks about " ++ @typeName(Row) ++ "'s ." ++ row_mod.columnTuple(wanted) ++
                 ", and neither its key nor any `.unique` is over those columns.\n" ++
-                "  The key is ." ++ tupleOf(keys) ++
+                "  The key is ." ++ row_mod.columnTuple(keys) ++
                 (if (declared.len > 0) ", and the uniques are:" ++ declared else ", and it declares no `.unique`.") ++
                 "\n  A constraint the marker does not declare is one this cannot name for you.",
         );
@@ -501,31 +501,11 @@ fn columnsNamed(comptime Row: type, comptime columns: anytype) []const []const u
     }
 }
 
-fn sameSet(comptime a: []const []const u8, comptime b: []const []const u8) bool {
-    comptime {
-        if (a.len != b.len) return false;
-        for (a) |x| {
-            for (b) |y| {
-                if (std.mem.eql(u8, x, y)) break;
-            } else return false;
-        }
-        return true;
-    }
-}
-
 fn sqliteSpelling(comptime table: []const u8, comptime columns: []const []const u8) []const u8 {
     comptime {
         var out: []const u8 = "";
         for (columns, 0..) |c, i| out = out ++ (if (i > 0) ", " else "") ++ table ++ "." ++ c;
         return out;
-    }
-}
-
-fn tupleOf(comptime columns: []const []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "{ ";
-        for (columns, 0..) |c, i| out = out ++ (if (i > 0) ", " else "") ++ "." ++ c;
-        return out ++ " }";
     }
 }
 
@@ -5149,15 +5129,9 @@ fn assertReadable(comptime Row: type) void {
                 },
                 .column, .aggregate, .over_children, .through => {},
             }
-            const Column = switch (@typeInfo(f_type)) {
-                .optional => |o| o.child,
-                else => f_type,
-            };
+            const Column = types.bare(f_type);
             const listed = types.listElement(Column) != null;
-            const Item = if (types.listElement(Column)) |I| switch (@typeInfo(I)) {
-                .optional => |o| o.child,
-                else => I,
-            } else Column;
+            const Item = if (types.listElement(Column)) |I| types.bare(I) else Column;
             if (numberNoneStores(Item, listed)) |why| @compileError(
                 "nilo: " ++ @typeName(Row) ++ " reads `" ++ f_name ++ "` as " ++
                     @typeName(f_type) ++ ", " ++ why,
@@ -5201,10 +5175,7 @@ fn assertReadable(comptime Row: type) void {
 /// `db.raw([]i64, …)` would read as a slice of rows, which is what the
 /// answer already is.
 fn scalarColumn(comptime T: type) bool {
-    const Inner = switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    const Inner = types.bare(T);
     if (@typeInfo(Inner) == .@"struct" and @hasDecl(Inner, row_mod.marker)) return false;
     return readable(Inner);
 }
@@ -5301,10 +5272,7 @@ fn assertStreamable(comptime Row: type) void {
                 ),
                 .column, .aggregate, .over_children, .through => {},
             }
-            const Inner = switch (@typeInfo(f_type)) {
-                .optional => |o| o.child,
-                else => f_type,
-            };
+            const Inner = types.bare(f_type);
             if (types.jsonPayload(Inner) != null) @compileError(
                 "nilo: " ++ @typeName(Row) ++ " reads `" ++ f_name ++ "` as a Json column, " ++
                     "and a streamed row cannot hold one.\n" ++

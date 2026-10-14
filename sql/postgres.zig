@@ -1124,10 +1124,7 @@ pub const Wire = struct {
     /// counts: a `Timestamp` over a moment was taken above by its OID, and
     /// one over an `int8` is the number it is.
     fn numberOf(comptime T: type) ?type {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
         return switch (@typeInfo(Inner)) {
             .int, .float => Inner,
             else => null,

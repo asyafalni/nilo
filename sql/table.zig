@@ -624,10 +624,7 @@ fn unreadFields(comptime unread: []const row_mod.Unread) []const row_mod.Field {
 /// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 pub fn enumValues(comptime T: type) []const []const u8 {
     comptime {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types_mod.bare(T);
         if (@typeInfo(Inner) != .@"enum") return &.{};
         if (types_mod.declaredColumn(Inner) != null) return &.{};
 
@@ -833,14 +830,14 @@ pub fn literalText(
             else if (isTextLiteral(W)) @compileError(
                 "nilo: " ++ what ++ " gives " ++ mine ++ " text, and " ++
                     "the column holds one of " ++ @typeName(Inner) ++ "'s words.\n" ++
-                    "  They are written the way a column is: " ++ namedList(words) ++
+                    "  They are written the way a column is: " ++ row_mod.nameList(words) ++
                     " — so `." ++ words[0] ++ "` rather than `\"" ++ words[0] ++ "\"`.",
             ) else @compileError(
                 "nilo: " ++ what ++ " gives " ++ mine ++ " a " ++ @typeName(W) ++ ", and " ++
                     "the column holds one of " ++ @typeName(Inner) ++ "'s words.\n" ++
                     "  Write the word as an enum literal, `." ++ words[0] ++ "`, or a list of them " ++
                     "as a tuple, `.{ ." ++ words[0] ++ " }`; a value of " ++ @typeName(Inner) ++
-                    " itself is taken too. They are " ++ namedList(words) ++ ".",
+                    " itself is taken too. They are " ++ row_mod.nameList(words) ++ ".",
             );
             for (words) |w| {
                 if (std.mem.eql(u8, w, tag)) return quoteLiteral(w);
@@ -848,7 +845,7 @@ pub fn literalText(
             @compileError(
                 "nilo: " ++ what ++ " gives " ++ mine ++ " `." ++ tag ++
                     "`, which is not one of " ++ @typeName(Inner) ++ "'s words.\n" ++
-                    "  They are " ++ namedList(words) ++ ".",
+                    "  They are " ++ row_mod.nameList(words) ++ ".",
             );
         }
 
@@ -952,7 +949,7 @@ fn arrayElement(
             @compileError(
                 "nilo: " ++ what ++ " gives " ++ mine ++ " a list holding `." ++
                     @tagName(written) ++ "`, which is not one of " ++ @typeName(Bare) ++
-                    "'s words.\n  They are " ++ namedList(words) ++ ".",
+                    "'s words.\n  They are " ++ row_mod.nameList(words) ++ ".",
             );
         }
         if (Bare == bool) {
@@ -1036,10 +1033,7 @@ fn wrongLiteral(
 }
 
 fn unwrap(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
+    return types_mod.bare(T);
 }
 
 /// Whether a column holds text — the same three shapes `dialect.acceptsInner`
@@ -1285,15 +1279,6 @@ fn wordList(comptime words: []const []const u8) []const u8 {
     }
 }
 
-/// A list of names, for a message: `` `a`, `b` ``.
-fn namedList(comptime names: []const []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (names, 0..) |n, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ n ++ "`";
-        return out;
-    }
-}
-
 fn checkColumn(comptime Row: type, comptime what: []const u8, comptime name: []const u8) void {
     comptime {
         if (!row_mod.hasColumn(Row, name)) row_mod.noSuchColumn(Row, name, "`." ++ what ++ "`");
@@ -1344,7 +1329,7 @@ fn entryName(
         checkIdentifier(
             derived,
             "the name nilo derives for " ++ @typeName(Row) ++ "'s `." ++ what ++ "` over " ++
-                namedList(columns) ++ " is `" ++ derived ++ "`, which",
+                row_mod.nameList(columns) ++ " is `" ++ derived ++ "`, which",
             "Give the entry a `.name` that says what it is for.",
         );
         return derived;
@@ -1410,10 +1395,7 @@ fn uniquesOf(
 fn checkText(comptime Row: type, comptime name: []const u8) void {
     comptime {
         const T = row_mod.ColumnType(Row, name);
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types_mod.bare(T);
         // The same two shapes `dialect.acceptsInner` calls text, asked here in
         // the same order, so a column that reads as text is a column that can
         // have its case folded.

@@ -60,7 +60,7 @@ pub const Doc = struct {
     pub fn table(self: Doc, schema: ?[]const u8, name: []const u8) ?Desc {
         for (self.tables) |t| {
             if (!std.mem.eql(u8, t.table, name)) continue;
-            if (sameSchema(t.schema, schema)) return t;
+            if (table_mod.sameSchema(t.schema, schema)) return t;
         }
         return null;
     }
@@ -70,12 +70,6 @@ pub const Doc = struct {
 /// makes the first `generate` write a `CREATE TABLE` for everything.
 pub fn empty(comptime D: type) Doc {
     return .{ .version = 0, .dialect = D.name, .tables = &.{} };
-}
-
-fn sameSchema(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// The line the file opens with.

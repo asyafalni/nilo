@@ -152,7 +152,7 @@ pub fn width(comptime Row: type) usize {
 fn layoutOf(comptime D: type, comptime Row: type) Layout {
     comptime {
         @setEvalBranchQuota(row_mod.shapeBudget(Row));
-        const relation = statement.relation(D, Row);
+        const relation = row_mod.relation(D, Row);
         var joins: []const Join = &.{};
         var outputs: []const Output = &.{};
         var wanted: []const GroupKey = &.{};
@@ -250,7 +250,7 @@ fn visit(
                     joins.* = joins.* ++ &[_]Join{.{
                         .alias = name,
                         .text = (if (left) " LEFT JOIN " else " JOIN ") ++
-                            statement.relation(D, Parent) ++ " AS " ++ alias ++ " ON " ++ on,
+                            row_mod.relation(D, Parent) ++ " AS " ++ alias ++ " ON " ++ on,
                         // An inner join leaves out a row whose parent is not
                         // there, which a table without the foreign key, or
                         // one deferred inside a transaction, can hold. So a
@@ -343,31 +343,71 @@ const ThroughColumn = struct {
     last: []const u8,
 };
 
-fn throughColumn(comptime Level: type, comptime field: []const u8) ThroughColumn {
+/// One reference a `nilo_through` field follows: the column that points, the
+/// Row and key it points at, the dotted path of columns that reached it, and
+/// whether the column may be null and a field says `.join = .inner` through it.
+const Hop = struct {
+    column: []const u8,
+    row: type,
+    target: []const u8,
+    chain: []const u8,
+    nullable: bool,
+    inner: bool,
+};
+
+/// The path a `nilo_through` field walks, resolved once: the hops, the Row
+/// the last one ends on, and the column read there. **Both the type check
+/// (`throughColumn`) and the joins (`throughOf`) read this**, because two
+/// walks of the same path drifted apart once (item 109's `.join = .inner`).
+const ThroughWalk = struct {
+    hops: []const Hop,
+    End: type,
+    last: []const u8,
+};
+
+fn throughWalk(comptime Level: type, comptime field: []const u8) ThroughWalk {
     comptime {
         const steps = row_mod.throughPath(Level, field);
         const what = @typeName(Level) ++ "'s `." ++ field ++ "`";
         var R = row_mod.ownerOf(Level);
-        var nullable = false;
-        var narrows = false;
         var chain: []const u8 = "";
+        var hops: []const Hop = &.{};
         for (steps[0 .. steps.len - 1], 0..) |column, i| {
             if (!row_mod.hasColumn(R, column)) row_mod.noSuchColumn(R, column, what);
             const pointed = table_mod.pointedFrom(R, column) orelse throughWithoutReference(Level, field, R, column);
             chain = chain ++ (if (i == 0) "" else ".") ++ column;
-            if (@typeInfo(row_mod.ColumnType(R, column)) == .optional) {
-                if (joinedInner(Level, chain)) narrows = true else nullable = true;
-            }
+            hops = hops ++ &[_]Hop{.{
+                .column = column,
+                .row = pointed.row,
+                .target = pointed.target,
+                .chain = chain,
+                .nullable = @typeInfo(row_mod.ColumnType(R, column)) == .optional,
+                .inner = joinedInner(Level, chain),
+            }};
             R = pointed.row;
         }
         const last = steps[steps.len - 1];
         if (!row_mod.hasColumn(R, last)) row_mod.noSuchColumn(R, last, what);
+        return .{ .hops = hops, .End = R, .last = last };
+    }
+}
+
+fn throughColumn(comptime Level: type, comptime field: []const u8) ThroughColumn {
+    comptime {
+        const walk = throughWalk(Level, field);
+        var nullable = false;
+        var narrows = false;
+        for (walk.hops) |h| {
+            if (h.nullable) {
+                if (h.inner) narrows = true else nullable = true;
+            }
+        }
         return .{
-            .T = row_mod.ColumnType(R, last),
+            .T = row_mod.ColumnType(walk.End, walk.last),
             .nullable_reference = nullable,
             .narrows = narrows,
-            .Target = R,
-            .last = last,
+            .Target = walk.End,
+            .last = walk.last,
         };
     }
 }
@@ -426,44 +466,36 @@ pub fn throughOf(
 ) Through {
     comptime {
         const entry = row_mod.throughEntry(Level, field);
-        const steps = entry.path;
-        var R = row_mod.ownerOf(Level);
+        const walk = throughWalk(Level, field);
         var at = here;
         var alias: []const u8 = through_prefix ++ (if (level.len == 0) "" else "." ++ level) ++ "/";
-        var chain: []const u8 = "";
         var left = optional_above;
         var joins: []const Join = &.{};
         var key: []const u8 = "";
-        for (steps[0 .. steps.len - 1], 0..) |column, i| {
-            const pointed = table_mod.pointedFrom(R, column) orelse throughWithoutReference(Level, field, R, column);
-            chain = chain ++ (if (i == 0) "" else ".") ++ column;
-            const nullable = @typeInfo(row_mod.ColumnType(R, column)) == .optional;
-            const inner = joinedInner(Level, chain);
-            if (nullable and !inner) left = true;
-            alias = alias ++ (if (i == 0) "" else ".") ++ column;
+        for (walk.hops, 0..) |h, i| {
+            if (h.nullable and !h.inner) left = true;
+            alias = alias ++ (if (i == 0) "" else ".") ++ h.column;
             const quoted = D.quote(alias);
             joins = joins ++ &[_]Join{.{
                 .alias = alias,
-                .text = (if (left) " LEFT JOIN " else " JOIN ") ++ statement.relation(D, pointed.row) ++
-                    " AS " ++ quoted ++ " ON " ++ quoted ++ "." ++ D.quote(pointed.target) ++
-                    " = " ++ at ++ "." ++ D.quote(column),
+                .text = (if (left) " LEFT JOIN " else " JOIN ") ++ row_mod.relation(D, h.row) ++
+                    " AS " ++ quoted ++ " ON " ++ quoted ++ "." ++ D.quote(h.target) ++
+                    " = " ++ at ++ "." ++ D.quote(h.column),
                 // Inner is inner: a row whose referenced row is missing is
                 // left out, whether or not the reference can be null, and a
                 // count that skipped the join would count it (the parent's
                 // join says the same, above).
                 .narrows = !left,
             }};
-            if (i == 0) key = quoted ++ "." ++ D.quote(pointed.target);
+            if (i == 0) key = quoted ++ "." ++ D.quote(h.target);
             at = quoted;
-            R = pointed.row;
         }
-        const last = steps[steps.len - 1];
-        const column = at ++ "." ++ D.quote(last);
+        const column = at ++ "." ++ D.quote(walk.last);
         const read = if (entry.otherwise)
             "COALESCE(" ++ column ++ ", " ++ table_mod.literalText(
-                R,
+                walk.End,
                 @typeName(Level) ++ "'s " ++ row_mod.through_marker ++ " `." ++ field ++ "` `.otherwise`",
-                last,
+                walk.last,
                 @field(@field(Level, row_mod.through_marker), field).otherwise,
             ) ++ ")"
         else
@@ -498,26 +530,8 @@ fn parentLink(comptime Holder: type, comptime field: []const u8) Link {
         const Parent = row_mod.parentRowOf(row_mod.fieldTypeOf(Holder, field).?).?;
         const Owner = row_mod.ownerOf(Holder);
         const Target = row_mod.ownerOf(Parent);
-        const found = referencesBetween(Owner, Target);
-
-        const link = if (row_mod.viaOf(Holder, field)) |via|
-            linkVia(Holder, field, found, Owner, Target, via)
-        else if (found.links.len == 1) found.links[0] else if (found.links.len == 0) @compileError(
-            "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` as a parent, and " ++
-                @typeName(Owner) ++ " declares no `.references` to " ++ @typeName(Target) ++
-                "'s table `" ++ row_mod.qualifiedOf(Target).table ++ "`.\n" ++
-                "  The join is read out of the schema rather than written here. Add " ++
-                "`.references = .{ .<column> = .{ " ++ @typeName(Target) ++ ", .id } }` to " ++
-                @typeName(Owner) ++ "'s " ++ row_mod.marker ++ ", or name the column: `pub const " ++
-                row_mod.via_marker ++ " = .{ ." ++ field ++ " = .<column> };`.",
-        ) else @compileError(
-            "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` as a parent, and " ++
-                @typeName(Owner) ++ " points at " ++ @typeName(Target) ++ "'s table from more than " ++
-                "one column: " ++ found.named ++ ".\n" ++
-                "  Which of them this field follows is a question about what it means, and " ++
-                "guessing would answer a different one. Say which: `pub const " ++
-                row_mod.via_marker ++ " = .{ ." ++ field ++ " = .<column> };`.",
-        );
+        const link = linkBetween(Holder, field, Owner, Target, "as a parent", "this field follows is a question " ++
+            "about what it means, and guessing would answer a different one");
 
         // **The type says whether the parent can be missing, and it has to say
         // what the schema says.** A nullable reference is a `LEFT JOIN`, and a
@@ -531,13 +545,13 @@ fn parentLink(comptime Holder: type, comptime field: []const u8) Link {
         const optional = @typeInfo(row_mod.fieldTypeOf(Holder, field).?) == .optional;
         if (nullable and !optional) @compileError(
             "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` as " ++ @typeName(Parent) ++
-                ", and " ++ nameList(link.columns) ++ " may be null.\n" ++
+                ", and " ++ row_mod.nameList(link.columns) ++ " may be null.\n" ++
                 "  A row whose reference is null has no parent to fill it from. Write `" ++ field ++
                 ": ?" ++ @typeName(Parent) ++ "`.",
         );
         if (optional and !nullable) @compileError(
             "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` as ?" ++ @typeName(Parent) ++
-                ", and " ++ nameList(link.columns) ++ " is never null.\n" ++
+                ", and " ++ row_mod.nameList(link.columns) ++ " is never null.\n" ++
                 "  Every row has its parent, so the `?` is a branch no caller will take. Write `" ++
                 field ++ ": " ++ @typeName(Parent) ++ "`.",
         );
@@ -571,7 +585,7 @@ fn childrenOf(comptime Row: type, comptime field: []const u8) Children {
 
         if (link.columns.len != 1) @compileError(
             "nilo: " ++ @typeName(Row) ++ " reads `" ++ field ++ "` as children through a " ++
-                "reference of several columns, " ++ nameList(link.columns) ++ ".\n" ++
+                "reference of several columns, " ++ row_mod.nameList(link.columns) ++ ".\n" ++
                 "  The children are read for every parent at once, keyed by one value each, and a " ++
                 "key of several columns is not one value. Read them with `db.select` and a " ++
                 "condition, or with `db.raw`.",
@@ -592,27 +606,42 @@ fn childrenOf(comptime Row: type, comptime field: []const u8) Children {
 /// `how` is what the message says the field reads them as.
 fn backLink(comptime Row: type, comptime field: []const u8, comptime Child: type, comptime how: []const u8) Link {
     comptime {
-        const Owner = row_mod.ownerOf(Row);
-        const ChildOwner = row_mod.ownerOf(Child);
-        const found = referencesBetween(ChildOwner, Owner);
+        return linkBetween(Row, field, row_mod.ownerOf(Child), row_mod.ownerOf(Row), how, "makes a row a child of " ++
+            "this one is a question about what the field means");
+    }
+}
 
-        return if (row_mod.viaOf(Row, field)) |via|
-            linkVia(Row, field, found, ChildOwner, Owner, via)
+/// The one reference out of `From`'s table to `To`'s that a field reading
+/// across it follows: the one there is, the one `nilo_via` names, or a refusal
+/// when there are none or several. Parent fields and children fields ask the
+/// same question from opposite ends, so both come here. `how` is what the
+/// message says the field reads `To` as; `which` finishes "Which of them ...".
+fn linkBetween(
+    comptime Holder: type,
+    comptime field: []const u8,
+    comptime From: type,
+    comptime To: type,
+    comptime how: []const u8,
+    comptime which: []const u8,
+) Link {
+    comptime {
+        const found = referencesBetween(From, To);
+        return if (row_mod.viaOf(Holder, field)) |via|
+            linkVia(Holder, field, found, From, To, via)
         else if (found.links.len == 1) found.links[0] else if (found.links.len == 0) @compileError(
-            "nilo: " ++ @typeName(Row) ++ " reads `" ++ field ++ "` " ++ how ++ ", and " ++
-                @typeName(ChildOwner) ++ " declares no `.references` to " ++ @typeName(Owner) ++
-                "'s table `" ++ row_mod.qualifiedOf(Owner).table ++ "`.\n" ++
+            "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` " ++ how ++ ", and " ++
+                @typeName(From) ++ " declares no `.references` to " ++ @typeName(To) ++
+                "'s table `" ++ row_mod.qualifiedOf(To).table ++ "`.\n" ++
                 "  The join is read out of the schema rather than written here. Add " ++
-                "`.references = .{ .<column> = .{ " ++ @typeName(Owner) ++ ", .id } }` to " ++
-                @typeName(ChildOwner) ++ "'s " ++ row_mod.marker ++ ", or name the column: `pub const " ++
+                "`.references = .{ .<column> = .{ " ++ @typeName(To) ++ ", .id } }` to " ++
+                @typeName(From) ++ "'s " ++ row_mod.marker ++ ", or name the column: `pub const " ++
                 row_mod.via_marker ++ " = .{ ." ++ field ++ " = .<column> };`.",
         ) else @compileError(
-            "nilo: " ++ @typeName(Row) ++ " reads `" ++ field ++ "` " ++ how ++ ", and " ++
-                @typeName(ChildOwner) ++ " points at " ++ @typeName(Owner) ++ "'s table from more " ++
+            "nilo: " ++ @typeName(Holder) ++ " reads `" ++ field ++ "` " ++ how ++ ", and " ++
+                @typeName(From) ++ " points at " ++ @typeName(To) ++ "'s table from more " ++
                 "than one column: " ++ found.named ++ ".\n" ++
-                "  Which of them makes a row a child of this one is a question about what the " ++
-                "field means. Say which: `pub const " ++ row_mod.via_marker ++ " = .{ ." ++ field ++
-                " = .<column> };`.",
+                "  Which of them " ++ which ++ ". Say which: `pub const " ++
+                row_mod.via_marker ++ " = .{ ." ++ field ++ " = .<column> };`.",
         );
     }
 }
@@ -683,7 +712,7 @@ pub fn overChildrenCall(comptime D: type, comptime Row: type, comptime field: []
             joined = joined ++ " AND " ++ reached.sql;
         }
         const call = if (over.column) |c| over.word ++ "(" ++ alias ++ "." ++ D.quote(c) ++ ")" else "count(*)";
-        return "(SELECT " ++ call ++ " FROM " ++ statement.relation(D, over.Child) ++ " AS " ++ alias ++
+        return "(SELECT " ++ call ++ " FROM " ++ row_mod.relation(D, over.Child) ++ " AS " ++ alias ++
             hops ++ " WHERE " ++ joined ++ ")";
     }
 }
@@ -717,7 +746,7 @@ fn referencesBetween(comptime From: type, comptime To: type) Found {
         for (table_mod.foreignKeysOf(From)) |ref| {
             if (!std.mem.eql(u8, ref.table, to.table)) continue;
             if (!table_mod.sameSchema(ref.schema, to.schema)) continue;
-            named = named ++ (if (links.len == 0) "" else ", ") ++ nameList(ref.columns);
+            named = named ++ (if (links.len == 0) "" else ", ") ++ row_mod.nameList(ref.columns);
             links = links ++ &[_]Link{.{ .columns = ref.columns, .targets = ref.targets }};
         }
         return .{ .links = links, .named = named };
@@ -752,14 +781,6 @@ fn linkVia(
                 row_mod.keyList(To) ++ ", which one column cannot match. Declare the foreign key.",
         );
         return .{ .columns = &.{via}, .targets = &.{keys[0]} };
-    }
-}
-
-fn nameList(comptime columns: []const []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (columns, 0..) |c, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ c ++ "`";
-        return out;
     }
 }
 
@@ -819,10 +840,7 @@ pub fn assertShape(comptime Row: type) void {
                     if (over.column) |column| {
                         const C = row_mod.ColumnType(row_mod.ownerOf(over.Child), column);
                         assertOrdersForMinMax(Row, f_name, over.word, column, C);
-                        const Bare = switch (@typeInfo(C)) {
-                            .optional => |o| o.child,
-                            else => C,
-                        };
+                        const Bare = types_mod.bare(C);
                         if (f_type != ?Bare) @compileError(
                             "nilo: " ++ @typeName(Row) ++ " reads `." ++ f_name ++ "`, the " ++ over.word ++
                                 " of `" ++ column ++ "` over the rows pointing back, as " ++
@@ -950,10 +968,7 @@ fn assertThrough(comptime Row: type, comptime field: []const u8, comptime F: typ
                 "  Every row reaches the column already, so there is no row to leave out. " ++
                 "Take `.join` off.",
         );
-        const Bare = switch (@typeInfo(read.T)) {
-            .optional => |o| o.child,
-            else => read.T,
-        };
+        const Bare = types_mod.bare(read.T);
         const nullable = read.nullable_reference or @typeInfo(read.T) == .optional;
         if (entry.otherwise and !nullable) @compileError(
             head ++ " says `.otherwise`, and the column is " ++ @typeName(read.T) ++
@@ -1021,10 +1036,7 @@ fn assertOrdersForMinMax(
     comptime C: type,
 ) void {
     comptime {
-        const Bare = switch (@typeInfo(C)) {
-            .optional => |o| o.child,
-            else => C,
-        };
+        const Bare = types_mod.bare(C);
         const kind: ?[]const u8 = if (Bare == bool)
             "a bool"
         else if (Bare == types_mod.Uuid)
@@ -1058,10 +1070,7 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
     comptime {
         const aggregate = row_mod.aggregateOf(Row, field).?;
         const words = @tagName(aggregate.kind);
-        const Bare = switch (@typeInfo(F)) {
-            .optional => |o| o.child,
-            else => F,
-        };
+        const Bare = types_mod.bare(F);
         const optional = @typeInfo(F) == .optional;
 
         if (aggregate.kind == .count or aggregate.kind == .count_distinct) {
@@ -1080,10 +1089,7 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
         const column = aggregate.column.?;
         if (!row_mod.hasColumn(Owner, column)) row_mod.noSuchColumn(Owner, column, @typeName(Row) ++ "'s `." ++ field ++ "`");
         const C = row_mod.ColumnType(Owner, column);
-        const CBare = switch (@typeInfo(C)) {
-            .optional => |o| o.child,
-            else => C,
-        };
+        const CBare = types_mod.bare(C);
 
         const Want: type = switch (aggregate.kind) {
             .sum => switch (@typeInfo(CBare)) {
@@ -1549,14 +1555,9 @@ fn childOrder(comptime D: type, comptime Table: type, comptime relation: []const
                 row_mod.ColumnType(Table, f_name),
                 what ++ " `.order." ++ f_name ++ "`",
             );
-            const direction: Direction = statement.writtenValue(T, f_name, Direction);
-            // A slice rather than the array `++` would infer, or a `NULLS`
-            // clause appended below is a different length and does not fit.
-            var one: []const u8 = relation ++ "." ++ D.quote(f_name) ++ (if (direction.descending()) " DESC" else " ASC");
-            if (direction.placement()) |where_nulls| {
-                one = one ++ (D.nulls(where_nulls) orelse dialect_mod.noNullsOrder(D, Table, f_name));
-            }
-            out = out ++ (if (out.len == 0) "" else ", ") ++ one;
+            const direction: Direction = row_mod.writtenValue(T, f_name, Direction);
+            out = out ++ (if (out.len == 0) "" else ", ") ++
+                relation ++ "." ++ D.quote(f_name) ++ direction.suffix(D, Table, f_name);
         }
         return out;
     }
@@ -1706,7 +1707,7 @@ fn assertNoLock(comptime Row: type, comptime O: type, comptime call: []const u8)
 /// `.order = .{ .customer = .{ .name = .asc } }`.
 fn orderBy(comptime D: type, comptime Row: type, comptime T: type, comptime outputs: []const Output) []const u8 {
     comptime {
-        const terms = orderTerms(D, Row, T, &.{}, statement.relation(D, Row), outputs);
+        const terms = orderTerms(D, Row, T, &.{}, row_mod.relation(D, Row), outputs);
         return if (terms.len == 0) "" else " ORDER BY " ++ terms;
     }
 }
@@ -1787,17 +1788,12 @@ fn orderTerms(
                         if (carried) row_mod.fieldTypeOf(Level, f_name).? else row_mod.ColumnType(row_mod.ownerOf(Level), f_name),
                         "`.order." ++ row_mod.pathName(at) ++ "`",
                     );
-                    const direction: Direction = statement.writtenValue(T, f_name, Direction);
+                    const direction: Direction = row_mod.writtenValue(T, f_name, Direction);
                     const named = if (through_table)
                         relation ++ "." ++ D.quote(f_name)
                     else
                         bareOf(outputs, row_mod.pathName(at)) orelse D.quote(row_mod.pathName(at));
-                    // A slice, for the reason `childOrder` gives.
-                    var one: []const u8 = named ++ (if (direction.descending()) " DESC" else " ASC");
-                    if (direction.placement()) |where_nulls| {
-                        one = one ++ (D.nulls(where_nulls) orelse
-                            dialect_mod.noNullsOrder(D, Level, f_name));
-                    }
+                    const one: []const u8 = named ++ direction.suffix(D, Level, f_name);
                     break :term one;
                 },
                 .children, .beside => row_mod.noSuchColumn(Level, f_name, "`.order`"),

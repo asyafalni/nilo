@@ -297,10 +297,7 @@ pub fn enumColumnsOf(comptime Row: type) []const EnumColumn {
         var n: usize = 0;
         for (info.field_names, info.field_types) |f_name, f_type| {
             if (!row_mod.isColumnField(Row, f_name)) continue;
-            const Inner = switch (@typeInfo(f_type)) {
-                .optional => |o| o.child,
-                else => f_type,
-            };
+            const Inner = types_mod.bare(f_type);
             if (@typeInfo(Inner) != .@"enum") continue;
             if (!@hasDecl(Inner, "nilo_column")) continue;
             out[n] = .{ .column = f_name, .type_name = Inner.nilo_column, .E = Inner };
@@ -498,10 +495,7 @@ pub fn readingsOf(
 
 fn reading(comptime D: type, comptime field: []const u8, comptime F: type) Reading {
     const reads: []const []const u8 = D.reads(F) orelse &.{};
-    var text = types_mod.jsonPayload(switch (@typeInfo(F)) {
-        .optional => |o| o.child,
-        else => F,
-    }) != null;
+    var text = types_mod.jsonPayload(types_mod.bare(F)) != null;
     for (reads) |name| {
         if (std.mem.eql(u8, name, D.text_accepts[0])) text = true;
     }

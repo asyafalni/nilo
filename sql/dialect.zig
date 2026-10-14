@@ -299,10 +299,7 @@ pub const Postgres = struct {
     /// own error rather than a wrong number.
     pub fn readAggregate(comptime call: []const u8, comptime kind: Aggregate, comptime T: type) []const u8 {
         return comptime blk: {
-            const Bare = switch (@typeInfo(T)) {
-                .optional => |o| o.child,
-                else => T,
-            };
+            const Bare = types.bare(T);
             switch (kind) {
                 .count, .count_distinct => break :blk call,
                 .sum, .avg => switch (@typeInfo(Bare)) {
@@ -572,10 +569,7 @@ pub const Postgres = struct {
             // binary data format*. Its `text[]` encoder gets the same case
             // right, so the digits-and-cast route is taken here too. Delete
             // this line when pg.zig's `encodeNullables` sizes what it writes.
-            const Inner = switch (@typeInfo(T)) {
-                .optional => |o| o.child,
-                else => T,
-            };
+            const Inner = types.bare(T);
             if (types.jsonPayload(Inner) != null) break :blk "text[]::jsonb[]";
             const named = acceptsInner(T) orelse break :blk null;
             break :blk named[0] ++ "[]";
@@ -606,10 +600,7 @@ pub const Postgres = struct {
     /// brackets instead.
     pub fn columnType(comptime T: type) ?[]const u8 {
         return comptime blk: {
-            const Inner = switch (@typeInfo(T)) {
-                .optional => |o| o.child,
-                else => T,
-            };
+            const Inner = types.bare(T);
             if (types.listElement(Inner)) |Item| {
                 const elem = acceptsInner(Item) orelse break :blk null;
                 break :blk elem[0] ++ "[]";
@@ -1005,10 +996,7 @@ pub const Postgres = struct {
     }
 
     fn acceptsInner(comptime T: type) Accepts {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
 
         // Text, in the spelling this framework prefers. `Str` comes from Core,
         // which knows nothing about databases, so the answer for it is here
@@ -1078,10 +1066,7 @@ pub const Postgres = struct {
         // A slice of optionals is how a column that holds NULLs among its
         // elements is read, and it is the same array type either way — the
         // null flag lives in the value rather than in the column.
-        const Bare = switch (@typeInfo(Item)) {
-            .optional => |o| o.child,
-            else => Item,
-        };
+        const Bare = types.bare(Item);
 
         // Text has three spellings in a column and two as an array element:
         // a `Str` and a `[]const u8` are the same bytes to a reader.
@@ -1140,10 +1125,7 @@ pub const Postgres = struct {
     }
 
     fn readsInner(comptime T: type) Accepts {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
         if (types.isUnix(Inner)) return &.{ "int8", "int4", "int2" };
         if (!types.isBytes(Inner) and types.asText(Inner) != null) return text_accepts;
         // What reads without a value that can fail to fit: a column as wide
@@ -1848,10 +1830,7 @@ pub const SQLite = struct {
     }
 
     fn readsSqlite(comptime T: type) Accepts {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
         if (types.isBytes(Inner)) return &.{ "BLOB", "TEXT" };
         if (Inner == types.Timestamp or types.isUnix(Inner)) return &.{ "INTEGER", "NUMERIC" };
         if (Inner == core.Str or types.asText(Inner) != null or types.declaredColumn(Inner) != null)
@@ -1887,10 +1866,7 @@ pub const SQLite = struct {
     }
 
     fn acceptsSqlite(comptime T: type) Accepts {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
 
         if (Inner == core.Str) return text_accepts;
 
@@ -2190,10 +2166,7 @@ pub fn assertEnumOrders(
 ) void {
     comptime {
         if (D.enum_orders_by_position) return;
-        const Bare = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Bare = types.bare(T);
         if (@typeInfo(Bare) != .@"enum") return;
         const named = types.declaredColumn(Bare) orelse return;
         for (Postgres.text_accepts) |text| {

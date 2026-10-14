@@ -825,14 +825,14 @@ fn walk(
                 // `=`, and nothing bound. Read here rather than in `condition`,
                 // which is handed the type and not the struct the word sits in.
                 if (f_type == @TypeOf(.enum_literal)) {
-                    if (clockWord(D, Column, f_name, fieldValue(W, f_name), "`." ++ f_name ++ " = ." ++
-                        @tagName(fieldValue(W, f_name)) ++ "`")) |clock|
+                    if (clockWord(D, Column, f_name, row_mod.fieldValue(W, f_name), "`." ++ f_name ++ " = ." ++
+                        @tagName(row_mod.fieldValue(W, f_name)) ++ "`")) |clock|
                     {
                         break :term state.qualifier ++ D.quote(f_name) ++ " = " ++ clock;
                     }
                 }
                 if (isShiftShape(f_type)) {
-                    const shift = clockShifted(D, Column, f_name, f_type, fieldValue(W, f_name), "`." ++
+                    const shift = clockShifted(D, Column, f_name, f_type, row_mod.fieldValue(W, f_name), "`." ++
                         f_name ++ " = .{ ." ++ @typeInfo(f_type).@"struct".field_names[0] ++ " = … }`").?;
                     break :term state.qualifier ++ D.quote(f_name) ++ " = " ++ shift;
                 }
@@ -1163,15 +1163,15 @@ fn oneExists(
         // The **value** written there, which is the Row itself. `@FieldType`
         // would answer `type`, which is what `.in`'s field holds rather than
         // what it says.
-        const Inner = fieldValue(T, "in");
+        const Inner = row_mod.fieldValue(T, "in");
         row_mod.assertRow(Inner);
 
         // Before the join is looked for, because a self-reference is a
         // reference in both directions and would be refused as that instead.
         // The Row outside is written the way the statement wrote it: its
         // relation, or the alias a parent was joined under (ADR 218).
-        const outer_rel = if (state.outer.len > 0) state.outer else relationOf(D, Outer);
-        const inner_rel = relationOf(D, Inner);
+        const outer_rel = if (state.outer.len > 0) state.outer else row_mod.relation(D, Outer);
+        const inner_rel = row_mod.relation(D, Inner);
         if (std.mem.eql(u8, outer_rel, inner_rel)) @compileError(
             "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", which reads the same " ++
                 "table as " ++ @typeName(Outer) ++ ".\n" ++
@@ -1293,7 +1293,7 @@ fn keyOnThisSide(
             "a condition on those columns";
         @compileError(
             "nilo: an entry of `." ++ word ++ "` over " ++ @typeName(Inner) ++ " " ++ said ++
-                ", and the key is " ++ @typeName(Outer) ++ "'s own " ++ nameList(link.outer) ++ ".\n" ++
+                ", and the key is " ++ @typeName(Outer) ++ "'s own " ++ row_mod.nameList(link.outer) ++ ".\n" ++
                 "  Without a condition it asks only whether the row that key points at is " ++
                 "there, and " ++ instead ++ " asks that without a subquery.",
         );
@@ -1374,7 +1374,7 @@ fn oneAcross(
         if (columns_info.field_names.len < 2) @compileError(
             "nilo: `.across` names " ++ (if (columns_info.field_names.len == 0) "no column" else "one column") ++
                 ".\n  One column is an ordinary condition: write `." ++
-                (if (columns_info.field_names.len == 1) @tagName(fieldValue(Columns, "0")) else "code") ++
+                (if (columns_info.field_names.len == 1) @tagName(row_mod.fieldValue(Columns, "0")) else "code") ++
                 " = …`. `.across` is for a value tested against several.",
         );
         var columns: [columns_info.field_names.len][]const u8 = undefined;
@@ -1383,13 +1383,13 @@ fn oneAcross(
                 "nilo: `.across`'s `.columns` holds a " ++ @typeName(f_type) ++
                     ".\n  A column is named as it is in a condition: `.code`.",
             );
-            const name = @tagName(fieldValue(Columns, f_name));
+            const name = @tagName(row_mod.fieldValue(Columns, f_name));
             if (!row_mod.hasColumn(Row, name)) row_mod.noSuchColumn(Row, name, "an `.across`");
             columns[i] = name;
         }
-        const First = bareOf(row_mod.ColumnType(Row, columns[0]));
+        const First = types.bare(row_mod.ColumnType(Row, columns[0]));
         for (columns[1..]) |name| {
-            const Other = bareOf(row_mod.ColumnType(Row, name));
+            const Other = types.bare(row_mod.ColumnType(Row, name));
             if (Other != First) @compileError(
                 "nilo: `.across` on " ++ @typeName(Row) ++ " names `" ++ columns[0] ++ "`, which is " ++
                     @typeName(row_mod.ColumnType(Row, columns[0])) ++ ", and `" ++ name ++ "`, which is " ++
@@ -1487,15 +1487,6 @@ fn oneAcross(
     }
 }
 
-/// The column's type without its optional, for saying whether two columns
-/// bind as one: a nullable `trademark` and a `name` are both text.
-fn bareOf(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .optional => |o| o.child,
-        else => T,
-    };
-}
-
 /// A term that is only there when its parameter is: `(term OR $n IS NULL)`.
 ///
 /// **The term comes first, and on Postgres that is the whole of what makes
@@ -1515,25 +1506,6 @@ fn bareOf(comptime T: type) type {
 /// and passed, and `live.zig` now runs each shape against Postgres.
 fn guarded(comptime D: type, comptime term: []const u8, comptime n: usize) []const u8 {
     return "(" ++ term ++ " OR " ++ D.placeholder(n) ++ " IS NULL)";
-}
-
-/// The relation a Row reads, quoted and schema-qualified — the same text
-/// `statement.relation` writes, computed here because a subquery names two of
-/// them and neither is the statement's own.
-fn relationOf(comptime D: type, comptime Row: type) []const u8 {
-    comptime {
-        const q = row_mod.qualifiedOf(Row);
-        return D.qualify(q.schema, q.table);
-    }
-}
-
-/// A column list for a message: `` `epic_id`, `department_id` ``.
-fn nameList(comptime columns: []const []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (columns, 0..) |c, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ c ++ "`";
-        return out;
-    }
 }
 
 /// Which columns of each side the two tables are joined by, one for one.
@@ -1581,7 +1553,7 @@ fn correlation(
         for (table_mod.foreignKeysOf(Inner)) |ref| {
             if (!std.mem.eql(u8, ref.table, outer_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, outer_q.schema)) continue;
-            named = named ++ (if (found.len == 0) "" else ", ") ++ nameList(ref.columns);
+            named = named ++ (if (found.len == 0) "" else ", ") ++ row_mod.nameList(ref.columns);
             found = found ++ &[_]Link{.{ .inner = ref.columns, .outer = ref.targets, .points_back = true }};
         }
         // The parent direction: a column of Outer that points at Inner.
@@ -1590,7 +1562,7 @@ fn correlation(
         for (table_mod.foreignKeysOf(Outer)) |ref| {
             if (!std.mem.eql(u8, ref.table, inner_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, inner_q.schema)) continue;
-            back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ nameList(ref.columns);
+            back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ row_mod.nameList(ref.columns);
             back = back ++ &[_]Link{.{ .inner = ref.targets, .outer = ref.columns, .points_back = false }};
         }
 
@@ -1609,7 +1581,7 @@ fn correlation(
                     "  It is the column of " ++ @typeName(Inner) ++ " that points at " ++
                     @typeName(Outer) ++ ", written as a name: `.on = .partner_id`.",
             );
-            const wanted = @tagName(fieldValue(T, "on"));
+            const wanted = @tagName(row_mod.fieldValue(T, "on"));
             if (!row_mod.hasColumn(Inner, wanted)) {
                 row_mod.noSuchColumn(Inner, wanted, "`." ++ word ++ "`'s `.on`");
             }
@@ -1641,7 +1613,7 @@ fn correlation(
                     "  It is the column of " ++ @typeName(Outer) ++ " that points at " ++
                     @typeName(Inner) ++ ", written as a name: `.via = .department_id`.",
             );
-            const wanted = @tagName(fieldValue(T, "via"));
+            const wanted = @tagName(row_mod.fieldValue(T, "via"));
             if (!row_mod.hasColumn(Outer, wanted)) {
                 row_mod.noSuchColumn(Outer, wanted, "`." ++ word ++ "`'s `.via`");
             }
@@ -1703,31 +1675,6 @@ fn correlation(
     }
 }
 
-/// The value a caller wrote out for one field of a struct literal, the way
-/// `statement.writtenValue` reads one — one field, never the whole struct, so
-/// a sibling holding a runtime value is not demanded to be comptime as well.
-fn fieldValue(comptime T: type, comptime field: []const u8) blk: {
-    const t_info = @typeInfo(T).@"struct";
-    for (t_info.field_names, t_info.field_types) |f_name, f_type| {
-        if (std.mem.eql(u8, f_name, field)) break :blk f_type;
-    }
-    break :blk void;
-} {
-    comptime {
-        const t_info2 = @typeInfo(T).@"struct";
-        for (t_info2.field_names, t_info2.field_types, t_info2.field_attrs) |f_name, f_type, f_attrs| {
-            if (!std.mem.eql(u8, f_name, field)) continue;
-            const written = f_attrs.default_value_ptr orelse @compileError(
-                "nilo: `." ++ field ++ "` has no value written out where it is used.\n" ++
-                    "  It is settled while compiling, so it has to be a literal rather " ++
-                    "than something worked out at run time.",
-            );
-            return @as(*const f_type, @ptrCast(@alignCast(written))).*;
-        }
-        unreachable;
-    }
-}
-
 /// **The database's clock, as a word**: `.now` on a `sql.Timestamp` column and
 /// `.today` on a `sql.Date` one, the expression the database evaluates in
 /// place of a value. Null when the word is neither, and on a column whose type
@@ -1782,10 +1729,7 @@ fn clockOf(
         const today = std.mem.eql(u8, name, "today");
         if (!now and !today) return null;
         const F = row_mod.ColumnType(Row, column);
-        const C = switch (@typeInfo(F)) {
-            .optional => |o| o.child,
-            else => F,
-        };
+        const C = types.bare(F);
         if (@typeInfo(C) == .@"enum") return null;
         if (now and C == types.Timestamp) return .moment;
         if (today and C == types.Date) return .day;
@@ -1973,11 +1917,11 @@ fn clockTerm(
         if (std.mem.indexOf(u8, spelled, "LIKE") != null) return null;
         if (op.T != @TypeOf(.enum_literal)) {
             if (!isShiftShape(op.T)) return null;
-            const shift = clockShifted(D, Row, column, op.T, fieldValue(T, op.name), "`." ++ column ++
+            const shift = clockShifted(D, Row, column, op.T, row_mod.fieldValue(T, op.name), "`." ++ column ++
                 " = .{ ." ++ op.name ++ " = .{ ." ++ @typeInfo(op.T).@"struct".field_names[0] ++ " = … } }`").?;
             return quoted ++ " " ++ spelled ++ " " ++ shift;
         }
-        const word = fieldValue(T, op.name);
+        const word = row_mod.fieldValue(T, op.name);
         const clock = clockWord(D, Row, column, word, "`." ++ column ++ " = .{ ." ++ op.name ++
             " = ." ++ @tagName(word) ++ " }`") orelse return null;
         return quoted ++ " " ++ spelled ++ " " ++ clock;
@@ -2315,10 +2259,7 @@ fn elementIsNull(comptime E: type) bool {
 /// as one.
 fn isText(comptime T: type) bool {
     comptime {
-        const Inner = switch (@typeInfo(T)) {
-            .optional => |o| o.child,
-            else => T,
-        };
+        const Inner = types.bare(T);
         if (Inner == core.Str) return true;
         return switch (@typeInfo(Inner)) {
             .pointer => |p| p.size == .slice and p.child == u8,
