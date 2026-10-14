@@ -822,3 +822,19 @@ here too.
 **What it decided.** Nothing moved, which was the expectation: the seed is the argument the one hash pass already took, and the field sits beside `shard_mask`, so there is no second pass and no new line. The fix ships as written. Not measured: eight threads, a put-heavy mix, and the miss path of section 10 (the hash is the same instruction on all three, so none is expected to move).
 
 **Can it be pushed further.** There is no cost left to take out: an xor with a loaded field.
+
+## 12. The shard lock spins on a read and yields
+
+**What was run.** `zig build bench-cache-contention -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast`, a new program (`bench/cache_contention.zig`): one shard of a 64 KiB Store, every thread writing to it, `put` taking the lock on every write and `refuse` writing a 16 KiB value the shard refuses. Built twice, once from `1676b58` (`git archive`, the program and its step copied in) and once from the tree with the test-and-test-and-set lock (256 looks, then `std.Thread.yield`) and the lock-free refusal (ADR 109); three interleaved rounds a side. **On the 2-core Xeon Platinum 8255C**, not this file's Ryzen: two cores cannot say how the lock scales, which §1 is about, but eight threads on two cores is the case the change is for, a holder preempted with waiters burning their timeslice.
+
+| row | threads, cores | before, ops/s | after, ops/s | |
+|---|---|---|---|---|
+| `put` | 8 on 2 (`taskset -c 0,1`, 5 s) | 1.33–1.38M | **4.49–4.61M** | **3.4×** |
+| `refuse` | 8 on 2 | 15.2–17.2M | **61.2–68.3M** | **4.0×** |
+| `put` | 1 on 1 (`taskset -c 0`, 3 s) | 5.80–6.15M | 5.51–5.74M | **3–7% slower** |
+| `refuse` | 1 on 1 | 33.5–36.5M | **40.9–44.4M** | 1.2× |
+
+**What it decided.** The lock ships. Under oversubscription the old swap loop lost three quarters of its writes to waiters that kept the line bouncing and a preempted holder that could not finish; the yield hands the core back. **The one row that went the wrong way is a single uncontended writer**, 3 to 7% slower with ranges that do not overlap. The fast path is still one swap, so the difference is in code generation around it rather than in the lock's logic, and it is inside ADR 017's 10%. Not measured: the Ryzen, where §1's eight-thread read rows are, and a mixed read/write load.
+
+**Can it be pushed further.** The uncontended row: read the `put` path's code for what moved before taking the 256 as tuned, since it was set by argument (above one critical section, far below a timeslice) and not by a sweep.
+

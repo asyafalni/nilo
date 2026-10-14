@@ -52,7 +52,10 @@
 //! now is that a writer is alone, so the cursor it publishes is the whole
 //! truth about where it is writing.
 //!
-//! The lock spins rather than parks because Zig 0.16's `std.Io.Mutex.lock`
+//! The lock is test-and-test-and-set: a waiter reads while it is held, and
+//! after a few hundred looks yields its thread, so a holder the OS has
+//! preempted is not waited out by burning the waiters' timeslices.
+//! It spins rather than parks because Zig 0.16's `std.Io.Mutex.lock`
 //! takes an `io: Io`, and a module with no event loop has none to give it.
 //! **That turns a preference into a rule this file has to keep forever:
 //! nothing that waits, ever, inside a critical section.** It is also what makes
@@ -370,8 +373,39 @@ const Counters = struct {
 const Lock = struct {
     held: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
 
+    /// How many failed looks at a held lock before the waiter gives its
+    /// timeslice back. A critical section here is a copy and a scan, tens to
+    /// hundreds of nanoseconds, so a few hundred looks (a few microseconds)
+    /// outlasts any holder that is running. A holder still not done by then
+    /// has been preempted by the OS, and every further spin is a core doing
+    /// nothing the holder can use. The soak tests run more threads than
+    /// cores, which is exactly when that happens. Not tuned: the figure only
+    /// has to sit well above one critical section and well below a timeslice.
+    const spins_before_yield = 256;
+
+    /// **Test-and-test-and-set** (ADR 109). The write that takes the lock is
+    /// tried once, and while it is held the waiter only reads, so the line
+    /// stays shared among the waiters instead of bouncing between their cores
+    /// on every look. After `spins_before_yield` looks it yields the thread.
+    /// That needs no `Io`, and it is not a wait inside a critical section,
+    /// because the waiter holds nothing.
     fn take(l: *Lock) void {
-        while (l.held.swap(true, .acquire)) std.atomic.spinLoopHint();
+        if (!l.held.swap(true, .acquire)) return;
+        var spins: u32 = 0;
+        while (true) {
+            while (l.held.load(.monotonic)) {
+                if (spins < spins_before_yield) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                } else {
+                    // `YieldError` is `SystemCannotYield`: on a system that
+                    // cannot yield, spinning is all there is.
+                    std.Thread.yield() catch std.atomic.spinLoopHint();
+                    spins = 0;
+                }
+            }
+            if (!l.held.swap(true, .acquire)) return;
+        }
     }
 
     fn release(l: *Lock) void {
@@ -1112,9 +1146,13 @@ pub const Store = struct {
         // to come first rather than read better lower down. A single entry big
         // enough to push out most of a shard is also a cache that holds one
         // thing.
+        //
+        // **No lock for the refusal.** It touches nothing the lock guards:
+        // the answer comes from the lengths and the ring's size, which never
+        // change after `open`, and the count is an atomic that `get` bumps
+        // with no lock held at all. The lock used to be taken here only to
+        // bump it.
         if (!entryFits(shard.ring.len, key.len, value.len)) {
-            shard.lock.take();
-            defer shard.lock.release();
             Counters.bump(&shard.stats.refused);
             return .refused;
         }

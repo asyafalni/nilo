@@ -5536,6 +5536,24 @@ pub fn build(b: *std.Build) void {
             .dependOn(&run.step);
     }
 
+    // What the shard lock costs with more threads than cores on one shard
+    // (ADR 109). The before and after of the lock's test-and-test-and-set.
+    const bench_cache_contention = b.addExecutable(.{
+        .name = "nilo-bench-cache-contention",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/cache_contention.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nilo_cache", .module = nilo_cache }},
+        }),
+    });
+    {
+        const run = b.addRunArtifact(bench_cache_contention);
+        run.addPassthruArgs();
+        b.step("bench-cache-contention", "Time the shard lock with more threads than cores on one shard")
+            .dependOn(&run.step);
+    }
+
     // What reading and writing a protobuf message costs, against a decoder
     // written by hand for the same fields (ADR 245). No Engine and no server.
     const bench_proto = b.addExecutable(.{

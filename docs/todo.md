@@ -365,12 +365,6 @@ Nothing is open at this tier.
 
 ## P3: a narrower use case, or a cost not yet measured
 
-### `nilo_cache`
-
-**The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:371`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:1107`). Not measured.
-
-**Needs:** test-and-test-and-set with a yield after some spins, the refusal's lock dropped, and both measured under contention.
-
 ### `nilo_jwt`
 
 **Only 2048, 3072 and 4096 bits of RSA, and of the curves only P-256, P-384 and Ed25519.** A key size with no branch is `error.KeySizeNotSupported` and a curve with none is `error.CurveNotSupported`, rather than a best effort. ES512 wants P-521 and `EdDSA` over Ed448 wants Ed448, and std carries neither.
