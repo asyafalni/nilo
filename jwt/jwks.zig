@@ -7,11 +7,12 @@
 //! caller *cannot* already write safely is the rest of this module, and
 //! ADR 111 is where that line is argued.
 //!
-//! Two key types are read: `RSA`, as `n` and `e`, and `EC`, as `crv`, `x`
-//! and `y`. **The type of the key is what decides how a token is checked**
-//! — `token.zig` picks RS256 or ES256 from the key it found, never from the
-//! token's `alg` (ADR 111). A key set usually carries keys this cannot use
-//! — an Ed25519 key beside the others, a key marked `"use": "enc"`. Those
+//! Three key types are read: `RSA`, as `n` and `e`; `EC`, as `crv`, `x` and
+//! `y`; and `OKP`, as `crv` and `x` (RFC 8037). **The key is what decides how
+//! a token is checked**: `token.zig` picks RS256, ES256, ES384 or EdDSA from
+//! the key it found (its type, and its curve for the last three), never from
+//! the token's `alg` (ADR 111). A key set usually carries keys this cannot
+//! use, such as a symmetric `oct` key or one marked `"use": "enc"`. Those
 //! are **skipped rather than refused**: a document nilo cannot fully read is
 //! still a document with the right key in it, and an issuer adding a key type
 //! is not a reason to stop signing people in.
@@ -23,7 +24,8 @@ pub const Error = error{
     /// The bytes are not a JSON object with a `keys` array in it.
     NotAKeySet,
     /// A key said RSA and then did not carry `n` and `e` as base64url, or
-    /// said EC and did not carry `crv`, `x` and `y`.
+    /// said EC and did not carry `crv`, `x` and `y`, or said OKP and did not
+    /// carry `crv` and `x`.
     KeyNotUsable,
     OutOfMemory,
 };
@@ -40,6 +42,7 @@ pub const Key = struct {
     pub const Material = union(enum) {
         rsa: Rsa,
         ec: Ec,
+        okp: Okp,
     };
 
     pub const Rsa = struct {
@@ -51,7 +54,8 @@ pub const Key = struct {
     };
 
     pub const Ec = struct {
-        /// The curve's JWA name, `P-256` for the one that has a branch. Kept
+        /// The curve's JWA name, `P-256` or `P-384` for the two that have a
+        /// branch. Kept
         /// as text so that a curve nilo has no branch for is refused by name
         /// at `verify` rather than skipped here and reported as a missing
         /// key.
@@ -61,15 +65,63 @@ pub const Key = struct {
         y: []const u8,
     };
 
+    pub const Okp = struct {
+        /// The curve's JWA name, `Ed25519` for the one that has a branch.
+        /// Kept as text for the reason `Ec.crv` is: `Ed448` and `X25519`
+        /// are refused by name at `verify`, not lost at parse.
+        crv: []const u8,
+        /// The whole public key, which is one string where an EC key has two.
+        x: []const u8,
+    };
+
     /// The `alg` a token signed with this key has to say. The comparison in
     /// `token.zig` runs this way round: the key decides, the header agrees.
+    /// A key on a curve with no branch answers to nothing, and is `""`;
+    /// `token.zig` refuses it by name (`CurveNotSupported`) before it asks.
     pub fn algorithm(self: Key) []const u8 {
         return switch (self.material) {
             .rsa => "RS256",
-            .ec => "ES256",
+            .ec => |ec| curveAlgorithm("EC", ec.crv),
+            .okp => |okp| curveAlgorithm("OKP", okp.crv),
+        };
+    }
+
+    /// Whether the key's curve is one that has a branch. An RSA key has no
+    /// curve, so it always is.
+    pub fn curveSupported(self: Key) bool {
+        return switch (self.material) {
+            .rsa => true,
+            .ec, .okp => self.algorithm().len != 0,
         };
     }
 };
+
+/// The curves that have a branch, with the key type each belongs to and the
+/// `alg` a token under it says. **The one table**: `algorithm()`, the
+/// skipping of a key whose own `alg` is another, and `jwt.curves` all read
+/// it, so a curve is added in one line here and one file beside `es256.zig`.
+pub const supported = [_]struct { kty: []const u8, crv: []const u8, alg: []const u8 }{
+    .{ .kty = "EC", .crv = "P-256", .alg = "ES256" },
+    .{ .kty = "EC", .crv = "P-384", .alg = "ES384" },
+    .{ .kty = "OKP", .crv = "Ed25519", .alg = "EdDSA" },
+};
+
+fn curveAlgorithm(kty: []const u8, crv: []const u8) []const u8 {
+    for (supported) |s| {
+        if (std.mem.eql(u8, s.kty, kty) and std.mem.eql(u8, s.crv, crv)) return s.alg;
+    }
+    return "";
+}
+
+/// Whether `alg` is a name some curve of key type `kty` answers to. A key
+/// that says an `alg` outside these is for something else (`ES512`, say) and
+/// is skipped, where one on an unknown curve that says nothing is kept.
+fn answersTo(kty: []const u8, alg: []const u8) bool {
+    for (supported) |s| {
+        if (std.mem.eql(u8, s.kty, kty) and std.mem.eql(u8, s.alg, alg)) return true;
+    }
+    return false;
+}
 
 /// The keys of one document, owned together. `deinit` frees the lot.
 pub const Keys = struct {
@@ -154,7 +206,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Keys {
                 .n = try decode(alloc, n_text),
             } };
         } else if (std.mem.eql(u8, kty, "EC")) ec: {
-            if (entry.alg) |alg| if (!std.mem.eql(u8, alg, "ES256")) continue;
+            if (entry.alg) |alg| if (!answersTo("EC", alg)) continue;
 
             // The same bargain: it said EC, so it owes a curve and a point.
             // Which curve is not checked here — a curve with no branch is
@@ -167,6 +219,17 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Keys {
                 .crv = crv,
                 .x = try decode(alloc, x_text),
                 .y = try decode(alloc, y_text),
+            } };
+        } else if (std.mem.eql(u8, kty, "OKP")) okp: {
+            if (entry.alg) |alg| if (!answersTo("OKP", alg)) continue;
+
+            // The same bargain once more: it said OKP, so it owes a curve and
+            // a key. `X25519` and `Ed448` are `verify`'s refusal.
+            const crv = entry.crv orelse return error.KeyNotUsable;
+            const x_text = entry.x orelse return error.KeyNotUsable;
+            break :okp Key.Material{ .okp = .{
+                .crv = crv,
+                .x = try decode(alloc, x_text),
             } };
         } else continue;
 
@@ -187,10 +250,10 @@ fn decode(alloc: std.mem.Allocator, text: []const u8) Error![]u8 {
 
 const testing = std.testing;
 
-test "an Ed25519 key beside an RSA one is skipped, not refused" {
+test "a key of a type nilo does not read, beside an RSA one, is skipped and not refused" {
     var keys = try parse(testing.allocator,
         \\{"keys":[
-        \\  {"kty":"OKP","crv":"Ed25519","kid":"okp","x":"aaaa"},
+        \\  {"kty":"oct","kid":"secret","k":"aaaa"},
         \\  {"kty":"RSA","alg":"RS256","use":"sig","kid":"rsa","n":"-_8","e":"AQAB"}
         \\]}
     );
@@ -222,7 +285,7 @@ test "an EC key is read as one, with its curve and both coordinates" {
 test "an EC key that says another algorithm, or is for encryption, is skipped" {
     var keys = try parse(testing.allocator,
         \\{"keys":[
-        \\  {"kty":"EC","crv":"P-384","alg":"ES384","kid":"p384","x":"-_8","y":"AQAB"},
+        \\  {"kty":"EC","crv":"P-521","alg":"ES512","kid":"p521","x":"-_8","y":"AQAB"},
         \\  {"kty":"EC","crv":"P-256","use":"enc","kid":"enc","x":"-_8","y":"AQAB"},
         \\  {"kty":"EC","crv":"P-256","kid":"sig","x":"-_8","y":"AQAB"}
         \\]}
@@ -235,12 +298,49 @@ test "an EC key that says another algorithm, or is for encryption, is skipped" {
 
 test "an EC key on another curve with no alg is kept, so that verify can name it" {
     var keys = try parse(testing.allocator,
-        \\{"keys":[{"kty":"EC","crv":"P-384","kid":"p384","x":"-_8","y":"AQAB"}]}
+        \\{"keys":[{"kty":"EC","crv":"P-521","kid":"p521","x":"-_8","y":"AQAB"}]}
     );
     defer keys.deinit();
 
     try testing.expectEqual(@as(usize, 1), keys.all.len);
-    try testing.expectEqualStrings("P-384", keys.all[0].material.ec.crv);
+    try testing.expectEqualStrings("P-521", keys.all[0].material.ec.crv);
+    try testing.expect(!keys.all[0].curveSupported());
+    try testing.expectEqualStrings("", keys.all[0].algorithm());
+}
+
+test "a P-384 key answers to ES384 and an Ed25519 key to EdDSA, by their curve" {
+    var keys = try parse(testing.allocator,
+        \\{"keys":[
+        \\  {"kty":"EC","crv":"P-384","alg":"ES384","kid":"p384","x":"-_8","y":"AQAB"},
+        \\  {"kty":"EC","crv":"P-256","kid":"p256","x":"-_8","y":"AQAB"},
+        \\  {"kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","kid":"ed","x":"-_8"},
+        \\  {"kty":"OKP","crv":"Ed448","kid":"ed448","x":"-_8"},
+        \\  {"kty":"OKP","crv":"X25519","use":"enc","kid":"x25519","x":"-_8"},
+        \\  {"kty":"OKP","crv":"Ed25519","alg":"ES256","kid":"liar","x":"-_8"}
+        \\]}
+    );
+    defer keys.deinit();
+
+    // The X25519 key is for encryption and the last claims an `alg` that is
+    // not an OKP one; both are skipped.
+    try testing.expectEqual(@as(usize, 4), keys.all.len);
+    try testing.expectEqualStrings("ES384", keys.find("p384").?.algorithm());
+    try testing.expectEqualStrings("ES256", keys.find("p256").?.algorithm());
+    const ed = keys.find("ed").?;
+    try testing.expectEqualStrings("EdDSA", ed.algorithm());
+    try testing.expectEqualStrings("Ed25519", ed.material.okp.crv);
+    try testing.expectEqualSlices(u8, &.{ 0xfb, 0xff }, ed.material.okp.x);
+    // Ed448 is kept so that `verify` can refuse it by name.
+    try testing.expect(!keys.find("ed448").?.curveSupported());
+}
+
+test "an OKP key missing its curve or its key is the document being wrong" {
+    try testing.expectError(error.KeyNotUsable, parse(testing.allocator,
+        \\{"keys":[{"kty":"OKP","kid":"a","x":"-_8"}]}
+    ));
+    try testing.expectError(error.KeyNotUsable, parse(testing.allocator,
+        \\{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"a"}]}
+    ));
 }
 
 test "a kid that is not in the set finds nothing" {

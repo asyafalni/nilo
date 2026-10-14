@@ -373,9 +373,9 @@ Nothing is open at this tier.
 
 ### `nilo_jwt`
 
-**Only 2048, 3072 and 4096 bits of RSA, and only P-256 of EC.** A key size with no branch is `error.KeySizeNotSupported` and a curve with none is `error.CurveNotSupported`, rather than a best effort. ES384 is the same twenty lines over `EcdsaP384Sha384`; ES512 wants P-521, which std does not carry; Ed25519 (`EdDSA`) is a different key type again.
+**Only 2048, 3072 and 4096 bits of RSA, and of the curves only P-256, P-384 and Ed25519.** A key size with no branch is `error.KeySizeNotSupported` and a curve with none is `error.CurveNotSupported`, rather than a best effort. ES512 wants P-521 and `EdDSA` over Ed448 wants Ed448, and std carries neither.
 
-**Needs:** ES384 over std's `EcdsaP384Sha384`, about twenty lines beside ES256, and `EdDSA` over std's Ed25519, each held by a token and key set an issuer publishes; P-521 waits on std, which does not carry it.
+**Needs:** P-521 and Ed448 in std, then each beside its sibling in `jwt/`, held by a token and key set an issuer publishes. Last checked at 0.17.0.
 
 **Whether a token with no `aud` can be checked by the claim that does name the application.** `audience = .unchecked` is what a Cognito access token (`client_id`), a Clerk session token and a Keycloak token for a user with no client role (`azp`) need, and the check then moves to the caller's own `Claims`. A by-name claim check inside `nilo_jwt` would parse the payload into a `std.json.Value` tree on every verify, an allocation on the request path ([ADR 017](./adr/017-the-trade-budget-has-four-axes.md)).
 

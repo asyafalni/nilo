@@ -4,10 +4,12 @@
 //! that reads `alg` out of the header and does what it says will accept
 //! `{"alg":"none"}`, and will accept an HMAC signed with the RSA public key
 //! it published. So `alg` is not an instruction here, it is one more thing
-//! compared — first against the two names this file knows, before any key
+//! compared — first against the four names this file knows, before any key
 //! is looked up, and then against the one the key that was found answers to
-//! (ADR 111). A token saying `ES256` over an RSA key is not "try ECDSA"; it
-//! is a mismatch, and it is refused the way `none` is.
+//! (ADR 111): RS256 for an RSA key, and for the others the curve decides,
+//! `P-256` ES256, `P-384` ES384, `Ed25519` EdDSA. A token saying `ES256`
+//! over an RSA key is not "try ECDSA"; it is a mismatch, and it is refused
+//! the way `none` is. So is `ES384` over a P-256 key.
 //!
 //! **Nothing in the payload is looked at until the signature has passed.**
 //! `exp` off an unverified token is a number somebody chose.
@@ -22,18 +24,21 @@ const b64 = @import("b64.zig");
 const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
 const es256 = @import("es256.zig");
+const es384 = @import("es384.zig");
+const eddsa = @import("eddsa.zig");
 const memo_mod = @import("memo.zig");
 
-/// The two names a header's `alg` may carry, and the whole of what is
-/// accepted before a key is looked up. Which of the two a token actually
-/// gets is the key's decision.
-const known_algorithms = [_][]const u8{ "RS256", "ES256" };
+/// The names a header's `alg` may carry, and the whole of what is accepted
+/// before a key is looked up. Which of them a token actually gets is the
+/// key's decision.
+const known_algorithms = [_][]const u8{ "RS256", "ES256", "ES384", "EdDSA" };
 
 pub const Error = error{
     /// Not three base64url segments separated by two dots.
     NotAToken,
-    /// The header says something other than `RS256` or `ES256` — including
-    /// `none` — or says one of them over a key of the other kind.
+    /// The header says something other than `RS256`, `ES256`, `ES384` or
+    /// `EdDSA` — including `none` — or says one of them over a key that
+    /// answers to another.
     WrongAlgorithm,
     /// The header's `kid` is not in the key set, or it named none and the
     /// set has more than one key to choose from.
@@ -52,7 +57,7 @@ pub const Error = error{
     /// caller asked for.
     ClaimsNotReadable,
     OutOfMemory,
-} || rs256.Error || es256.Error;
+} || rs256.Error || es256.Error || es384.Error || eddsa.Error;
 
 /// What one registered claim has to be, said out loud. A union rather than a
 /// nullable string, so that skipping a check is a word on the line that
@@ -159,6 +164,10 @@ pub fn verify(
 
     const key = opts.keys.find(header.kid) orelse return error.NoSuchKey;
 
+    // A curve with no branch is named, not left to look like a mismatch: a
+    // P-521 key under `ES256` is not the issuer using the wrong algorithm.
+    if (!key.curveSupported()) return error.CurveNotSupported;
+
     // The key decides which arithmetic runs, and the header has to agree
     // with it. `ES256` over an RSA key is a mismatch, not a request.
     if (!std.mem.eql(u8, alg, key.algorithm())) return error.WrongAlgorithm;
@@ -174,7 +183,12 @@ pub fn verify(
     if (!remembered) {
         switch (key.material) {
             .rsa => |rsa| try rs256.verify(signed, sig, rsa.e, rsa.n),
-            .ec => |ec| try es256.verify(signed, sig, ec.crv, ec.x, ec.y),
+            // The curve picked the `alg` above, and picks the arithmetic here.
+            .ec => |ec| if (std.mem.eql(u8, ec.crv, es384.curves[0]))
+                try es384.verify(signed, sig, ec.crv, ec.x, ec.y)
+            else
+                try es256.verify(signed, sig, ec.crv, ec.x, ec.y),
+            .okp => |okp| try eddsa.verify(signed, sig, okp.crv, okp.x),
         }
         if (opts.memo) |m| m.remember(digest.?);
     }
@@ -572,10 +586,11 @@ test "a header saying ES256 over an RSA key is a mismatch, and so is the other w
     const Claims = struct { iss: []const u8 };
 
     // The mixed set: an RSA key under `test-key`, the RFC's EC key under
-    // `es256-key`, and the RS256 token still reads against it.
+    // `es256-key`, an Ed25519 key under `an-okp-key`, and the RS256 token
+    // still reads against it.
     var keys = try keySet();
     defer keys.deinit();
-    try testing.expectEqual(@as(usize, 2), keys.all.len);
+    try testing.expectEqual(@as(usize, 3), keys.all.len);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -615,7 +630,7 @@ test "a header saying ES256 over an RSA key is a mismatch, and so is the other w
     }));
 }
 
-test "ES384 and every other name are refused before a key is looked up" {
+test "ES512 and every other name are refused before a key is looked up" {
     const Claims = struct { iss: []const u8 };
 
     var keys = try jwks.parse(testing.allocator, vector.es256_jwks);
@@ -624,8 +639,8 @@ test "ES384 and every other name are refused before a key is looked up" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    // {"alg":"ES384"} over the one-key set, which would otherwise answer.
-    const forged = "eyJhbGciOiJFUzM4NCJ9." ++ vector.es256_payload ++ "." ++ vector.es256_signature;
+    // {"alg":"ES512"} over the one-key set, which would otherwise answer.
+    const forged = "eyJhbGciOiJFUzUxMiJ9." ++ vector.es256_payload ++ "." ++ vector.es256_signature;
     try testing.expectError(error.WrongAlgorithm, verify(Claims, arena.allocator(), forged, .{
         .keys = &keys,
         .now_s = 1_300_000_000,
@@ -638,7 +653,7 @@ test "a key on a curve with no branch is refused by name rather than as missing"
     const Claims = struct { iss: []const u8 };
 
     var keys = try jwks.parse(testing.allocator,
-        \\{"keys":[{"kty":"EC","crv":"P-384","x":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v","y":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v"}]}
+        \\{"keys":[{"kty":"EC","crv":"P-521","x":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v","y":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v"}]}
     );
     defer keys.deinit();
 
@@ -709,4 +724,170 @@ test "an issuer that is a value refuses another issuer's token, and .unchecked t
         .audience = .{ .is = "client-1" },
         .now_s = 1_500_000_000,
     });
+}
+
+// ES384, over a key and a token made by another implementation (vector.zig).
+
+const Issued = struct { iss: []const u8, sub: []const u8 };
+
+fn issuedOpts(keys: *const jwks.Keys) Options {
+    return .{
+        .keys = keys,
+        .issuer = .{ .is = "https://accounts.example" },
+        .audience = .{ .is = "client-1" },
+        .now_s = 1_500_000_000,
+    };
+}
+
+test "an ES384 token verifies against the issuer's P-384 key, and the claims come back" {
+    var keys = try jwks.parse(testing.allocator, vector.es384_jwks);
+    defer keys.deinit();
+    try testing.expectEqualStrings("ES384", keys.all[0].algorithm());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const claims = try verify(Issued, arena.allocator(), vector.es384_token, issuedOpts(&keys));
+    try testing.expectEqualStrings("u-7", claims.sub);
+
+    // The registered claims are the module's business under this key too.
+    var late = issuedOpts(&keys);
+    late.now_s = 2_000_000_001;
+    try testing.expectError(error.Expired, verify(Issued, arena.allocator(), vector.es384_token, late));
+}
+
+test "a tampered ES384 token is a bad signature, in the payload or in the signature" {
+    var keys = try jwks.parse(testing.allocator, vector.es384_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bad_payload = try a.dupe(u8, vector.es384_token);
+    const at = std.mem.indexOfScalar(u8, bad_payload, '.').? + 1;
+    bad_payload[at] = if (bad_payload[at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verify(Issued, a, bad_payload, issuedOpts(&keys)));
+
+    // A byte in the middle of r, past the last character that carries slack
+    // bits, so the change is in the integer and not in the padding.
+    const bad_sig = try a.dupe(u8, vector.es384_token);
+    const sig_at = std.mem.lastIndexOfScalar(u8, bad_sig, '.').? + 20;
+    bad_sig[sig_at] = if (bad_sig[sig_at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verify(Issued, a, bad_sig, issuedOpts(&keys)));
+}
+
+test "an ES384 signature sent as DER is refused by its length" {
+    var keys = try jwks.parse(testing.allocator, vector.es384_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const der = vector.es384_header ++ "." ++ vector.es384_payload ++ "." ++ vector.es384_signature_der;
+    try testing.expectError(error.SignatureWrongLength, verify(Issued, arena.allocator(), der, issuedOpts(&keys)));
+}
+
+test "ES384 and ES256 each refuse the other's key, by the curve" {
+    // The RFC's P-256 key, given the `kid` the ES384 token names, so that
+    // the `kid` finds it and it is the `alg` that is being tested.
+    var p256 = try jwks.parse(testing.allocator,
+        "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"es384-key\",\"x\":\"" ++ vector.es256_x ++ "\",\"y\":\"" ++ vector.es256_y ++ "\"}]}");
+    defer p256.deinit();
+    var p384 = try jwks.parse(testing.allocator, vector.es384_jwks);
+    defer p384.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An ES384 token pointed at the P-256 key, and the RFC's ES256 token (which
+    // names no `kid`, so the one key answers) at the P-384 one.
+    // Both are a mismatch before any arithmetic, not a bad signature.
+    try testing.expectError(error.WrongAlgorithm, verify(Issued, a, vector.es384_token, .{
+        .keys = &p256,
+        .now_s = 1_300_000_000,
+        .issuer = .unchecked,
+        .audience = .unchecked,
+    }));
+    try testing.expectError(error.WrongAlgorithm, verify(RfcClaims, a, vector.es256_token, .{
+        .keys = &p384,
+        .now_s = 1_300_000_000,
+        .issuer = .unchecked,
+        .audience = .unchecked,
+    }));
+}
+
+// EdDSA over Ed25519, RFC 8037.
+
+test "an EdDSA token verifies against the issuer's Ed25519 key, and the claims come back" {
+    var keys = try jwks.parse(testing.allocator, vector.eddsa_jwks);
+    defer keys.deinit();
+    try testing.expectEqualStrings("EdDSA", keys.all[0].algorithm());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const claims = try verify(Issued, arena.allocator(), vector.eddsa_token, issuedOpts(&keys));
+    try testing.expectEqualStrings("https://accounts.example", claims.iss);
+    try testing.expectEqualStrings("u-7", claims.sub);
+}
+
+test "a tampered EdDSA token is a bad signature, in the payload or in the signature" {
+    var keys = try jwks.parse(testing.allocator, vector.eddsa_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bad_payload = try a.dupe(u8, vector.eddsa_token);
+    const at = std.mem.indexOfScalar(u8, bad_payload, '.').? + 1;
+    bad_payload[at] = if (bad_payload[at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verify(Issued, a, bad_payload, issuedOpts(&keys)));
+
+    const bad_sig = try a.dupe(u8, vector.eddsa_token);
+    const sig_at = std.mem.lastIndexOfScalar(u8, bad_sig, '.').? + 10;
+    bad_sig[sig_at] = if (bad_sig[sig_at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verify(Issued, a, bad_sig, issuedOpts(&keys)));
+}
+
+test "an EdDSA header over an EC key, and an ES384 header over an Ed25519 key, are mismatches" {
+    var ed = try jwks.parse(testing.allocator, vector.eddsa_jwks);
+    defer ed.deinit();
+    var p384 = try jwks.parse(testing.allocator, vector.es384_jwks);
+    defer p384.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // {"alg":"EdDSA","kid":"es384-key"} over the P-384 key, with the Ed25519
+    // token's own signature, and {"alg":"ES384","kid":"ed25519-key"} the
+    // other way round.
+    const eddsa_over_ec = "eyJhbGciOiJFZERTQSIsImtpZCI6ImVzMzg0LWtleSJ9." ++ vector.eddsa_payload ++ "." ++ vector.eddsa_signature;
+    try testing.expectError(error.WrongAlgorithm, verify(Issued, a, eddsa_over_ec, issuedOpts(&p384)));
+    const es384_over_okp = "eyJhbGciOiJFUzM4NCIsImtpZCI6ImVkMjU1MTkta2V5In0." ++ vector.es384_payload ++ "." ++ vector.es384_signature;
+    try testing.expectError(error.WrongAlgorithm, verify(Issued, a, es384_over_okp, issuedOpts(&ed)));
+}
+
+test "a key on a curve with no branch is refused by name under any algorithm, Ed448 and P-521 alike" {
+    var keys = try jwks.parse(testing.allocator,
+        \\{"keys":[
+        \\  {"kty":"OKP","crv":"Ed448","kid":"ed448","x":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"},
+        \\  {"kty":"EC","crv":"P-521","kid":"p521","x":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","y":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}
+        \\]}
+    );
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // {"alg":"EdDSA","kid":"ed448"} and {"alg":"ES256","kid":"p521"}: the
+    // honest names for these keys' neighbours, and still CurveNotSupported.
+    const ed448 = "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkNDQ4In0." ++ vector.eddsa_payload ++ "." ++ vector.eddsa_signature;
+    try testing.expectError(error.CurveNotSupported, verify(Issued, a, ed448, issuedOpts(&keys)));
+    const p521 = "eyJhbGciOiJFUzI1NiIsImtpZCI6InA1MjEifQ." ++ vector.es384_payload ++ "." ++ vector.es384_signature;
+    try testing.expectError(error.CurveNotSupported, verify(Issued, a, p521, issuedOpts(&keys)));
 }

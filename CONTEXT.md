@@ -418,7 +418,7 @@ A JWT somebody else signed and this program has to believe or refuse. The word i
 _Avoid_: JWT as a verb, bearer, credential, ticket, id token
 
 **Key set**:
-An issuer's public keys, as they come back from its JWKS endpoint, read into the ones a token can be checked against — RSA for RS256, EC on P-256 for ES256 — and each one's type is what decides which check a token under it gets. Keys of another type in the same document are skipped rather than refused, because an issuer adding a key type is not a reason to stop signing people in. Fetching it and deciding when it is stale are the caller's.
+An issuer's public keys, as they come back from its JWKS endpoint, read into the ones a token can be checked against — RSA for RS256, EC on P-256 for ES256, EC on P-384 for ES384, OKP on Ed25519 for EdDSA — and each one's type and curve is what decides which check a token under it gets. Keys of another type in the same document are skipped rather than refused, because an issuer adding a key type is not a reason to stop signing people in. Fetching it and deciding when it is stale are the caller's.
 _Avoid_: JWKS as a noun on its own, keyring, key store, certificate
 
 **Claims**:

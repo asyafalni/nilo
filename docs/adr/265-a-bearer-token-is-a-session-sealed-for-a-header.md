@@ -35,7 +35,7 @@ fn me(b: nilo.Bearer(Signed)) !Profile {
 
 ## What was rejected
 
-- **A hand-written HS256 beside `nilo_jwt`**, the position `docs/decided.md` held. It left the constant-time compare to the caller. `nilo_jwt` still verifies RS256 and ES256 only; a token from an issuer other than this server is `Verified(V)`.
+- **A hand-written HS256 beside `nilo_jwt`**, the position `docs/decided.md` held. It left the constant-time compare to the caller. `nilo_jwt` still verifies public-key algorithms only (RS256, ES256, ES384, EdDSA); a token from an issuer other than this server is `Verified(V)`.
 - **Signing JWTs.** An application issuing a token to its own client does not need one the client can read, and a token with an `alg` header is the confusion ADR 111 refuses.
 - **A separate secret for tokens.** Two settings to rotate and to forget. One secret opens both, and the purpose in the associated data keeps them apart.
 - **A key exposed so the application can call `seal`.** The key stays in `Ctx`; `issue` is the one way out.

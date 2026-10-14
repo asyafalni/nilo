@@ -21,24 +21,24 @@ Two things this module did not anticipate turned up once it shipped. An issuer s
 
 ### What is in and what is not
 
-**In:** RS256 and ES256 verification, the key set they read, the registered claims (`exp`, `iss`, `aud`), and a `Keyring` that rotates a key set without a race.
+**In:** RS256, ES256, ES384 and EdDSA (Ed25519) verification, the key set they read, the registered claims (`exp`, `iss`, `aud`), and a `Keyring` that rotates a key set without a race.
 **Out:** the JWKS fetch's own HTTP call, discovery, PKCE, the nonce, the domain claim, and the mapping to a user row.
 
 The line is not taste. A JWKS fetch is an HTTPS GET, which `nilo_fetch` already sends and which nothing about being wrong makes dangerous, a fetch that fails, fails loudly. Holding the answer is `nilo_cache`'s job; when to refresh it is a policy the module states a bound for and does not otherwise make. So the module is the half where being wrong is silent, and the caller (or the `Keyring` below) keeps the half where being wrong is obvious, the same cut `nilo_pw` makes between the hashing and the salt and the allocator.
 
 ### The key decides the algorithm, never the header
 
-**The header's `alg` is compared, twice, and never dispatched on.** A JWKS key that says `"kty":"RSA"` is read as RS256 material (`e` and `n`); one that says `"kty":"EC"` is read as ES256 material (`crv`, `x`, `y`); `jwt.Key` carries which as a `material` union.
+**The header's `alg` is compared, twice, and never dispatched on.** A JWKS key that says `"kty":"RSA"` is read as RS256 material (`e` and `n`); one that says `"kty":"EC"` is read as ECDSA material (`crv`, `x`, `y`), ES256 on `P-256` and ES384 on `P-384`; one that says `"kty":"OKP"` is read as EdDSA material (`crv`, `x`, RFC 8037), on `Ed25519`; `jwt.Key` carries which as a `material` union, and the curve picks the `alg` from one table in `jwks.zig`.
 The header is checked at two points in `token.zig`, both refusals rather than routing:
 
-1. **Before the key is looked up**, against the two names this module knows (`"RS256"`, `"ES256"`). `none`, `HS256`, `ES384` and everything else stop here and never reach a `kid` match, which is what keeps `none` reading `WrongAlgorithm` rather than `NoSuchKey`.
-2. **After the key is found**, against the one name that key answers to. `ES256` over an RSA key is a mismatch, refused the way `none` is, before any arithmetic runs.
+1. **Before the key is looked up**, against the four names this module knows (`"RS256"`, `"ES256"`, `"ES384"`, `"EdDSA"`). `none`, `HS256`, `ES512` and everything else stop here and never reach a `kid` match, which is what keeps `none` reading `WrongAlgorithm` rather than `NoSuchKey`.
+2. **After the key is found**, against the one name that key answers to. `ES256` over an RSA key, or `ES384` over a P-256 one, is a mismatch, refused the way `none` is, before any arithmetic runs.
 
 So a key set holding an RSA key and an EC key at once, what an issuer publishes mid-migration, cannot be talked into checking one with the other: the token names a `kid`, the `kid` names a key, the key names the algorithm, and the header either agrees or the token is refused. At no point does anything in the token pick code.
 
-**A key size or curve with no branch is refused by name, not skipped.** An RSA modulus that is not 2048, 3072 or 4096 bits is `error.KeySizeNotSupported`; an EC key whose `crv` is not `P-256` is kept by `parseKeys` and refused by name at `verify`, `error.CurveNotSupported`, because skipping it at parse time would turn the token into `NoSuchKey`, which the caller reads as "refetch", and they would refetch forever. A key of another type entirely, Ed25519, or one marked `"use":"enc"`, is still skipped at parse, because an issuer adding one of those means nothing about this program.
+**A key size or curve with no branch is refused by name, not skipped.** An RSA modulus that is not 2048, 3072 or 4096 bits is `error.KeySizeNotSupported`; an EC key whose `crv` is not `P-256` or `P-384`, or an OKP key whose `crv` is not `Ed25519` (`P-521`, `Ed448`, `X25519`), is kept by `parseKeys` and refused by name at `verify`, `error.CurveNotSupported`, because skipping it at parse time would turn the token into `NoSuchKey`, which the caller reads as "refetch", and they would refetch forever. A key of another type entirely (`oct`), or one marked `"use":"enc"`, is still skipped at parse, because an issuer adding one of those means nothing about this program.
 
-**The JWS signature on an EC token is raw `r || s`, sixty-four bytes on P-256, and never DER.** Every other place an ECDSA signature turns up, a certificate, `openssl dgst`, a `.sig` file, is the DER `SEQUENCE { INTEGER r, INTEGER s }`; RFC 7518 §3.4 says a JWS carries the two integers back to back, each padded to the curve's width. A DER signature arrives as `error.SignatureWrongLength` rather than as a `BadSignature` that costs an afternoon.
+**The JWS signature on an EC token is raw `r || s`, sixty-four bytes on P-256 and ninety-six on P-384, and never DER.** Every other place an ECDSA signature turns up, a certificate, `openssl dgst`, a `.sig` file, is the DER `SEQUENCE { INTEGER r, INTEGER s }`; RFC 7518 §3.4 says a JWS carries the two integers back to back, each padded to the curve's width. A DER signature arrives as `error.SignatureWrongLength` rather than as a `BadSignature` that costs an afternoon.
 
 ### Nothing is read until the signature has passed
 
@@ -142,7 +142,7 @@ The pin is two counters. A reader increments `crossing`, loads the pointer, incr
 
 **A refusal in `refusals/` for the missing field.** The compile error is Zig's own `missing struct field: audience`, which names the field and points at the declaration this ADR's doc comment sits on. `nilo_jwt` has no refusals table (there are nine, none of them this module's), and a table is a row in `build.zig` for a message that would say what Zig already says.
 
-**HS256, the EC families beyond P-256, JWE, and signing.** Signing is absent because a server issuing its own sessions has `Session(T)` sealed into a cookie, and a client that cannot hold a cookie has `Bearer(T)`, the same seal in an `Authorization` header ([ADR 265](./265-a-bearer-token-is-a-session-sealed-for-a-header.md)), and does not need a token it can read at all. HS256 is one call to `std.crypto.auth.hmac.sha2.HmacSha256`, and it stays out because the shared-secret shape is what makes the `alg`-confusion attack possible: a module that verifies both a shared secret and a public key has to be careful about something a module that verifies only public keys cannot get wrong.
+**HS256, the curves std does not carry (P-521, so ES512, and Ed448), JWE, and signing.** ES384 and EdDSA were left out at first and came in over the std `EcdsaP384Sha384` and `Ed25519`, each held by a token an independent library made and a key set that holds it (RFC 8037 Appendix A.4 for the Ed25519 primitive). Signing is absent because a server issuing its own sessions has `Session(T)` sealed into a cookie, and a client that cannot hold a cookie has `Bearer(T)`, the same seal in an `Authorization` header ([ADR 265](./265-a-bearer-token-is-a-session-sealed-for-a-header.md)), and does not need a token it can read at all. HS256 is one call to `std.crypto.auth.hmac.sha2.HmacSha256`, and it stays out because the shared-secret shape is what makes the `alg`-confusion attack possible: a module that verifies both a shared secret and a public key has to be careful about something a module that verifies only public keys cannot get wrong.
 
 ## What it costs
 
@@ -151,7 +151,7 @@ The pin is two counters. A reader increments `crossing`, loads the pointer, incr
 | Allocations per request | none beyond `verify`'s own; a `Keyring` pin is three atomic operations and no allocation, and a swap allocates the new set once per rotation |
 | Memory per idle connection | unchanged: a caller holds a pointer on its stack for as long as it held a `*const Keys` before |
 | Throughput and p99 | unmeasured beyond the RSA or ECDSA verify itself (a modular exponentiation, or `EcdsaP256Sha256.Signature.verify`); a `Keyring` adds three atomics on top. The roadmap still holds "whether a sign-in endpoint should cache a verification or just do it" open, waiting on that number |
-| Binary size | 0 for a program that never imports `nilo_jwt`, a linker fact rather than a promise; one that does links RS256 and ES256 both, since the choice between them is a runtime switch on the key |
+| Binary size | 0 for a program that never imports `nilo_jwt`, a linker fact rather than a promise; one that does links RS256, ES256, ES384 and EdDSA all, since the choice between them is a runtime switch on the key |
 
 `Expect` moves none of the four axes. It is a tag and a slice where an optional slice was, in an options value on the stack and once in a `Keyring`; `verify` makes one more `switch` on a tag it made one `if` on a pointer for, and allocates nothing it did not. No number was measured for this, since there is no instruction an allocation count or an idle connection could notice it in; `python3 bench/release.py` is the run that would, and `bench/release/jwt.zig` has to be rewritten to the new spelling before it runs.
 

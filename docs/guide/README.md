@@ -20,7 +20,7 @@ Read the pages in order the first time, since each one assumes the ones above it
 | **`nilo_config`** | settings read from the environment into a struct of yours | [Settings](./config.md) |
 | **`nilo_pw`** | password hashing: argon2id, stored as PHC | [Sessions](./sessions.md#sign-in-and-password-checking) |
 | **`nilo_cache`** | an expiring cache in this process, holding no pointers | [A cache in this process](./cache.md), and the Space that [Idempotency keys](./idempotency.md) keeps its answers in |
-| **`nilo_jwt`** | checking somebody else's signed token: RS256, ES256 and a JWKS | [Checking somebody else's token](./jwt.md) |
+| **`nilo_jwt`** | checking somebody else's signed token: RS256, ES256, ES384, EdDSA and a JWKS | [Checking somebody else's token](./jwt.md) |
 | **`nilo_proto`** | protobuf messages as plain structs: OTLP, a gRPC method's message | [Protobuf messages](./proto.md) |
 | **`nilo_id`** | UUIDs, v4 and v7 | [Identifiers](./id.md) |
 | **`nilo_core`** | `Str`, the Scope and the clock the rest share | [the reference](../reference/core.md#scope) |

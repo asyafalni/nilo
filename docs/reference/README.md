@@ -377,7 +377,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [Memory per entry](./cache.md#memory-per-entry)
   - [What it will not do](./cache.md#what-it-will-not-do)
 
-**[nilo_jwt](./jwt.md)**: `nilo_jwt` checks a JWT that somebody else signed (RS256 or ES256), and never signs or fetches one itself.
+**[nilo_jwt](./jwt.md)**: `nilo_jwt` checks a JWT that somebody else signed (RS256, ES256, ES384 or EdDSA), and never signs or fetches one itself.
 
 - [`nilo_jwt`](./jwt.md#nilo_jwt-1)
   - [`jwt.verify` and `jwt.Keys`](./jwt.md#jwtverify-and-jwtkeys)

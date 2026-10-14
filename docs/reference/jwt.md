@@ -1,6 +1,6 @@
 # nilo_jwt
 
-**`nilo_jwt` checks a JWT that somebody else signed (RS256 or ES256), and never signs or fetches one itself.**
+**`nilo_jwt` checks a JWT that somebody else signed (RS256, ES256, ES384 or EdDSA), and never signs or fetches one itself.**
 
 **Guide:** [Checking somebody else's token](../guide/jwt.md) · **Design:** [JWT verification](../design/jwt.md)
 
@@ -32,15 +32,15 @@ fn signIn(gpa: std.mem.Allocator, keys: *const jwt.Keys, id_token: []const u8) !
 
 | | |
 |---|---|
-| `jwt.parseKeys(gpa, bytes)` | `!Keys`: a JWKS document read into the keys it can verify with: `RSA`, and `EC` on `P-256` |
+| `jwt.parseKeys(gpa, bytes)` | `!Keys`: a JWKS document read into the keys it can verify with: `RSA`, `EC` on `P-256` or `P-384`, and `OKP` on `Ed25519` |
 | `keys.deinit()` | frees all of it |
 | `keys.find(kid)` | `?Key`. A set with one key matches a token that named no key |
-| `key.material` | `.rsa = .{ .e, .n }` or `.ec = .{ .crv, .x, .y }`. Which one it is decides how a token signed with it is checked |
-| `key.algorithm()` | the `alg` a token signed with this key must declare: `RS256` or `ES256` |
+| `key.material` | `.rsa = .{ .e, .n }`, `.ec = .{ .crv, .x, .y }` or `.okp = .{ .crv, .x }`. Which one it is, and its curve, decides how a token signed with it is checked |
+| `key.algorithm()` | the `alg` a token signed with this key must declare: `RS256`, `ES256` (`P-256`), `ES384` (`P-384`) or `EdDSA` (`Ed25519`). It is empty for a key on a curve with no branch, which `verify` refuses by name |
 | `jwt.verify(Claims, gpa, token, opts)` | `!Claims`: the whole check, then the payload |
 | `jwt.Expect` | `union(enum) { is: []const u8, unchecked }`: what `issuer` and `audience` are set to. There is no default and no `null`, so a call that forgets one does not compile ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)) |
 | `jwt.key_sizes` | the RSA modulus lengths supported: 256, 384 and 512 bytes |
-| `jwt.curves` | the curves supported: `P-256` |
+| `jwt.curves` | the curves supported: `P-256`, `P-384` and `Ed25519` |
 
 ### `Options`
 
@@ -67,7 +67,7 @@ defer keys.deinit();
 
 **Three things are fixed, because making any of them an option lets you write a verifier that passes every test and is still insecure:**
 
-- **The algorithm comes from the key, never from the token's `alg`.** An `RSA` key is checked as RS256 and an `EC` key on `P-256` as ES256, and the header is only compared against that. `{"alg":"none"}` and an HMAC signed with the RSA modulus you published are rejected before any key is looked up, and `ES256` over an RSA key is a mismatch, not a request ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+- **The algorithm comes from the key, never from the token's `alg`.** An `RSA` key is checked as RS256, an `EC` key on `P-256` as ES256, one on `P-384` as ES384 and an `OKP` key on `Ed25519` as EdDSA, and the header is only compared against that. `{"alg":"none"}` and an HMAC signed with the RSA modulus you published are rejected before any key is looked up, and `ES256` over an RSA key, or `ES384` over a P-256 one, is a mismatch, not a request ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 - **Nothing in the payload is read until the signature has passed.** An `exp` from an unverified token is a number somebody chose.
 - **`exp` is required.** A credential that never expires is not a credential.
 
@@ -78,15 +78,15 @@ Strings in the returned claims point into the allocator you passed. Pass `c.aren
 | Error | When |
 |---|---|
 | `error.NotAToken` | not three base64url segments, or the header is not JSON |
-| `error.WrongAlgorithm` | the header says anything but `RS256` or `ES256` (`none` included), or names one of them over a key of the other kind |
+| `error.WrongAlgorithm` | the header says anything but `RS256`, `ES256`, `ES384` or `EdDSA` (`none` included), or names one of them over a key that answers to another |
 | `error.NoSuchKey` | the `kid` is not in the set, or no `kid` was given and the set has more than one key |
 | `error.BadSignature` | the key is right and the signature is not |
 | `error.NoExpiry` / `error.Expired` / `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not yet reached |
 | `error.WrongIssuer` / `error.WrongAudience` | `iss` or `aud` is not what you named |
 | `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct |
 | `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits |
-| `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` |
-| `error.SignatureWrongLength` | a signature that is not the size of its key. For ES256 that is sixty-four bytes of `r \|\| s`, which is where a DER-encoded signature is caught |
+| `error.CurveNotSupported` | a key whose curve has no branch: an `EC` key whose `crv` is not `P-256` or `P-384`, or an `OKP` key whose `crv` is not `Ed25519` (`P-521` and `Ed448` among them) |
+| `error.SignatureWrongLength` | a signature that is not the size of its key. For ES256 that is sixty-four bytes of `r \|\| s`, for ES384 ninety-six, and for EdDSA the sixty-four of `R \|\| S`; a DER-encoded ECDSA signature is caught here |
 | `error.KeyNotUsable` | a key in the set that the arithmetic cannot use: an even RSA exponent, or an EC coordinate that is not thirty-two bytes or not on the curve |
 
 ### `jwt.Keyring`
@@ -141,4 +141,4 @@ fn wire(app: *nilo.App, google: *jwt.Keyring, api: *fetch.Client) !void {
 
 ### What it does not do
 
-**Not included:** HS256, any curve but P-256, encrypted tokens, signing, discovery, PKCE and the nonce. There is no signing because a server issuing its own sessions has [`Session(T)`](./ctx.md#sessiont), and a client that cannot hold a cookie has [`Bearer(T)`](./ctx.md#bearert), and neither needs a token the client can read. The rest is the sign-in flow, which is yours.
+**Not included:** HS256, any curve but P-256, P-384 and Ed25519 (`P-521` and `Ed448` wait on std, which does not carry them), encrypted tokens, signing, discovery, PKCE and the nonce. There is no signing because a server issuing its own sessions has [`Session(T)`](./ctx.md#sessiont), and a client that cannot hold a cookie has [`Bearer(T)`](./ctx.md#bearert), and neither needs a token the client can read. The rest is the sign-in flow, which is yours.

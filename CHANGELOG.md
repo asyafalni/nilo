@@ -14,6 +14,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 - **`.min` and `.max` over an enum that sets `nilo_column` (a Postgres `ENUM`) are a compile error on the SQLite dialect**, because SQLite orders the column by the label's spelling and Postgres by the enum's declaration, so the same grouped Row named a different label on each with no error. Drop `nilo_column` from the enum so both store text, or read the first row with `.order` and `.limit = 1` ([ADR 181](docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 - **A `sql.Date` field refuses a column that does not arrive as `date` on a raw read inside a transaction and on a composed statement**, where an `int4` was read as a count of days since 2000. A domain over `date` still reads. Cast the column to `date` in the statement ([ADR 233](docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+- **`nilo_jwt` verifies ES384 (`EC` keys on `P-384`) and EdDSA (`OKP` keys on `Ed25519`, RFC 8037) beside RS256 and ES256**, and the key and its curve still pick the algorithm, never the token's `alg`. `Key.Material` has a third case, `.okp = .{ .crv, .x }`, so an exhaustive `switch` over `key.material` needs one more arm; an `OKP` key that used to be skipped is now read; `key.algorithm()` follows the curve and is `""` for one with no branch (P-521, Ed448), and a token whose key is on such a curve is `error.CurveNotSupported`. `jwt.curves` is `P-256`, `P-384` and `Ed25519` ([ADR 111](docs/adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 
 ### Added
 

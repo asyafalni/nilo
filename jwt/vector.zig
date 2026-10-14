@@ -1,4 +1,4 @@
-//! One RSA key, one EC key, and a token signed with each — generated or
+//! RSA, EC and OKP keys, and a token signed with each — generated or
 //! published elsewhere, and pinned here.
 //!
 //! Signed by somebody else's implementation on purpose. A vector produced by
@@ -15,11 +15,16 @@
 //! the public half of the key in A.3.1 — and it was re-checked against an
 //! independent P-256 before being pinned.
 //!
-//! The mixed key set carries an OKP key in front of the other two, so the
-//! skipping is exercised by every test that reads it. Ed25519 is the right
-//! stand-in for "a type nilo cannot read" because it is the one that will
-//! stay unreadable: the EC key that used to sit there was read the moment
-//! ES256 landed.
+//! The ES384 and EdDSA vectors are the exception to "published elsewhere":
+//! RFC 7515 has no P-384 example and RFC 8037's signed example has a payload
+//! that is not JSON, so the token-level ones were made by Python's
+//! `cryptography` (OpenSSL), not by this code, and the RFC's Ed25519 example
+//! is pinned beside them for the primitive.
+//!
+//! The mixed key set carries an OKP key after the other two, so that the keys the older tests index by position are still where they were. It was
+//! "a type nilo cannot read" until EdDSA landed, as the EC key before it
+//! was until ES256 did; the file that holds a key set nilo skips from is now
+//! `jwks.zig`'s own tests.
 //!
 //! **The private keys were thrown away**, or in the RFC's case were never
 //! anybody's. Nothing here signs anything, and there is nothing in this
@@ -73,12 +78,72 @@ pub const es256_y = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
 pub const es256_jwks =
     "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" ++ es256_x ++ "\",\"y\":\"" ++ es256_y ++ "\"}]}";
 
-/// The issuer's key set, as it would come back from a JWKS endpoint: an
-/// Ed25519 key nilo skips (RFC 8037 A.2's), the RSA key under `test-key`,
-/// and the RFC's EC key under `es256-key`.
+// RFC 8037 Appendix A: "Ed25519 Signing".
+
+/// `{"alg":"EdDSA"}`.
+pub const rfc8037_header = "eyJhbGciOiJFZERTQSJ9";
+
+/// `Example of Ed25519 signing`, which is not JSON, so it can be verified
+/// as a signature and not read as a token.
+pub const rfc8037_payload = "RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc";
+
+/// The sixty-four bytes of A.4.
+pub const rfc8037_signature =
+    "hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg";
+
+/// The public key of A.2 (`d` is not here), as the JWKS spells it.
+pub const rfc8037_x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+
+// ES384 and EdDSA tokens with the registered claims a verifier needs.
+// RFC 7515 has no P-384 example and RFC 8037's payload is not JSON, so these
+// two were signed by Python's `cryptography` (OpenSSL underneath) with a key
+// made for the purpose and thrown away. The payload for both is
+// `{"iss":"https://accounts.example","aud":"client-1","sub":"u-7",
+// "exp":2000000000}`.
+
+/// `{"alg":"ES384","kid":"es384-key"}`.
+pub const es384_header = "eyJhbGciOiJFUzM4NCIsImtpZCI6ImVzMzg0LWtleSJ9";
+
+/// The payload both of the tokens below carry.
+pub const claims_payload =
+    "eyJpc3MiOiJodHRwczovL2FjY291bnRzLmV4YW1wbGUiLCJhdWQiOiJjbGllbnQtMSIsInN1YiI6InUtNyIsImV4cCI6MjAwMDAwMDAwMH0";
+pub const es384_payload = claims_payload;
+
+pub const es384_x = "H2KNEs_ZLD09HspokU_2TSkARpFmuZW1zys0TsuBeSnoTBtWEVREqrMKoJ6KGlrD";
+pub const es384_y = "E5u_5HyTw-s2bdv8OGH6dVLUi38zfU4uOTPWa_0RHNe-YvC4fZ3_830NJjQD_AGU";
+
+/// `r || s`, ninety-six bytes.
+pub const es384_signature =
+    "zNSwWhRiSUMAzfsQKWwPec4lYo1bW3ygYHTGeotfNhVAiYAiZdHW20NHokW_bDOLdG5fSrH098NT5fBIj9SXzN_vyb7NYVNbqgGp8p2REdq5ed4l6i6tdo6hnm0N4sRh";
+
+/// The same `r` and `s` as DER, which is what OpenSSL writes by default.
+pub const es384_signature_der =
+    "MGUCMQDM1LBaFGJJQwDN-xApbA95ziVijVtbfKBgdMZ6i182FUCJgCJl0dbbQ0eiRb9sM4sCMHRuX0qx9PfDU-XwSI_Ul8zf78m-zWFTW6oBqfKdkRHauXneJeourXaOoZ5tDeLEYQ";
+
+pub const es384_token = es384_header ++ "." ++ es384_payload ++ "." ++ es384_signature;
+
+pub const es384_jwks =
+    "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-384\",\"use\":\"sig\",\"kid\":\"es384-key\",\"x\":\"" ++ es384_x ++ "\",\"y\":\"" ++ es384_y ++ "\"}]}";
+
+/// `{"alg":"EdDSA","kid":"ed25519-key"}`.
+pub const eddsa_header = "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkMjU1MTkta2V5In0";
+pub const eddsa_payload = claims_payload;
+pub const eddsa_x = "CLukSdVePIYP2SO2HOboyrJi9r5rKDjRgBV17KTdQwM";
+pub const eddsa_signature =
+    "bJGfYbGuo6kJ-ZxGy9j4Qyk1WnuVRQqBqIdOCILqj6lstTgNbTSd36Ytc-NU7WyCj2BuXPLzeaaCD5yA9KGYBw";
+
+pub const eddsa_token = eddsa_header ++ "." ++ eddsa_payload ++ "." ++ eddsa_signature;
+
+pub const eddsa_jwks =
+    "{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"use\":\"sig\",\"kid\":\"ed25519-key\",\"x\":\"" ++ eddsa_x ++ "\"}]}";
+
+/// The issuer's key set, as it would come back from a JWKS endpoint: the RSA
+/// key under `test-key`, the RFC's EC key under `es256-key`, and last RFC
+/// 8037 A.2's Ed25519 key. No token here is signed by that one (its private
+/// half is not kept), so it is read and not used to verify.
 pub const jwks =
     "{\"keys\":[" ++
-    "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"an-okp-key\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}," ++
     "{\"kty\":\"RSA\",\"alg\":\"RS256\",\"use\":\"sig\",\"kid\":\"test-key\",\"n\":\"" ++ rsa_n ++ "\",\"e\":\"AQAB\"}," ++
-    "{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"kid\":\"es256-key\",\"x\":\"" ++ es256_x ++ "\",\"y\":\"" ++ es256_y ++ "\"}" ++
+    "{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"kid\":\"es256-key\",\"x\":\"" ++ es256_x ++ "\",\"y\":\"" ++ es256_y ++ "\"}," ++
+    "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"an-okp-key\",\"x\":\"" ++ rfc8037_x ++ "\"}" ++
     "]}";

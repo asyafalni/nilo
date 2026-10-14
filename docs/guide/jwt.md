@@ -1,10 +1,10 @@
 # Checking somebody else's token
 
-**`nilo_jwt` verifies a JWT that an identity provider signed, with RS256 or ES256, and reads its claims into a struct of your own.**
+**`nilo_jwt` verifies a JWT that an identity provider signed, with RS256, ES256, ES384 or EdDSA, and reads its claims into a struct of your own.**
 
 **Reference:** [`nilo_jwt`](../reference/jwt.md#nilo_jwt), [`jwt.Keyring`](../reference/jwt.md#jwtkeyring), [`jwt.Verifier`](../reference/jwt.md#jwtverifierclaims-client), [`Verified(V)`](../reference/handlers.md#verifiedv) · **Design:** [JWT verification](../design/jwt.md)
 
-`nilo_jwt` verifies tokens such as a Google ID token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer token, or a Supabase session. It supports RS256 and ES256, which between them are what those issuers sign with. It is a tool module: no event loop, no allocator of its own, and it imports nothing, so `zig test jwt/jwt.zig` runs all of it ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+`nilo_jwt` verifies tokens such as a Google ID token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer token, or a Supabase session. It supports RS256, ES256, ES384 and EdDSA (Ed25519), which between them are what those issuers sign with. It is a tool module: no event loop, no allocator of its own, and it imports nothing, so `zig test jwt/jwt.zig` runs all of it ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 
 **It is for a token somebody else issued.** A sign-in that your own server keeps track of is a [`Session(T)`](./sessions.md), sealed into a cookie, and needs no token at all. In nilo, the word *token* only ever means a credential that arrived from outside ([`CONTEXT.md`](../../CONTEXT.md#tokens)).
 
@@ -72,7 +72,7 @@ fn whoIsThis(gpa: std.mem.Allocator, keys: *const jwt.Keys, token: []const u8) !
 
 **Each of these is a mistake that would give you a verifier that passes every test and leaves the endpoint open**, and preventing them is the reason this module exists rather than a paragraph pointing at `std.crypto`:
 
-- **The algorithm comes from the key, never from the token's `alg`.** A JWKS key that says `RSA` is checked as RS256, and one that says `EC` on `P-256` as ES256; nothing in the token header can change that. The header's `alg` is only compared. A header saying `none`, or `HS256` with your published RSA modulus used as the HMAC secret, is rejected before any key is looked up. A header saying `ES256` over an RSA key, or `RS256` over an EC key, returns `error.WrongAlgorithm` before any arithmetic runs. So a key set holding both kinds, which is what an issuer publishes in the middle of a migration, cannot be tricked into checking one kind with the other ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+- **The algorithm comes from the key, never from the token's `alg`.** A JWKS key that says `RSA` is checked as RS256, one that says `EC` on `P-256` as ES256, on `P-384` as ES384, and `OKP` on `Ed25519` as EdDSA; nothing in the token header can change that. The header's `alg` is only compared. A header saying `none`, or `HS256` with your published RSA modulus used as the HMAC secret, is rejected before any key is looked up. A header saying `ES256` over an RSA key, `ES384` over a P-256 key, or `RS256` over an EC key, returns `error.WrongAlgorithm` before any arithmetic runs. So a key set holding both kinds, which is what an issuer publishes in the middle of a migration, cannot be tricked into checking one kind with the other ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 - **Nothing in the payload is read until the signature has passed.** An `exp` from an unverified token is a number somebody chose.
 - **`exp` is required.** A credential with no end is not a credential, so a token without `exp` returns `error.NoExpiry` however well it is signed.
 
@@ -81,15 +81,15 @@ fn whoIsThis(gpa: std.mem.Allocator, keys: *const jwt.Keys, token: []const u8) !
 | Error | When | What to answer |
 |---|---|---|
 | `error.NotAToken` | not three base64url segments, or the header is not JSON | 401 |
-| `error.WrongAlgorithm` | the header says anything but `RS256` or `ES256` (`none` included), or names one over a key of the other kind | 401 |
+| `error.WrongAlgorithm` | the header says anything but `RS256`, `ES256`, `ES384` or `EdDSA` (`none` included), or names one over a key that answers to another | 401 |
 | `error.NoSuchKey` | the `kid` is not in the set, or no `kid` was named and the set has more than one key | the issuer may have rotated: [refresh](#key-rotation), then 401 |
 | `error.BadSignature` | the key is right and the signature is not | 401 |
 | `error.NoExpiry`, `error.Expired`, `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not reached | 401 |
 | `error.WrongIssuer`, `error.WrongAudience` | `iss` or `aud` is not what you set | 401 |
 | `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct | 401, or a 500 if your struct is what is wrong |
 | `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and an entry on the [todo list](../todo.md) under `nilo_jwt` |
-| `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` | the same 500, and the same todo entry |
-| `error.SignatureWrongLength` | a signature that is not the size of its key (for ES256, sixty-four bytes of `r \|\| s`) | 401. If it is *your* test token, the signer wrote DER: [below](#es256-signatures) |
+| `error.CurveNotSupported` | a key whose curve has no branch: `EC` other than `P-256` and `P-384`, or `OKP` other than `Ed25519` | the same 500, and the same todo entry |
+| `error.SignatureWrongLength` | a signature that is not the size of its key (sixty-four bytes of `r \|\| s` for ES256, ninety-six for ES384, sixty-four of `R \|\| S` for EdDSA) | 401. If it is *your* test token, the signer wrote DER: [below](#es256-signatures) |
 | `error.KeyNotUsable` | the set carried a key the arithmetic cannot use: an even exponent, a point that is not on the curve | 500. The key document is wrong, and no token will pass |
 
 **Every one of these is a 401 to the client, and the reason belongs in your log, not in the response.** Telling a caller which check failed tells them what to fix on the next attempt. The one worth a different answer is `NoSuchKey`, because that is what a key rotation looks like from here.
@@ -100,14 +100,14 @@ fn whoIsThis(gpa: std.mem.Allocator, keys: *const jwt.Keys, token: []const u8) !
 
 | | |
 |---|---|
-| `jwt.parseKeys(gpa, bytes)` | `!Keys`: a JWKS document read into the keys it can verify with, `RSA` as `n` and `e`, `EC` as `crv`, `x` and `y`. Keys of another type (Ed25519, a key marked `"use":"enc"`) are skipped, not rejected |
+| `jwt.parseKeys(gpa, bytes)` | `!Keys`: a JWKS document read into the keys it can verify with, `RSA` as `n` and `e`, `EC` as `crv`, `x` and `y`, `OKP` as `crv` and `x`. Keys of another type (an `oct` key, one marked `"use":"enc"`) are skipped, not rejected |
 | `keys.find(kid)` | `?Key`. A set with exactly one key answers for a token that named no `kid` |
-| `key.material` | `.rsa` or `.ec`, and the key's own `algorithm()` is `RS256` or `ES256` accordingly |
+| `key.material` | `.rsa`, `.ec` or `.okp`, and the key's own `algorithm()` is `RS256`, `ES256`, `ES384` or `EdDSA` accordingly |
 | `keys.deinit()` | frees everything |
 | `jwt.key_sizes` | the supported modulus lengths: 256, 384 and 512 bytes |
-| `jwt.curves` | the supported curves: `P-256` |
+| `jwt.curves` | the supported curves: `P-256`, `P-384` and `Ed25519` |
 
-`parseKeys` returns `error.NotAKeySet` for bytes that are not a JSON object with a `keys` array, and `error.KeyNotUsable` for a key that says RSA but has no `n` and `e`, or says EC but has no `crv`, `x` or `y`. An EC key on a curve other than `P-256` is *kept*, so that a token naming it returns `error.CurveNotSupported` rather than a `NoSuchKey` that sends you looking for a rotation.
+`parseKeys` returns `error.NotAKeySet` for bytes that are not a JSON object with a `keys` array, and `error.KeyNotUsable` for a key that says RSA but has no `n` and `e`, says EC but has no `crv`, `x` or `y`, or says OKP but has no `crv` or `x`. A key on a curve with no branch (`P-521`, `Ed448`) is *kept*, so that a token naming it returns `error.CurveNotSupported` rather than a `NoSuchKey` that sends you looking for a rotation.
 
 The issuer publishes the document's address. Google's is `https://www.googleapis.com/oauth2/v3/certs`, and for any OIDC issuer it is the `jwks_uri` in `/.well-known/openid-configuration`. **The usual setup is a `Keyring`**: the key URL, issuer and audience written once, the document fetched at startup, and the key set swapped safely when the issuer rotates ([below](#key-rotation)).
 
@@ -139,9 +139,9 @@ A program that only wants to parse the bytes can still use `parseKeys`: `jwt.par
 
 ## ES256 signatures
 
-**ES256 keys need nothing different in the call: the key's type picks the arithmetic, and the same `verify` handles both.** Supabase, Apple and a growing number of issuers sign with ES256 (ECDSA over P-256 with SHA-256), and their JWKS carries `{"kty":"EC","crv":"P-256","x":…,"y":…}` instead of `n` and `e`.
+**ES256, ES384 and EdDSA keys need nothing different in the call: the key's type and curve pick the arithmetic, and the same `verify` handles all of them.** Supabase, Apple and a growing number of issuers sign with ES256 (ECDSA over P-256 with SHA-256), and their JWKS carries `{"kty":"EC","crv":"P-256","x":…,"y":…}` instead of `n` and `e`. ES384 is the same on `"crv":"P-384"`, with 48-byte coordinates, and EdDSA is `{"kty":"OKP","crv":"Ed25519","x":…}`, the whole 32-byte public key in one string (RFC 8037). A JWKS entry that names an `alg` the curve does not answer to, `ES512` for instance, is skipped.
 
-One thing matters if you ever *create* an ES256 token for a test. A JWS signature is the two integers `r` and `s` back to back, thirty-two bytes each, sixty-four in total (RFC 7518 §3.4). Every tool outside JOSE (`openssl dgst`, a certificate, a `.sig` file) writes the DER `SEQUENCE { INTEGER r, INTEGER s }` instead, around seventy bytes with a variable length. A token whose last segment is DER is rejected here as `error.SignatureWrongLength`, by name, rather than as a `BadSignature` you spend an afternoon on. The module's own test vector is the one from RFC 7515, which avoids the problem.
+One thing matters if you ever *create* an ES256 token for a test. A JWS signature is the two integers `r` and `s` back to back, thirty-two bytes each, sixty-four in total (RFC 7518 §3.4). Every tool outside JOSE (`openssl dgst`, a certificate, a `.sig` file) writes the DER `SEQUENCE { INTEGER r, INTEGER s }` instead, around seventy bytes with a variable length. ES384 is the same at forty-eight bytes each, ninety-six in total, and an EdDSA signature has no DER form at all. A token whose last segment is DER is rejected here as `error.SignatureWrongLength`, by name, rather than as a `BadSignature` you spend an afternoon on. The module's own test vector is the one from RFC 7515, which avoids the problem.
 
 ## The signed-in user as a handler argument
 
@@ -241,7 +241,7 @@ Whether a `kid` miss should *reject* rather than *fetch* is still your decision:
 
 **`now_s` is an argument, so you test an expiry by choosing the time instead of waiting.** Create a key you hold (`openssl genrsa` or `openssl ecparam -name prime256v1 -genkey`), publish its public half as a JWKS document, and sign a token with any JOSE library. Then call `verify` at the second before its `exp`, at `exp`, and the second after. That is a complete test, and it runs under `zig test` with no server.
 
-The module's own suite does exactly that against two fixed vectors in `jwt/vector.zig` (an RSA token signed elsewhere, and RFC 7515's own ES256 example). Copy the shape from that file.
+The module's own suite does exactly that against fixed vectors in `jwt/vector.zig` (an RSA token signed elsewhere, RFC 7515's own ES256 example, RFC 8037's Ed25519 example, and an ES384 and an EdDSA token made by OpenSSL's library). Copy the shape from that file.
 
 ## What it costs
 
@@ -251,11 +251,11 @@ The module's own suite does exactly that against two fixed vectors in `jwt/vecto
 
 ## What it will not do
 
-**Not supported: HS256, any curve but P-256, encrypted tokens (JWE), signing, discovery, PKCE and the nonce.** Signing is missing because a server that issues its own sessions has [`Session(T)`](./sessions.md) and needs no token. HS256 is missing because a module that verifies both a shared secret and a public key has to defend against an algorithm-confusion attack that a module verifying only one cannot fall for ([decided](../decided.md#accepted)). The rest is the sign-in flow (redirecting to the provider, exchanging a code), which is yours.
+**Not supported: HS256, any curve but P-256, P-384 and Ed25519 (`P-521` and `Ed448` wait on std), encrypted tokens (JWE), signing, discovery, PKCE and the nonce.** Signing is missing because a server that issues its own sessions has [`Session(T)`](./sessions.md) and needs no token. HS256 is missing because a module that verifies both a shared secret and a public key has to defend against an algorithm-confusion attack that a module verifying only one cannot fall for ([decided](../decided.md#accepted)). The rest is the sign-in flow (redirecting to the provider, exchanging a code), which is yours.
 
 ## See also
 
 - [The reference](../reference/jwt.md#nilo_jwt): the full list of calls.
 - [Sessions](./sessions.md): what a signed-in user becomes after the first verified request.
 - [Calling somebody else's API](./fetch.md): the fetch that gets the key set.
-- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md): why verifying is in this module and fetching is not, why the key picks the algorithm, and what ES256 costs.
+- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md): why verifying is in this module and fetching is not, why the key picks the algorithm, and what ES256 costs. ES384 and EdDSA were added to it in place.

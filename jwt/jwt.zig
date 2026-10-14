@@ -39,14 +39,15 @@
 //!
 //! So the three that are easiest to get wrong are not options:
 //!
-//! - **The algorithm is the key's, never the token's `alg`.** Two are read:
+//! - **The algorithm is the key's, never the token's `alg`.** Four are read:
 //!   RS256 for a JWKS key that says `RSA`, ES256 for one that says `EC` on
-//!   `P-256`. Which one runs is decided by the key the `kid` found, and the
-//!   header's `alg` is only compared — against the two names before a key is
+//!   `P-256`, ES384 for `EC` on `P-384`, and EdDSA for `OKP` on `Ed25519`.
+//!   Which one runs is decided by the key the `kid` found, and the
+//!   header's `alg` is only compared — against the four names before a key is
 //!   looked up, so `{"alg":"none"}` and an HMAC signed with the published
 //!   RSA modulus are refused before anything else, and against the key's
-//!   own name after, so `ES256` over an RSA key is a mismatch and not a
-//!   request (ADR 111).
+//!   own name after, so `ES256` over an RSA key, or over a P-384 one, is a
+//!   mismatch and not a request (ADR 111).
 //! - **Nothing in the payload is read until the signature has passed.** An
 //!   `exp` off an unverified token is a number somebody chose.
 //!   `exp` is required, because a credential with no end is not one.
@@ -57,14 +58,16 @@
 //!
 //! **The arithmetic is std's.** RS256 is `std.crypto.Certificate.rsa`, which
 //! is public in Zig 0.16 and is the code that verifies a TLS certificate
-//! chain; ES256 is `std.crypto.sign.ecdsa.EcdsaP256Sha256`. This module
-//! writes no RSA and no ECDSA. What it adds is the switch over RSA key
+//! chain; ES256 and ES384 are `std.crypto.sign.ecdsa.EcdsaP256Sha256` and
+//! `EcdsaP384Sha384`; EdDSA is `std.crypto.sign.Ed25519`. This module
+//! writes no RSA, no ECDSA and no EdDSA. What it adds is the switch over RSA key
 //! sizes, because `modulus_len` is a comptime parameter there and a run-time
 //! length here, and the one fact about a JWS signature std cannot know: it
 //! is raw `r || s`, not DER.
 //!
-//! **What it does not do**: HS256, any curve but P-256, encrypted tokens
-//! (JWE), signing, discovery, PKCE, and the nonce. Signing is not here
+//! **What it does not do**: HS256, any curve but P-256, P-384 and Ed25519
+//! (P-521 waits on std, which does not carry it; Ed448 likewise), encrypted
+//! tokens (JWE), signing, discovery, PKCE, and the nonce. Signing is not here
 //! because a server that issues its own sessions has `Session(T)` sealed into
 //! a cookie (ADR 033) and does not need a token; the rest is the sign-in
 //! flow, which is the caller's.
@@ -78,6 +81,8 @@ const std = @import("std");
 const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
 const es256 = @import("es256.zig");
+const es384 = @import("es384.zig");
+const eddsa = @import("eddsa.zig");
 const token_mod = @import("token.zig");
 const keyring_mod = @import("keyring.zig");
 const verifier_mod = @import("verifier.zig");
@@ -87,8 +92,9 @@ const verifier_mod = @import("verifier.zig");
 pub const Keys = jwks.Keys;
 
 /// One public key out of a key set: its `kid`, and its `material` — `.rsa`
-/// with `e` and `n`, or `.ec` with `crv`, `x` and `y`. Which of the two it
-/// is decides how a token under it is checked.
+/// with `e` and `n`, `.ec` with `crv`, `x` and `y`, or `.okp` with `crv` and
+/// `x`. Which of the three it is, and its curve, decides how a token under it
+/// is checked.
 pub const Key = jwks.Key;
 
 /// What `verify` is told: the keys, the issuer and audience to insist on,
@@ -133,15 +139,23 @@ pub const verify = token_mod.verify;
 /// a best effort.
 pub const key_sizes = rs256.sizes;
 
-/// The curves that have a branch: `P-256`, and only that. An EC key on
-/// another curve is `error.CurveNotSupported` rather than a best effort.
-pub const curves = es256.curves;
+/// The curves that have a branch: `P-256` and `P-384` of `EC`, `Ed25519` of
+/// `OKP`, and only those. A key on another curve is
+/// `error.CurveNotSupported` rather than a best effort.
+pub const curves = blk: {
+    var names: [jwks.supported.len][]const u8 = undefined;
+    for (jwks.supported, 0..) |s, i| names[i] = s.crv;
+    const done = names;
+    break :blk done;
+};
 
 test {
     _ = @import("b64.zig");
     _ = jwks;
     _ = rs256;
     _ = es256;
+    _ = es384;
+    _ = eddsa;
     _ = token_mod;
     _ = keyring_mod;
     _ = verifier_mod;
@@ -184,4 +198,34 @@ test "an ES256 token reads end to end the same way, off the key's type alone" {
         .now_s = 1_300_000_000,
     });
     try std.testing.expectEqualStrings("joe", claims.iss);
+}
+
+test "ES384 and EdDSA tokens read end to end the same way, off the key's type and curve alone" {
+    const vector = @import("vector.zig");
+    const Claims = struct { sub: []const u8 };
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    inline for (.{
+        .{ vector.es384_jwks, vector.es384_token },
+        .{ vector.eddsa_jwks, vector.eddsa_token },
+    }) |pair| {
+        var keys = try parseKeys(std.testing.allocator, pair[0]);
+        defer keys.deinit();
+        const claims = try verify(Claims, arena.allocator(), pair[1], .{
+            .keys = &keys,
+            .issuer = .{ .is = "https://accounts.example" },
+            .audience = .{ .is = "client-1" },
+            .now_s = 1_500_000_000,
+        });
+        try std.testing.expectEqualStrings("u-7", claims.sub);
+    }
+}
+
+test "the curves that have a branch are named" {
+    try std.testing.expectEqual(@as(usize, 3), curves.len);
+    try std.testing.expectEqualStrings("P-256", curves[0]);
+    try std.testing.expectEqualStrings("P-384", curves[1]);
+    try std.testing.expectEqualStrings("Ed25519", curves[2]);
 }
