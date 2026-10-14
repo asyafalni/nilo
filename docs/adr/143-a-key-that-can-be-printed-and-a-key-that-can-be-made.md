@@ -67,6 +67,35 @@ same reason and says so. The two cannot drift in a way that matters: both are
 **`v7` stays**, for the caller who has the millisecond already — a backfill, a
 key made for a row that existed before it did.
 
+## Keys made in a loop come out in order
+
+**`v7Now` keeps a counter in `rand_a`** (RFC 9562 §6.2, method 1), so rows
+inserted in a loop and read back by id come out in the order they went in. An
+outbox, an audit log or an event table that pages by id needs that.
+
+- The twelve bits after the version nibble are the counter. It is seeded from
+  the key's own entropy (eleven bits, top bit clear, so a fresh millisecond
+  has room for at least 2048 keys) when the wall clock reaches a later
+  millisecond, and goes up by one for each key after it.
+- **When the counter passes 4095 inside one millisecond, the timestamp moves
+  ahead by one and the counter is seeded again.** The key's clock then runs a
+  little ahead of the wall for the length of the burst. The same rule covers a
+  wall clock that steps back: the key keeps the last millisecond it used.
+- **The state is a `threadlocal`**, sixteen bytes a thread that mints, no
+  allocation, no lock. Order is therefore per thread: two threads in the same
+  millisecond count apart, and a fiber that changes threads between two calls
+  joins the other thread's count. Nothing between reading the state and
+  writing it waits, so a fiber is never switched out inside it.
+- `v7(entropy, ms)` stays as it was: the format, no state, random order inside
+  a millisecond. It is the call for a caller who chose the millisecond.
+- 62 bits of `rand_b` stay random; a `v7Now` key carries twelve fewer random
+  bits than before.
+
+Against ADR 017: allocations and idle memory are zero. Cost per key is one
+threadlocal read and write and an add, and it is in `bench/release/id.zig`,
+which now mints through `v7Now` as well as `v7`. Binary size is the same as
+before for a program that does not call `v7Now`.
+
 ## What it asks for, and where the refusal lives
 
 `v7Now` checks for `entropy` and not for a whole Scope, because that is the whole
@@ -95,3 +124,22 @@ being a module of its own already buys.
   in hand; nothing in the repository had to change.
 - `id.v7Now(scope)` is the spelling for a key, and `id.v7(entropy, ms)` is the
   spelling for a key at a time somebody chose.
+
+## What was rejected
+
+- **No counter at all**, which this ADR and the `v7` comment first held: a
+  counter is a threadlocal or an atomic, nobody had asked for ordering inside a
+  millisecond, and no state let `v7` be called from any fiber without a lock.
+  What moved it: an outbox, audit log or event table that pages by id gets rows
+  back out of insertion order from a loop of inserts, and the cost of the
+  counter turned out to be sixteen bytes of threadlocal and an add, with no
+  lock because nothing in the critical stretch waits.
+- **A counter inside `v7(entropy, ms)`.** That call takes its millisecond from
+  the caller, so a counter there would be state keyed on an argument: a
+  backfill at a past time would fight the counter of a key made now. `v7Now`
+  owns the clock and so owns the counter.
+- **An atomic shared by all threads**, for order across threads: a contended
+  cache line on every key from every core, to order keys whose real order the
+  caller cannot observe anyway.
+- **Waiting for the next millisecond when the counter runs out**: a sleep in a
+  module that has no loop to sleep on.

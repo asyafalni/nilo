@@ -605,12 +605,6 @@ Nothing is open at this tier.
 
 **Needs:** a decision on making the field's type depend on `nilo_build.tls`, so `.tls = …` without the flag is a compile error naming it, with ADR 212 edited whichever way it goes.
 
-### `nilo_id`
-
-**A v7 made in the same millisecond as another is not ordered after it, so rows inserted in a loop and read back by id come back out of insertion order.** RFC 9562 allows a counter in `rand_a` (§6.2, method 1) and `nilo_id` has none, decided once on the grounds that nobody had asked. An outbox, an audit log or an event table that pages by id is the use case it closes.
-
-**Needs:** the counter in `rand_a`, seeded at random each millisecond and incremented within it, with the threadlocal it takes and its cost per id in `bench/release/`.
-
 ### `nilo_pw`
 
 **Argon2id from std hashes a password 19% slower than the same code with its permutation in four vector lanes, and the patch has not been sent.** As four `@Vector(4, u64)` lanes the hash is 11.19 ms instead of 13.78, and 8.98 out of `pw.huge_pages`, byte-identical; nilo carries no copy of std's crypto to get it ([ADR 044](./adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)), so a login pays the difference until std has it.

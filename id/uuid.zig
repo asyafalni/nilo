@@ -27,7 +27,8 @@
 //! The line `sql/types.zig` holds applies here as well — **a type carries a
 //! value and knows how to write itself; it does not calculate.** There is no
 //! arithmetic on a UUID, no comparison past the bytes, and no notion of "the
-//! next" one.
+//! next" one. The one piece of state in this file is `v7Now`'s counter, and it
+//! lives beside the type, not in it (ADR 143).
 
 const std = @import("std");
 
@@ -88,12 +89,11 @@ pub const Uuid = struct {
     /// of `entropy`.
     ///
     /// Sortable *across* milliseconds and not within one — two made in the
-    /// same millisecond come out in random order relative to each other. RFC
-    /// 9562 allows a counter there and this has none, which is a decision
-    /// rather than an omission (ADR 038): a counter is a threadlocal or an
-    /// atomic, it buys ordering inside a millisecond that nobody asked for,
-    /// and having no state is what lets this be called from any fiber
-    /// without a lock.
+    /// same millisecond with this call come out in random order relative to
+    /// each other, because it keeps no state and so has nothing to order them
+    /// by. It is the format, for a caller who chose the millisecond: a
+    /// backfill, a test. `v7Now` is the one that keeps a counter in `rand_a`
+    /// and orders a loop of keys (ADR 143).
     ///
     /// Only the low 48 bits of `ms` are kept, because that is the whole of
     /// the field. Unix milliseconds run out of them in the year 10889.
@@ -125,12 +125,40 @@ pub const Uuid = struct {
     /// the module out of its layer. `http/bulkhead.zig` reads the monotonic
     /// clock beside `core/clock.zig` for the same reason and says so.
     ///
+    /// **Keys made one after another on one thread sort in the order they were
+    /// made, even inside a millisecond** (RFC 9562 §6.2, method 1). The twelve
+    /// bits after the version, which `v7` fills with entropy, hold a counter
+    /// here: seeded from the key's own entropy when the millisecond changes
+    /// (eleven bits, so the top one is clear and a fresh millisecond has room
+    /// for at least 2048 keys), and one higher for each key after it. The 62
+    /// bits of `rand_b` stay random, so a key is as unguessable as before
+    /// minus the twelve that now count.
+    ///
+    /// **When the counter runs out inside one millisecond, the key borrows the
+    /// next one**: the timestamp moves ahead by a millisecond and the counter
+    /// is seeded again, so the order holds and the clock in the key runs a
+    /// little ahead of the wall for as long as the burst lasts. The same
+    /// happens if the wall clock steps back: the key keeps the last
+    /// millisecond it used rather than go under it.
+    ///
+    /// **The order is per thread, and that is all a threadlocal gives.** Two
+    /// threads minting in the same millisecond each count from their own seed,
+    /// and a fiber that moves to another thread between two calls joins the
+    /// other thread's count. There is no lock and no atomic here because
+    /// nothing between reading the state and writing it waits, so a fiber
+    /// cannot be switched out inside it.
+    ///
     /// `scope` is a `*Ctx` or a `*nilo.Run` — anything with `entropy`. On a
     /// `Run` built by `init` rather than `initIo` this is `error.NoIo`, which
     /// is the same answer `scope.entropy` gives on its own.
     pub fn v7Now(scope: anytype) !Uuid {
         comptime checkMints(@TypeOf(scope));
-        return v7(try scope.entropy(v7_entropy), @intCast(nowMillis()));
+        const entropy = try scope.entropy(v7_entropy);
+        // The seed is taken from the entropy's own `rand_a` bits, which the
+        // counter then overwrites, so it costs no second draw.
+        const seed: u12 = (@as(u12, entropy[0] & 0x07) << 8) | entropy[1];
+        advance(&last, @intCast(nowMillis()), seed);
+        return v7(entropy, last.ms).withCounter(last.n);
     }
 
     /// Which version this claims to be. `4` and `7` are the two written
@@ -300,6 +328,15 @@ pub const Uuid = struct {
 
     pub const nilo_openapi = .{ .type = "string", .format = "uuid" };
 
+    /// `rand_a` as a counter: the twelve bits after the version nibble, big
+    /// endian, over whatever `v7` put there.
+    fn withCounter(self: Uuid, n: u12) Uuid {
+        var out = self;
+        out.bytes[6] = 0x70 | @as(u8, @intCast(n >> 8));
+        out.bytes[7] = @truncate(n);
+        return out;
+    }
+
     /// The six bits every layout sets the same way: four saying which
     /// version this is, two saying it follows RFC 9562 at all. Shared
     /// because a generator that sets one and forgets the other produces
@@ -311,6 +348,38 @@ pub const Uuid = struct {
         return out;
     }
 };
+
+/// The millisecond and counter the last key of this thread used.
+///
+/// **A threadlocal, because the alternatives cost more than they buy**: an
+/// atomic is a contended cache line on every key from every core, and a lock
+/// cannot be taken by a fiber that must not block its thread (ADR 001). Cost:
+/// 16 bytes of thread-local storage per thread that mints, and no
+/// allocation. The `ms` starts at zero, so the first key always takes the
+/// wall clock.
+const Counter = struct { ms: u64 = 0, n: u12 = 0 };
+threadlocal var last: Counter = .{};
+
+/// Move `c` to the next key's millisecond and counter, given the wall clock
+/// and a seed for a counter that has to start.
+///
+/// A later millisecond starts over from `seed`, which is under 2048 so the
+/// counter never begins in the top half. The same millisecond, or an earlier
+/// one because the clock stepped back, counts up from where it was; at 4095 it
+/// carries into the next millisecond and starts from `seed` again (RFC 9562
+/// §6.2 allows either that or waiting, and waiting is a sleep nothing here may
+/// do).
+fn advance(c: *Counter, now_ms: u64, seed: u12) void {
+    if (now_ms > c.ms) {
+        c.* = .{ .ms = now_ms, .n = seed };
+        return;
+    }
+    c.n, const carried = @addWithOverflow(c.n, 1);
+    if (carried == 1) {
+        c.ms += 1;
+        c.n = seed;
+    }
+}
 
 /// Refuse anything `v7Now` cannot get randomness out of, in nilo's own words.
 ///
@@ -552,6 +621,8 @@ const Minting = struct {
 };
 
 test "v7Now takes the randomness from the Scope and the millisecond from the clock" {
+    // A burst in another test can leave the thread's clock ahead of the wall.
+    last = .{};
     var scope: Minting = .{ .seed = 11 };
     const key = try Uuid.v7Now(&scope);
 
@@ -567,9 +638,8 @@ test "v7Now takes the randomness from the Scope and the millisecond from the clo
     try testing.expect(now - carried < 1_000);
 
     // And the entropy is where `v7` puts it: the last ten bytes, version and
-    // variant bits aside.
+    // variant bits aside. The first two are the counter's now.
     const raw = seeded(Uuid.v7_entropy, 11);
-    try testing.expectEqual(raw[0] & 0x0f, key.bytes[6] & 0x0f);
     try testing.expectEqualSlices(u8, raw[3..], key.bytes[9..]);
 }
 
@@ -585,15 +655,67 @@ test "a Scope that cannot mint says so rather than inventing a key" {
     try testing.expectError(error.NoIo, Uuid.v7Now(&broken));
 }
 
-test "two keys minted in a row sort the way they were made, or tie" {
-    var first: Minting = .{ .seed = 1 };
-    var second: Minting = .{ .seed = 2 };
-    const a = try Uuid.v7Now(&first);
-    const b = try Uuid.v7Now(&second);
-    // Same millisecond is the ordinary case here and is a tie rather than a
-    // failure — a v7 is sortable *across* milliseconds and not within one,
-    // which the `v7` comment says at length.
-    try testing.expect(std.mem.order(u8, a.bytes[0..6], b.bytes[0..6]) != .gt);
+test "keys minted in a loop on one thread sort strictly in the order they were made" {
+    // Every key gets the same entropy, so only the counter can be what orders
+    // them. Ten thousand is more than 4096, which crosses a millisecond
+    // carry whatever the wall clock does underneath.
+    var scope: Minting = .{ .seed = 1 };
+    var before = try Uuid.v7Now(&scope);
+    for (0..10_000) |_| {
+        const next = try Uuid.v7Now(&scope);
+        try testing.expectEqual(std.math.Order.lt, std.mem.order(u8, &before.bytes, &next.bytes));
+        try testing.expectEqual(std.math.Order.lt, std.mem.order(u8, &before.toText(), &next.toText()));
+        try testing.expectEqual(@as(u4, 7), next.version());
+        try testing.expectEqual(@as(u8, 0x80), next.bytes[8] & 0xc0);
+        before = next;
+    }
+}
+
+test "the counter starts below the top half and counts up inside a millisecond" {
+    var c: Counter = .{};
+    advance(&c, 1000, 0x7ff);
+    try testing.expectEqual(Counter{ .ms = 1000, .n = 0x7ff }, c);
+    advance(&c, 1000, 0x123);
+    try testing.expectEqual(Counter{ .ms = 1000, .n = 0x800 }, c);
+    // A later millisecond starts over from the new seed.
+    advance(&c, 1001, 0x123);
+    try testing.expectEqual(Counter{ .ms = 1001, .n = 0x123 }, c);
+}
+
+test "a counter that runs out borrows the next millisecond and the order holds" {
+    var c: Counter = .{ .ms = 100, .n = 0xfff };
+    advance(&c, 100, 5);
+    try testing.expectEqual(Counter{ .ms = 101, .n = 5 }, c);
+
+    // A burst far past 4096 at a wall clock that never moves: the order of the
+    // bytes is the order of the calls, and the clock in the key ran ahead.
+    var prev = Uuid.v7(seeded(Uuid.v7_entropy, 3), c.ms).withCounter(c.n);
+    for (0..10_000) |_| {
+        advance(&c, 100, 5);
+        const next = Uuid.v7(seeded(Uuid.v7_entropy, 3), c.ms).withCounter(c.n);
+        try testing.expectEqual(std.math.Order.lt, std.mem.order(u8, &prev.bytes, &next.bytes));
+        try testing.expectEqual(@as(u4, 7), next.version());
+        prev = next;
+    }
+    try testing.expect(c.ms > 101);
+}
+
+test "a clock that steps back does not take the keys back with it" {
+    var c: Counter = .{ .ms = 500, .n = 10 };
+    advance(&c, 400, 3);
+    try testing.expectEqual(Counter{ .ms = 500, .n = 11 }, c);
+}
+
+test "the counter fills the twelve bits after the version and nothing else" {
+    const raw = seeded(Uuid.v7_entropy, 6);
+    const key = Uuid.v7(raw, 42).withCounter(0xabc);
+    try testing.expectEqual(@as(u4, 7), key.version());
+    try testing.expectEqual(@as(u8, 0x7a), key.bytes[6]);
+    try testing.expectEqual(@as(u8, 0xbc), key.bytes[7]);
+    try testing.expectEqual(@as(u8, 0x80), key.bytes[8] & 0xc0);
+    try testing.expectEqual(@as(u64, 42), key.millis().?);
+    try testing.expectEqual(raw[2] & 0x3f, key.bytes[8] & 0x3f);
+    try testing.expectEqualSlices(u8, raw[3..], key.bytes[9..]);
 }
 
 test "a Uuid leaves a JSON body as its text rather than as sixteen numbers" {

@@ -68,11 +68,13 @@ fn document(db: *sql.Db, c: *nilo.Ctx, key: id.Uuid) !Doc {
 
 ## Sort order of v7 keys
 
-**A v7 sorts correctly across milliseconds but not within one.** Its first six bytes are the clock and the other ten are the entropy you passed, with no counter, so two keys made in the same millisecond come back in random order relative to each other. RFC 9562 allows a counter there, and nilo deliberately does not use one: a counter needs a threadlocal or an atomic, and having no state is what lets `v7` be called from any fiber without a lock.
+**Keys from `v7Now` made one after another on one thread sort in the order they were made, inside a millisecond too.** Its first six bytes are the clock and the next twelve bits are a counter (RFC 9562 §6.2, method 1), seeded at random when the millisecond changes and one higher for each key after it. So rows inserted in a loop and read back by id come out in insertion order. If a burst uses up the counter in one millisecond, the key's clock moves ahead by one rather than the order breaking.
 
-**The trap is that the ids look ordered as long as the timestamps differ.** It shows up with a row whose timestamp comes from `now()` inside a transaction. That is Postgres behaviour, not nilo's: `now()` is the *transaction's* clock, so every row one command writes has the same instant, and the ordering then depends only on ten random bytes. `ORDER BY occurred_at, id` looks right in every test where the writes were a millisecond apart, and reshuffles the rows written together.
+**`v7(entropy, ms)` still sorts only across milliseconds.** It takes the millisecond from you and keeps no state, so two keys made with it for the same millisecond come back in random order relative to each other. Use it to backfill a key, and `v7Now` for a key made now.
 
-If the order rows were written in is something your product shows, store it: an ordinal column the command fills, or a sequence. A v7 orders by *when*, and two things that happened at the same instant have no *when* to order them by.
+**The order is per thread.** Two threads minting in the same millisecond each count from their own seed, and two servers do not know about each other at all. It shows up with a row whose timestamp comes from `now()` inside a transaction. That is Postgres behaviour, not nilo's: `now()` is the *transaction's* clock, so every row one command writes has the same instant, and `ORDER BY occurred_at, id` then orders those rows by id alone.
+
+If the order rows were written in matters across threads or servers, store it: an ordinal column the command fills, or a sequence. A v7 orders by *when*, and two things that happened at the same instant on different threads have no *when* to order them by.
 
 ## Where the randomness comes from
 
