@@ -1094,6 +1094,7 @@ test {
     _ = @import("jsonfloat.zig");
     _ = @import("jsonmark.zig");
     _ = @import("scan.zig");
+    _ = @import("utf8.zig");
     _ = @import("accept.zig");
     _ = @import("static.zig");
     _ = @import("follow.zig");

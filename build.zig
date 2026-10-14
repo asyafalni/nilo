@@ -5592,6 +5592,26 @@ pub fn build(b: *std.Build) void {
             .dependOn(&run.step);
     }
 
+    // What validating a string as UTF-8 costs, the standard library's
+    // decoder against `http/utf8.zig` (ADR 096). No Engine, no server.
+    const bench_utf8 = b.addExecutable(.{
+        .name = "nilo-bench-utf8",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/utf8_validate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "utf8",
+                .module = b.createModule(.{ .root_source_file = b.path("http/utf8.zig"), .target = target, .optimize = optimize }),
+            }},
+        }),
+    });
+    {
+        const run = b.addRunArtifact(bench_utf8);
+        b.step("bench-utf8", "Time validating a string as UTF-8, std.unicode's decoder against the block validator")
+            .dependOn(&run.step);
+    }
+
     // Whether a JSON answer in arena segments beats `Allocating` (a
     // measurement; `bench/json_segments.zig` says what). The real writer
     // is the module, so what is timed is `json.write` into each.

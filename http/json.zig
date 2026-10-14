@@ -36,6 +36,7 @@ const field_mod = @import("field.zig");
 const fail = @import("fail.zig");
 const patch_mod = @import("patch.zig");
 const jsonfloat = @import("jsonfloat.zig");
+const utf8 = @import("utf8.zig");
 
 /// Serialise `value` as JSON. Uses the generated writer when the type is one
 /// it covers, and `std.json` when it is not — decided while compiling, so
@@ -184,7 +185,7 @@ const FiniteJson = struct {
                     const slice = if (p.size == .many) std.mem.span(v) else v;
                     // A string, which is what `std.json` makes of text and
                     // what it makes of anything else it cannot call one.
-                    if (p.child == u8 and std.unicode.utf8ValidateSlice(slice)) return self.inner.write(slice);
+                    if (p.child == u8 and utf8.valid(slice)) return self.inner.write(slice);
                     try self.beginArray();
                     for (slice) |x| try self.write(x);
                     return self.endArray();
@@ -1130,11 +1131,12 @@ inline fn plainBlocks(comptime n: usize, text: []const u8) bool {
 /// `std.json` asks `utf8ValidateSlice` first and falls back to `[104,101]`, so
 /// that is what this asks and that is what this writes.
 ///
-/// The cost is the validation, the same function `std.json` calls: a
-/// 32-byte-at-a-time scan that only walks UTF-8 past the first byte over 0x7f,
-/// so ASCII is one vector pass.
+/// The cost is the validation, which gives the answer `std.json`'s
+/// `utf8ValidateSlice` gives. That function clears ASCII 32 bytes at a time and
+/// then goes a byte at a time, 2,404ns for a kilobyte of `é` against 10ns for
+/// ASCII, so `utf8.valid` is used instead: 32 bytes a block whatever they hold.
 fn writeText(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    if (!std.unicode.utf8ValidateSlice(text)) return writeByteArray(w, text);
+    if (!utf8.valid(text)) return writeByteArray(w, text);
     return writeString(w, text);
 }
 
@@ -1176,7 +1178,7 @@ pub fn writeString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void
 /// six a control character takes as `\u00xx`, so a buffer sized for the worst
 /// escape holds the worst replacement.
 pub fn writeLossyString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    if (std.unicode.utf8ValidateSlice(text)) return writeString(w, text);
+    if (utf8.valid(text)) return writeString(w, text);
     try w.writeByte('"');
     var run: usize = 0;
     var i: usize = 0;

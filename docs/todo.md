@@ -545,10 +545,6 @@ Nothing is open at this tier.
 
 **What would settle it:** the `h2load -m 10` rows, the gRPC rows at 32 to 1,024 connections and the tagged-union profile rows run again on a quiet machine, before (`514e8c1`) against after, interleaved, each binary from one path.
 
-**A response whose text is not ASCII is checked a byte at a time, 2,404 ns a kilobyte against 10 ns for ASCII, which a service answering in Japanese, Chinese, Arabic or Russian pays on every answer.** ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md), [`http.md`](../bench/result/http.md)). `std.json` pays the same; a Keiser–Lemire validator is the known fix.
-
-**Needs:** the validator over the 32-lane scan the escape already uses, held by a differential test against `std.unicode.utf8ValidateSlice`, and the kilobyte of `é` measured again.
-
 **`Room.handOut` holds the roster lock for a whole broadcast, so a `join` or a `leave` waits behind it, and nothing measures how long.** `bench/ws_server.zig` runs the chat loop with the Room taken out, and shortening the hold means draining in `takeSeat` as well.
 
 **What would settle it:** a harness with a Room of a thousand sockets broadcasting while others join and leave, the wait for `join` read at p99; then, if it shows, the hold shortened.

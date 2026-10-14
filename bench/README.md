@@ -53,6 +53,7 @@ zig build bench-proto          # protobuf decode and encode, against a decoder w
 zig build bench-json-float     # writing a float as JSON, std.json against serde_json's spelling; pin it with taskset
 zig build bench-json-segments  # a JSON answer in arena segments against Allocating, instructions and allocations a request; pin it with taskset, `-- --keep N` sets the arena's keep
 zig build bench-json-listing   # json.write on the arena's json-h2c answer, ns and instructions a request for the seven sizes and their mix; pin it with taskset, `-- --keep N` sets the arena's keep
+zig build bench-utf8           # validating a string as UTF-8, std.unicode's decoder against http/utf8.zig, ns a call on six inputs; pin it with taskset
 ```
 
 ## Servers for a load generator

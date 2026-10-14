@@ -1643,6 +1643,28 @@ The ASCII rows have no headroom worth chasing: 10ns for 365 bytes is already
 the vector path, and the only way past it is not to ask the question, which is
 what the bug was.
 
+
+### The block validator (`http/utf8.zig`)
+
+**What was run.** `taskset -c 0 zig build bench-utf8 -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` (`bench/utf8_validate.zig`, the program the table above came from written down this time), which times `std.unicode.utf8ValidateSlice` and `http/utf8.zig`'s `valid` interleaved round by round, best of 25 rounds of 200,000 calls, three runs, on the same 2-core Xeon, Zig 0.17.0, tree at `1676b58` plus the change, with nothing else building. ns a call, ranges over the three runs:
+
+| input | bytes | std | block validator |
+|---|---:|---:|---:|
+| the primary metric's payload, all ASCII | 365 | 36.7–38.0 | **17.3–19.1** |
+| a short field value | 9 | 9.3–11.8 | 9.9–11.5 (std's, under 32 bytes) |
+| 1 KB with one `é` halfway through | 1,024 | 284–286 | **64–65** |
+| 1 KB with one `é` near the front | 1,024 | 529–680 | **94–97** |
+| 1 KB of nothing but `é` | 1,024 | 2,181–2,446 | **438–617** |
+| 1 KB of nothing but hiragana | 1,023 | 989–1,411 | **441–514** |
+
+**The first version went the wrong way on the row that matters.** It ran every block through the same loop, carrying the previous block and reading its last three bytes, and the ASCII payload took 49.5 and 90.7 ns against std's 25.2 and 45.6, twice std's, on the row nearly every answer is. A leading loop that does what std's fast path does, one compare a block and nothing carried, and starts the validator at the first block holding a byte over `0x7f`, took it under std. **Read the ASCII row of a text change first.**
+
+**std's ASCII row reads 37 ns here against the 10 above**, on the same box and the same input. Not explained: the earlier figure was Zig 0.16's std and this is 0.17.0's, and nothing was read between the two. What it decided does not depend on it, because the comparison was taken interleaved in one process.
+
+**What it decided.** `json.zig`'s three checks go through `utf8.valid`, and the todo entry closes: the all-`é` kilobyte is 4 to 5 times cheaper, and no row is dearer than std's.
+
+**Can it be pushed further.** On the non-ASCII rows, yes: Zig 0.17 has no vector table lookup with an index known only at run time, so the validator spells Keiser–Lemire's lookups as compares, about twenty vector operations a block, where the paper's three lookups would take a few; roughly a byte a cycle rather than its half. The other text checks in `http/` (`fail.zig`, `serve.zig`, `log.zig`, `websocket.zig`) still ask std, a line each to move.
+
 ## What finding a service costs per request
 
 Run to settle a roadmap entry that had carried "it may well be nothing" for a

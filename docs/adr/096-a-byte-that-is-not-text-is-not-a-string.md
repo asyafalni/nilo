@@ -13,8 +13,10 @@ section, which owns it). This was the last place where that was untrue.
 an array of byte values when the answer is no; nilo asked nothing and wrote the
 bytes.
 
-**nilo now asks the same question, with the same function, and writes the same
-array.**
+**nilo now asks the same question, gets the same answer, and writes the same
+array.** The answer comes from `http/utf8.zig`, a validator that takes 32
+bytes at a time whatever they hold, held to `std.unicode.utf8ValidateSlice` by
+a differential test; the section on cost says why it is not std's.
 
 ```zig
 { .name = "\xff" }   // was {"name":"<ff>"}   now {"name":[255]}
@@ -81,10 +83,21 @@ replaces — but nilo is *eight times faster* than `std.json` on ASCII and would
 be much closer to it on CJK text, which is a different claim from the one this
 file's header makes.
 
-That is now a roadmap entry with a number behind it: a vectorised UTF-8
-validator is the lever, and nobody has needed it yet. Shipping this without one
-is the trade this ADR makes, and it is made in favour of being correct today
-rather than fast on a payload nobody here has.
+That was the lever, and it is pulled: `http/utf8.zig` checks a block of 32
+bytes whatever they hold, after a leading loop that clears ASCII one compare a
+block the way std's fast path does, and std's decoder is kept for a string
+under 32 bytes. On the same box the all-`é` kilobyte went from 2,181–2,446 ns
+to 438–617 and the ASCII payload from 37 to 18 ns
+([`bench/result/http.md`](../../bench/result/http.md#the-block-validator-httputf8zig)).
+A first version without the leading loop took twice std's time on the ASCII
+row, which is why it is there.
+
+**What was rejected: std's validator, kept after the first byte over `0x7f`.**
+It was this ADR's first decision, made in favour of being correct before being
+fast on a payload nobody here had, and it cost a response in Japanese, Chinese,
+Arabic or Russian 19 times the rest of its write. The block validator answers
+the same question for every input the differential test generates, so the
+trade it made is no longer needed.
 
 ## Where the check lives
 
