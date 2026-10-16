@@ -116,7 +116,7 @@ The last argument is a `Call`: per-call overrides, every field null, so `.{}` is
 | `stall_ms` | this call's own limit on silence, instead of the client's |
 | `max_body` | this call's own body limit, instead of the client's |
 
-**You can pass headers you did not choose.** A `headers` list copied from a `curl` command line carries `user-agent`, `host` and `authorization` as strings, and std writes each of those itself. Pass them as they are: nilo tells std to leave its own copy out, and keeping track of which headers std owns is nilo's job, not yours. The one to know about is `accept-encoding`. The line is sent as written, but the client still decodes nothing, so a server that sends `gzip` because you asked for it gives you `error.HttpContentEncodingUnsupported`, not a `Str` full of gzip. Leave it out and the client asks for identity itself.
+**You can pass headers you did not choose.** A `headers` list copied from a `curl` command line carries `user-agent`, `host` and `authorization` as strings, and std writes each of those itself. Pass them as they are: nilo tells std to leave its own copy out, and keeping track of which headers std owns is nilo's job, not yours. The one to know about is `accept-encoding`. The line is sent as written, but whether an answer is *decoded* is the build's choice and not the line's: without `-Dfetch_gzip` a server that sends `gzip` because you asked for it gives you `error.HttpContentEncodingUnsupported`, not a `Str` full of gzip, and with it you get the body ([below](#compressed-responses)). Leave the line out and the client asks for itself.
 
 ## Reading the response
 
@@ -434,13 +434,73 @@ Under a server it uses the Engine's timer, reset on every chunk; on a client wit
 | `error.InvalidProxy` | `Settings.proxy.url` is not an `http://` or `https://` URL with a host; raised by the start, before the program serves |
 | `error.TlsOverSocket` / `error.InvalidSocket` / `error.RedirectLeavesSocket` | a call over a unix socket that is `https://`, whose path is not an absolute socket path, or whose redirect left the origin ([above](#calling-a-service-on-a-unix-socket)) |
 | `error.NotStarted` | a call made before `listen()`: the client is finished at startup like any other service |
+| `error.HttpContentEncodingUnsupported` | the answer is under a coding this build does not read; gzip is read only with `-Dfetch_gzip` ([Compressed responses](#compressed-responses)) |
+| `error.BodyEncodingInvalid` | a `-Dfetch_gzip` build was told `Content-Encoding: gzip` and the bytes are not gzip, or end early, or do not match the footer |
 | the rest | `std.Uri.ParseError`, `std.http.Client`'s connect and receive errors, and the reader and writer errors, unchanged |
 
 `NotStarted` is the one a unit test runs into: a handler called directly, with no App around it, has a client nobody started. The fix is the same one the [testing page](./testing.md#checking-and-starting-services-in-a-test) gives for a database (`app.start(io)`, in a test that never listens), or a fake in the handler's argument list, which is what the signature rules are for.
 
 ## Compressed responses
 
-**Every call asks for an uncompressed body.** `send` puts `Accept-Encoding: identity` on every call, so `res.body` is the body and not a gzip stream. `std.http.Client` on its own advertises gzip and then hands back the compressed bytes; decompressing is a separate call there, and a caller who forgets it gets unreadable bytes and no error. Decompressing here would cost a 32 KiB flate window on the handler's stack, which is held per *connection* ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), so identity is the trade-off chosen. A server that ignores the header and sends gzip anyway causes an error, not a `Str` full of noise.
+**By default every call asks for an uncompressed body**, and a request body is only compressed when the call says so ([below](#sending-a-compressed-body)). `send` puts `Accept-Encoding: identity` on every call, so `res.body` is the body and not a gzip stream. `std.http.Client` on its own advertises gzip and then hands back the compressed bytes; decompressing is a separate call there, and a caller who forgets it gets unreadable bytes and no error. Decompressing here would cost a 32 KiB flate window on the handler's stack, which is held per *connection* ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), and it links flate into every program that dials out, so identity is what you get until you ask. A server that ignores the header and sends gzip anyway gives `error.HttpContentEncodingUnsupported`, not a `Str` full of noise (a Debug build also logs the line below).
+
+**Ask for gzip in your `build.zig`, not in a setting.** Some APIs and CDNs gzip whatever you asked, and a nilo server's `app.compress` gzips a large answer to a client that sends `gzip`:
+
+```zig
+const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .fetch_gzip = true });
+```
+
+(`nilo.app(b, .{ …, .fetch_gzip = true })` passes it for you; `-Dfetch_gzip` is the same flag when you build this repository.) With it, every call sends `Accept-Encoding: gzip, identity` and an answer under `Content-Encoding: gzip` is decoded before you see it, so `res.body` is the JSON and `max_body` counts the decoded bytes: a few kilobytes of gzip that inflate past it are `error.BodyTooLarge`. A body that is not gzip, is cut short, or does not match its checksum is `error.BodyEncodingInvalid`. It is a flag and not a `Settings` field because a field would link flate whether you chose it or not ([ADR 292](../adr/292-a-fetch-build-can-read-a-gzip-answer.md)).
+
+What it costs, so you can say no: 23 KB of binary where you dial out and nothing where you do not; 73 KB of heap for the length of reading one gzip answer, from the client's allocator (not the stack, and not at all for an answer that is not gzip); about 114,000 instructions for 4 KiB of JSON and 2.3 ms for 1 MiB. Only gzip is read: `deflate`, `zstd` and `br` are still `error.HttpContentEncodingUnsupported`. Every way of reading a body decodes (`ex.take`, `ex.pipe`, `ex.stream`, `ex.readInto`), `Redirects.follow` decodes the answer it ends at, and an `Exchange` you begin by hand does not decode unless you pass `.gzip = true`, so an object store still gives you the object as it was stored.
+
+**Test the decode path with `Canned.replyGzip`.** `canned.replyGzip(&buf, "200 OK", "", json)` serves `json` gzipped under `Content-Encoding: gzip` into a buffer you own, and the stream is in `canned.body` for a test that wants it damaged.
+
+## Sending a compressed body
+
+**Name the coding on the call: `.encoding = fetch.gzip`.** An agent posting its inventory every few seconds, or a batch of telemetry to a collector, sends JSON that gzip makes a sixth of its size, and the receiver of an OTLP post or a nilo route reads it.
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn report(api: *fetch.Client, c: *nilo.Ctx, inventory: anytype) !void {
+    const res = try api.postJson(c, "https://collector.example/api/sync", inventory, .{ .encoding = fetch.gzip.with(.{ .level = .fastest }) });
+    if (res.sent_encoding == null) {
+        // Small, or it did not shrink, or this server answered 415 and got the
+        // body plain. A caller that always sees null here can stop asking.
+    }
+}
+```
+
+The compression happens before the call, in the request's memory; the cost is a compressor of about 288 KB, on the heap, made on the first compressed call and kept by the `Client`. It is never started on the handler's stack ([ADR 293](../adr/293-a-request-body-can-be-sent-gzipped.md), [ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). A program that never writes `fetch.gzip` links none of it. A body under 1 KB goes out as it is.
+
+**A server that does not read gzip answers 415, and the call sends the body again without it, once.** nilo's own server names the codings it reads in `Accept-Encoding` on that answer. The client does not remember it between calls, so a caller pointed at an old server pays one extra round trip each time until it stops asking; `res.sent_encoding` is how it knows.
+
+### A body you write as you go
+
+When the lines of a body are not known in advance (a process table every two seconds, log lines as they happen), the length a `Body.stream` needs does not exist. **`Exchange.beginUpload` is the function for that**, separate on purpose: some servers refuse a chunked body outright (S3 answers 411), and the length stays mandatory everywhere else so that a missing one is a compile error rather than somebody else's status.
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn follow(api: *fetch.Client, c: *nilo.Ctx, url: []const u8, lines: []const []const u8) !u16 {
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    var up: fetch.Exchange.Upload = .{};
+    defer up.deinit();
+    try ex.beginUpload(api, c, &up, .{ .method = .POST, .url = url, .timeout_ms = 0 }, fetch.gzip);
+    for (lines) |line| {
+        try up.writer().writeAll(line);
+        try up.writer().writeAll("\n");
+        try up.writer().flush();     // this line, whole, is now on the server
+    }
+    return @backingInt((try up.end()).status);
+}
+```
+
+`flush` is the unit: under gzip it is a sync flush, so the server can decode up to the last flush without waiting for the rest. Write several lines and flush once to send them as one chunk. `timeout_ms = 0` is for an upload meant to stay open, and the answer is read when you call `end`; a server that ends the session early makes the writes fail and `end` returns its status.
 
 ## Streaming a large response (`Exchange`)
 

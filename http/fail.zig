@@ -370,6 +370,7 @@ pub fn statusFor(err: anyerror) u16 {
         // handler read too far is not the client's fault (ADR 019).
         error.BodyTruncated,
         error.BadChunk,
+        error.BadEncodedBody,
         error.InvalidCharacter,
         error.Overflow,
         error.InvalidNumber,

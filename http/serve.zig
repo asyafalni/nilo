@@ -1459,6 +1459,10 @@ fn headerValue(c: *const Ctx, name: []const u8) ?[]const u8 {
 noinline fn endStream(c: *Ctx) bool {
     const open = c._stream.?;
     c._stream = null;
+    // Broken off by `Stream.abort`: the end is never written. HTTP/1.1 closes
+    // the connection with no terminating chunk, and HTTP/2 finds the body
+    // ended by nothing and resets the stream (ADR 019).
+    if (open.aborted) return false;
     // Finished while a middleware held its end (ADR 008): nothing was lost,
     // and the end goes out now with the trailers that middleware added.
     if (!open.finished) std.log.warn(
@@ -1496,6 +1500,10 @@ noinline fn warnFailedAfterAnswering(
     deadlines: bulkhead.Deadlines,
     err: anyerror,
 ) void {
+    // `Stream.abort` is a handler saying on purpose that the body is broken
+    // off (ADR 019); it knows why and can say so itself, so it is not logged
+    // as a failure.
+    if (err == error.StreamAborted) return;
     // A write that ran out of time is the ordinary way a response to a client
     // that stopped reading ends, and "handler failed" sends whoever reads the
     // log looking for a bug in a handler that did nothing wrong (ADR 022).

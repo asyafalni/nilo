@@ -62,7 +62,7 @@ Three things about that loop matter.
 | | |
 |---|---|
 | `app.spawn(f, args)` | registered before the server, started once it is up |
-| `nilo.spawn(f, args)` | started now; `error.NoServer` if nothing is listening |
+| `nilo.spawn(f, args)` | started now; `error.NoServer` if nothing is listening and no test client is alive (a `testing.Client` lends a runner, [Testing](./testing.md#detached-work-from-a-handler)) |
 
 A handler calls `nilo.spawn`, for a request that starts something that outlives it. It needs a running server, and inside a handler there always is one.
 

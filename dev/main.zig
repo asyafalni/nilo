@@ -26,11 +26,17 @@
 //! that case, and that is the point of watching the output rather than the
 //! sources.
 //!
-//! **The first server is the current one, or none.** Before the
-//! watch starts, the same build runs once to the end: the binary on disk is
-//! whatever the last run left, and served first it seeded a database with a
-//! schema the sources no longer had. If that build fails the stale binary is
-//! removed, and the first build that compiles is the first thing started.
+//! **The first server is the current one, or none.** The binary on disk
+//! is whatever the last run left, and served first it seeded a database
+//! with a schema the sources no longer had. So it is removed before the
+//! watch starts, and the watch's first pass writes the first one. There is
+//! no build-once pass before it with `-fincremental`: the compiler's state
+//! is in memory, so a second process compiles and rewrites the binary even
+//! when nothing changed, and the pass only booted the server twice (ADR 190).
+//!
+//! **A binary written again with the same bytes restarts nothing.** It is
+//! hashed once its stamp has been seen twice, and compared with what was
+//! started.
 //!
 //! **The build is incremental unless asked otherwise.** The compiler stays
 //! resident and patches what it already made, so a save is served in under
@@ -224,15 +230,33 @@ pub fn main(init: std.process.Init) !void {
     // build compiled, found the file on disk already right, and did not
     // write it, so its stamp never moved. Removed, the first build that
     // compiles writes it, whatever it compiles to.
-    say("building with `{s}` before starting anything", .{joined(arena, build_argv.items)});
-    const current = try buildOnce(gpa, io, build_argv.items);
-    if (stopping.load(.acquire)) return;
-    if (!current) {
+    //
+    // **An incremental build has no cache hit to wait for.** The compiler
+    // keeps its state in memory, so a new process compiles and writes the
+    // binary again even when nothing changed (`zig build install
+    // -fincremental` twice rewrites it twice, 650 ms each for
+    // `examples/hello`, 14 s for a program with a C library), and the
+    // watch's first pass after a build-once pass was a second full compile
+    // that restarted the server. So with `-fincremental` there is no
+    // build-once: the binary is removed and the watch's first pass writes
+    // the first one, which is the current one by construction. Without it
+    // the cache does hit, and the build-once pass stays.
+    if (opts.incremental) {
         std.Io.Dir.cwd().deleteFile(io, opts.exe) catch |err| switch (err) {
             error.FileNotFound => {},
             else => say("could not remove the stale {s}: {s}", .{ opts.exe, @errorName(err) }),
         };
-        say("the build failed; nothing is started until one compiles", .{});
+    } else {
+        say("building with `{s}` before starting anything", .{joined(arena, build_argv.items)});
+        const current = try buildOnce(gpa, io, build_argv.items);
+        if (stopping.load(.acquire)) return;
+        if (!current) {
+            std.Io.Dir.cwd().deleteFile(io, opts.exe) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => say("could not remove the stale {s}: {s}", .{ opts.exe, @errorName(err) }),
+            };
+            say("the build failed; nothing is started until one compiles", .{});
+        }
     }
 
     try build_argv.insert(gpa, 3, "--watch");
@@ -250,6 +274,7 @@ pub fn main(init: std.process.Init) !void {
     defer trail.deinit(gpa);
     var server: ?*Running = null;
     var serving: ?Stamp = null;
+    var served_digest: ?u64 = null;
     var started_once = false;
     // A change is acted on once it has been seen twice, so a binary still
     // being written is not started half way through.
@@ -278,6 +303,17 @@ pub fn main(init: std.process.Init) !void {
             const fresh = if (serving) |s| !s.eql(seen) else true;
             if (fresh) {
                 if (pending != null and pending.?.eql(seen)) {
+                    const digest = contentHash(io, opts.exe);
+                    // The same bytes again: a save the compiler patched into
+                    // the binary it already had, or a pass that rewrote it
+                    // whole. The server running is already this program.
+                    if (server != null and digest != null and served_digest == digest) {
+                        say("{s} was written again with the same bytes; the server was not restarted", .{opts.exe});
+                        serving = seen;
+                        pending = null;
+                        sleep(io, poll_ms);
+                        continue;
+                    }
                     var drained: u64 = 0;
                     if (server) |r| {
                         drained = r.stop(io, drain_ms);
@@ -302,6 +338,7 @@ pub fn main(init: std.process.Init) !void {
                     // first restart knows what it replaced.
                     if (opts.prune and !opts.incremental) trail.advance(io, gpa, opts.exe);
                     serving = seen;
+                    served_digest = digest;
                     pending = null;
                 } else {
                     pending = seen;
@@ -522,6 +559,28 @@ fn buildRoot(io: std.Io, buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     }
 }
 
+/// A 64-bit hash of the file's bytes, null when it cannot be read. Run once
+/// for a binary that has been seen to change and only then, so a save pays
+/// one sequential read of the binary: about 50 ms for the 57 MB of
+/// `examples/hello` in Debug, and an estimated 0.3 s from the page cache for
+/// a 500 MB one, against the compile that preceded it. Wyhash, not a
+/// cryptographic hash: the two binaries are both this person's own build
+/// and nothing here is an adversary, so a 2^-64 collision would cost one
+/// missed restart.
+fn contentHash(io: std.Io, path: []const u8) ?u64 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var h: std.hash.Wyhash = .init(0);
+    var buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = file.readPositionalAll(io, &buf, offset) catch return null;
+        h.update(buf[0..n]);
+        if (n < buf.len) return h.final();
+        offset += n;
+    }
+}
+
 fn stamp(io: std.Io, path: []const u8) ?Stamp {
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
     return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
@@ -577,6 +636,33 @@ test "the exe is the one bare argument, and everything after -- is the server's"
     try testing.expectEqual(@as(usize, 2), opts.server_args.len);
     try testing.expectEqualStrings("--port", opts.server_args[0]);
     try testing.expectEqualStrings("9000", opts.server_args[1]);
+}
+
+test "the argv the dev step builds, with a second -- for the server, parses to the binary and the server's arguments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // `zig build dev -- -Dtarget=x86_64-linux-gnu -- outpost.toml` through
+    // `devRun` in build.zig: --zig <zig>, the binary, then the passthrough.
+    const opts = parse(arena.allocator(), argsOf(&.{
+        "nilo-dev", "--zig", "/opt/zig/zig", "/proj/zig-out/bin/app", "-Dtarget=x86_64-linux-gnu", "--", "outpost.toml",
+    })).?;
+    try testing.expectEqualStrings("/proj/zig-out/bin/app", opts.exe);
+    try testing.expectEqual(@as(usize, 1), opts.build_options.len);
+    try testing.expectEqualStrings("-Dtarget=x86_64-linux-gnu", opts.build_options[0]);
+    try testing.expectEqual(@as(usize, 1), opts.server_args.len);
+    try testing.expectEqualStrings("outpost.toml", opts.server_args[0]);
+}
+
+test "the binary after the server's arguments is not found, which is why the dev step passes it first" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The order the dev step had before: the passthrough, then the binary.
+    // Everything past the `--` is the server's, so no binary was named. The
+    // parser does not guess "the last argument", which a server's own
+    // arguments would make wrong the other way.
+    try testing.expect(parse(arena.allocator(), argsOf(&.{
+        "nilo-dev", "--zig", "/opt/zig/zig", "-Dtarget=x86_64-linux-gnu", "--", "outpost.toml", "/proj/zig-out/bin/app",
+    })) == null);
 }
 
 test "the flags name the zig, the step, the incremental mode, and -D options go to the build" {
@@ -720,4 +806,30 @@ test "a stamp moves when either the size or the mtime does" {
     try testing.expect(a.eql(.{ .size = 10, .mtime_ns = 100 }));
     try testing.expect(!a.eql(.{ .size = 11, .mtime_ns = 100 }));
     try testing.expect(!a.eql(.{ .size = 10, .mtime_ns = 101 }));
+}
+
+test "the content hash is equal for equal bytes whatever the mtime, and moves with one byte" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const d = tmp.dir;
+    // Longer than the read buffer, so the loop reads more than once.
+    const big = try testing.allocator.alloc(u8, 600 * 1024);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*c, i| c.* = @truncate(i *% 31);
+    try d.writeFile(io, .{ .sub_path = "a", .data = big });
+    try d.writeFile(io, .{ .sub_path = "b", .data = big });
+    big[big.len - 1] ^= 1;
+    try d.writeFile(io, .{ .sub_path = "c", .data = big });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPathFile(io, ".", &buf)];
+    var pa: [std.fs.max_path_bytes]u8 = undefined;
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    var pc: [std.fs.max_path_bytes]u8 = undefined;
+    const a = contentHash(io, try std.fmt.bufPrint(&pa, "{s}/a", .{base})).?;
+    const b = contentHash(io, try std.fmt.bufPrint(&pb, "{s}/b", .{base})).?;
+    const c = contentHash(io, try std.fmt.bufPrint(&pc, "{s}/c", .{base})).?;
+    try testing.expectEqual(a, b);
+    try testing.expect(a != c);
+    try testing.expect(contentHash(io, "/nonexistent/nilo-dev-test") == null);
 }

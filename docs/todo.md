@@ -199,6 +199,10 @@ Nothing is open at this tier.
 
 **Needs:** the follower's reload counted in the test, so a failure says which of the two it was, then the cause found; until then CI's `test-all` can go red on any change.
 
+**A second follower test fails now and then: "a reader never sees a file half replaced, however often it is replaced" (`http/follow.zig`) counted 5,833,116 where it expects 0.** It failed once in `test-all` on the 9700X on 16 October 2026, with other builds loading the machine and nothing under `http/follow.zig` or `http/static.zig` changed, and passed in the runs before and after it. The count is the readers' spin, either reads that met a torn file or looks that found no `/page.txt`, and the failure prints no line to tell which: a torn read would be the guarantee ADR 277 makes broken, a missing one a generation built while the file was half written and dropped.
+
+**Needs:** the two counters asserted with messages that name them, the test run in a loop under load in both modes until it fails again, and the cause found from which one it was.
+
 **One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.** Whether a field may be absent is now one comptime rule (`http/field.zig`), and a number described in a query and not in JSON is still open. Path prefixes are matched three ways (`middleware.underPrefix`, `static.underPrefix`, the router) and disagree on `//` and on a param, which is how `useOn` came to skip a `*` route until the chain was resolved per request for one. A JSON string is written by `json.zig` and again by `writeFailureBody`, and only one checks UTF-8. `If-None-Match`, `If-Range` and `Range` are answered in `serve.zig`, `sendfile.zig` and through `Versioned`. `fieldList` exists twice with different output. Each is a fix that closes its defects for good, where a patch to each copy closes them until the next copy.
 
 **Needs:** the shape of each shared piece decided — one prefix matcher the router's split defines, one JSON string writer, one conditional-request ladder — and the order, which the defects suggest: the prefix matcher next.
@@ -272,6 +276,10 @@ Nothing is open at this tier.
 **22% of `std.flate`'s CPU on a 4 KB body is a buffer rebuilt after every block, and it has not been filed upstream.** `toks.* = .empty` in `writeBlock` rebuilds the 96 KB token buffer from its constant after every block, where assigning the fields one by one gives byte-identical output 18% to 44% faster ([`http.md`](../bench/result/http.md#which-deflate-is-fastest-and-whether-brotli-or-zstd-would-beat-it)). ADR 211 refuses a fork of `Compress.zig`.
 
 **Needs:** the issue filed against zig, `lib/std/compress/flate/Compress.zig` lines 987 and 1055. Last checked at 0.17.0, where both lines are unchanged.
+
+**std's gzip decoder reads the trailer's CRC-32 and length and compares neither, and it has not been filed upstream.** `std.compress.flate.Decompress` stores them in `container_metadata` and returns, so a flipped byte inside a literal decodes to a wrong body of the right length. nilo now compares them itself in `http/encoded.zig`, `http/body.zig` (`Gzip`) and `fetch/gzip.zig`, three places that each had to find out; any other caller of std's gzip, in nilo or in a user's code, is silently unchecked.
+
+**Needs:** the issue filed against zig, `lib/std/compress/flate/Decompress.zig` `.protocol_footer`, with the one-byte reproduction from `http/encoded.zig`'s test; once fixed upstream, the three checks go. Last checked at 0.17.0.
 
 **HttpArena's `json-comp` costs nilo about 220 µs of server CPU a request on the board's 64 cores against dusty's 164, while on eight cpus here nilo spends 32.6 µs to dusty's 50.7.** Both send about 1.3 KB a response, and the entry gzips with libdeflate. Nothing measured here grows that fast: the compressor pool's lowest-slot borrow moved one compressor between cores, and giving each executor its own slot ([ADR 211](./adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) saved 0.6 µs of 32 ([`http.md`](../bench/result/http.md)). This machine's eight cores share one L3; the board's Threadripper splits sixty-four into sixteen with an L3 each, where a compressor's 229 KB working set or the `stop.in_flight` and `stop.requested` words every request touches (`http/serve.zig`, `http/ctx.zig`) cost a trip between them, and that is the remaining suspect, not a finding.
 
@@ -390,6 +398,18 @@ Nothing is open at this tier.
 **Needs:** the streamed call on `Target`, so its standing headers, its gate and the route's deadline reach it, with the Refusal beside it (a file in `fetch/refusals/` and a row in its table), written together.
 
 **Direction:** [A call to another service survives that service's bad minute](./roadmap.md#a-call-to-another-service-survives-that-services-bad-minute)
+
+**`nilo_fetch` compresses and decompresses on `std.flate` only, about four times slower than libdeflate, and holds a 73 KB decoder per gzip answer read.** A request body is gzipped on `std.flate` (5.8 to 6.2 ms for 1 MB at `.fastest` and `.default`, where libdeflate is a quarter to a third of that, ADR 248), and a gzip answer is read through a 73,136-byte heap decoder for its length, so 500 answers decoding at once hold 36.6 MB ([`fetch.md`](../bench/result/fetch.md)). `-Dlibdeflate` reaches only `nilo_http`, because a Fitting cannot import it ([ADR 292](./adr/292-a-fetch-build-can-read-a-gzip-answer.md), [ADR 293](./adr/293-a-request-body-can-be-sent-gzipped.md)). It is the cost an agent pays on a host that runs other people's workloads, which is the case that asked for compression.
+
+**What would settle it:** the CPU of an agent posting 100 KB to 1 MB bodies measured on `std.flate` and on libdeflate through a `nilo_fetch` that can reach it (a flag on the module, the `.libdeflate` one wired to `nilo_fetch` too), and the heap of many concurrent decoders under load against a whole-body inflate into `take`'s buffer, which needs no window.
+
+**`Exchange.beginUpload` follows no redirect and is not reachable through a `Target`**, the gap the entry above names for `Exchange.begin`, now for the chunked body the caller writes ([ADR 293](./adr/293-a-request-body-can-be-sent-gzipped.md)). A body already written cannot be sent again, so `.follow` would need the caller to write it twice.
+
+**Needs:** the upload on `Target` designed with the streamed call above, and a decision that a 307 or 308 to an upload is `error.RedirectRefused` with the reason, held by a live test.
+
+**`fetch.testing.Canned` keeps the first kilobyte of a request body, so `requestBodyDecoded` refuses a larger compressed one with `error.BodyTruncated`.** A test of a gzipped body past a kilobyte, which is most of the bodies worth compressing, cannot read what it sent through `Canned` ([ADR 293](./adr/293-a-request-body-can-be-sent-gzipped.md)).
+
+**Needs:** `Canned` holding the body up to a size the test names, with `serveWithBody`'s hash test brought to it, and a test reading a 64 KB gzipped body back.
 
 **`nilo_fetch` lays out a unix socket's `Connection` by hand, because `std.http.Client.connectUnix` does not compile at 0.17.0.** It names `std.posix.SocketError`, which is gone, and a pool API that has moved, and the `Plain.create` that a connection is built through is private; lazy analysis hides all of it until something calls it. So `Exchange.dialUnix` dials `std.Io.net.UnixAddress` and builds the `Connection` the way `Plain` does, behind a `@compileError` that fires on any Zig but 0.17 ([ADR 272](./adr/272-a-call-names-the-socket-it-goes-over.md)). A std that changes the layout without changing the version would free the wrong bytes; the tests free under the testing allocator, which is what would notice.
 
@@ -588,6 +608,10 @@ Nothing is open at this tier.
 **`.tls` compiles in a build without `-Dtls`, and is refused when `listen()` runs.** `Options.tls` is `?Tls` in every build (`http/bulkhead.zig:297`, `:433`), and [ADR 212](./adr/212-tls-is-an-option-a-build-asks-for.md) chose a one-line refusal at `listen()`, before the port is taken. That keeps the port from serving plain HTTP, and still turns a mistake the build could name into one a deploy finds, which principle 2 asks the other way round.
 
 **Needs:** a decision on making the field's type depend on `nilo_build.tls`, so `.tls = …` without the flag is a compile error naming it, with ADR 212 edited whichever way it goes.
+
+**`zig build -fincremental` recompiles and rewrites its output in every new process, and it has not been filed upstream.** Two plain runs of `zig build example-hello -fincremental` with nothing changed compile twice (about 650 ms each on `examples/hello`, the binary's mtime moving and its bytes the same), where without `-fincremental` the second is `cached` in 3 ms. `nilo-dev` now starts its watch without a build-once pass and skips a restart for a binary with the same bytes ([ADR 190](./adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)), but a dependent running its own `zig build -fincremental` twice still pays a full compile each time.
+
+**Needs:** the issue filed against zig with that two-run reproduction (ADR 190 has the measurement); once fixed, `nilo-dev`'s same-bytes check stays and its incremental start can go back to building once.
 
 ### `nilo_pw`
 

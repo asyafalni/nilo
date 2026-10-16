@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
 
 That reads `-Dtarget` and `-Doptimize`, fetches nilo with the same mode (see below), builds the executable with `nilo_http` imported, installs it, and adds the steps `run`, `dev` and `test`. `zig init` writes a library-and-executable scaffold around `src/root.zig`, which is not what a server wants; replace its `build.zig` with the five lines above and delete `src/root.zig`.
 
-Options go in the struct: `.sql = true` imports `nilo_sql` and fetches its drivers, `.tls`, `.http2` and `.libdeflate` pass the matching [build flags](../reference/app.md#niloapp) to the dependency, and `.target` and `.optimize` replace the ones read from the command line. It returns the executable, the test artifact and the dependency, so a project can add to any of them:
+Options go in the struct: `.sql = true` imports `nilo_sql` and fetches its drivers, `.tls`, `.http2`, `.libdeflate` and `.fetch_gzip` pass the matching [build flags](../reference/app.md#niloapp) to the dependency, and `.target` and `.optimize` replace the ones read from the command line. It returns the executable, the test artifact and the dependency, so a project can add to any of them:
 
 ```zig
 const built = nilo.app(b, .{ .name = "my-app", .root = b.path("src/main.zig"), .sql = true });
@@ -164,19 +164,21 @@ wati
 const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
 dev.addArg("--zig");
 dev.addFileArg(.zig_exe);
-dev.addPassthruArgs(); // what follows `--` on the command line
 // Where `install` puts the binary: a directory argument, because a file one
 // would be an input, and this one is written by the build nilo-dev starts.
 dev.addDirectoryArg2(
     .{ .relative = .{ .base = .install_bin, .sub_path = exe.out_filename } },
     .{ .make_absolute = true },
 );
+// Last, because nilo-dev reads the binary before any `--`: what follows `--`
+// on the command line is `-D` options for the build and, after a second
+// `--`, the server's own arguments.
+dev.addPassthruArgs();
 b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
 ```
 
 ```
 $ zig build dev
-nilo-dev: building with `zig build install -fincremental` before starting anything
 nilo-dev: watching with `zig build install --watch -fincremental`; serving zig-out/bin/my-app when it is written
 nilo-dev: started zig-out/bin/my-app (pid 41022)
 info: nilo listening on 127.0.0.1:8787 across 8 thread(s)

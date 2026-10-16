@@ -322,6 +322,7 @@ A build that serves plain HTTP fetches one dependency, [zio](https://github.com/
 | `.tls = true` | TLS 1.3 on a listener, for a server with nothing in front of it ([guide](./docs/guide/deploying.md#tls-without-a-proxy)). With `.tls_own = true` beside it, nilo uses a tls.zig you bring instead of fetching its own |
 | `.http2 = true` | HTTP/2 beside HTTP/1.1 on every listener, every route on either, and gRPC on top. With `.tls` too, a browser is offered it by ALPN ([guide](./docs/guide/deploying.md#http2-for-a-browser)) |
 | `.libdeflate = true` | libdeflate's compressor in place of the standard library's, for gzip ([guide](./docs/guide/responses.md#compression)) |
+| `.fetch_gzip = true` | `nilo_fetch` reads a gzip answer, counting `max_body` on the decoded bytes ([guide](./docs/guide/fetch.md#compressed-responses)) |
 
 ## 🚫 What it won't do
 

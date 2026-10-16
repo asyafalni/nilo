@@ -18,7 +18,12 @@
 //! past it is a 413 before a byte is read; a chunked body is counted as it
 //! arrives and stopped where it crosses. What it does **not** touch is
 //! `c.bodyStream()`, which holds nothing in the arena and carries a
-//! `max_bytes` of its own for the same reason.
+//! `max_bytes` of its own for the same reason. **That holds on both framings**:
+//! over HTTP/2 the connection collects a body only for a route that asks for
+//! it whole, and a body read in pieces is held by the stream's flow-control
+//! window and by its own `max_bytes` (ADR 260). The two tests that say so are
+//! `a body read through bodyStream is held to its own max_bytes, not to
+//! maxBody or max_body` here and in `h2conn.zig`.
 //!
 //! Lowering is as ordinary as raising. A sign-in route under a `listen()`
 //! that allows a megabyte for the import beside it can say it takes a
@@ -198,6 +203,34 @@ test "a chunked body is counted against the route's limit as it arrives" {
     const over = try client.send(&app, "POST /wide HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "9\r\nnine byte\r\n9\r\nnine byte\r\n0\r\n\r\n");
     try testing.expectEqual(@as(u16, 413), over.status);
+}
+
+fn weighStream(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStreamWith(.{ .max_bytes = 1 << 30 });
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    while (try incoming.read(&buf)) |part| total += part.len;
+    var out: [16]u8 = undefined;
+    try c.send(200, "text/plain", try std.fmt.bufPrint(&out, "{d}", .{total}));
+}
+
+test "a body read through bodyStream is held to its own max_bytes, not to maxBody or max_body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 8;
+    try app.with(with(16)).post("/limited", weighStream);
+    try app.post("/plain", weighStream);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    const big = "a body far longer than sixteen bytes, which is over every limit here";
+    for ([_][]const u8{ "/limited", "/plain" }) |path| {
+        const got = try client.post(&app, path, big);
+        try testing.expectEqual(@as(u16, 200), got.status);
+        var want: [8]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}", .{big.len}), got.body);
+    }
 }
 
 var test_limit: usize = 0;

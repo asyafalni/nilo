@@ -80,8 +80,11 @@
 //! reset, CVE-2023-44487) gains a client nothing; one that keeps opening past
 //! the cap is sent away. A header block is bounded however many CONTINUATION
 //! frames it arrives in, and so is the header list it decodes to. A message
-//! is bounded by its route's limit (`max_body`, or the route's own
-//! `maxBody`, ADR 156), compressed or not, and the messages a
+//! that a call reads whole (`c.body()`, a gRPC message) is bounded by its
+//! route's limit (`max_body`, or the route's own `maxBody`, ADR 156),
+//! compressed or not; a body a call reads in pieces with `c.bodyStream()` is
+//! not collected at all, and is held by the stream's window and its own
+//! `max_bytes` as on HTTP/1.1 (ADR 260). The messages a
 //! connection holds, arriving or held by a call until its answer is
 //! written, by one ceiling between them (`max_body`, or the largest limit a route
 //! raised to), past which a call waits on a
@@ -6296,6 +6299,162 @@ test "a body arriving in many DATA frames after the handler started is read thro
     // window is what is waited for.
     try testing.expect(steps.len >= 1 and steps.len <= 2);
     for (steps) |n| try testing.expect(n >= h2.default_window / 2);
+}
+
+/// Reads its body through `bodyStream` under a ceiling of its own far above
+/// any `maxBody` the tests give the App.
+fn wideUploadRoute(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStreamWith(.{ .max_bytes = 1 << 30 });
+    var buf: [1000]u8 = undefined;
+    var total: usize = 0;
+    while (try incoming.read(&buf)) |part| total += part.len;
+    var text: [20]u8 = undefined;
+    try c.sendText(200, std.fmt.bufPrint(&text, "{d}", .{total}) catch unreachable);
+}
+
+test "a body read through bodyStream is held to its own max_bytes on HTTP/2, not to the maxBody of its route or max_body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.limits.max_body = 8_192;
+    // A route chain with a `maxBody` far under the upload, and a neighbour
+    // under `max_body` alone: neither bounds what `bodyStream` reads, as on
+    // HTTP/1.1 (`maxbody.zig`, ADR 156, ADR 260).
+    try app.with(maxbody.with(16_384)).post("/limited", wideUploadRoute);
+    try app.post("/plain", wideUploadRoute);
+    try app.post("/collected", waitRoute);
+    try app.resolveChains();
+    for ([_][]const u8{ "/limited", "/plain" }) |path| {
+        var ex = try h2test.roundTrip(&app, .{ .method = "POST", .path = path, .body = &@as([60_000]u8, @splat('u')), .frame = 4_000 });
+        defer ex.deinit();
+        try testing.expectEqual(@as(u16, 200), ex.status);
+        try testing.expectEqualStrings("60000", ex.body);
+    }
+    // The control: the same bytes asked for whole are over the same limit.
+    resetUploads();
+    var whole = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/collected", .body = &@as([60_000]u8, @splat('u')), .frame = 4_000 });
+    defer whole.deinit();
+    try testing.expect(whole.status != 200);
+}
+
+/// Reads its body through `bodyStream` into a hash, and answers it with the
+/// count of decoded bytes: compared against the plain bytes' own.
+fn hashUploadRoute(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStreamWith(.{ .max_bytes = 128 * 1024 });
+    var buf: [1000]u8 = undefined;
+    var hasher: std.hash.Wyhash = .init(0);
+    var total: u64 = 0;
+    while (try incoming.read(&buf)) |part| {
+        hasher.update(part);
+        total += part.len;
+    }
+    var text: [40]u8 = undefined;
+    try c.sendText(200, std.fmt.bufPrint(&text, "{x}:{d}", .{ hasher.final(), total }) catch unreachable);
+}
+
+fn gzippedText(out: *std.Io.Writer.Allocating, text: []const u8) !void {
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress: std.compress.flate.Compress = try .init(&out.writer, &window, .gzip, .default);
+    try compress.writer.writeAll(text);
+    try compress.finish();
+}
+
+test "a gzip body read through bodyStream on HTTP/2 is decoded as it is read, a bomb is refused and another coding is a 415" {
+    resetUploads();
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/hash", hashUploadRoute);
+    try app.with(@import("bodyencodings.zig").with(.{"gzip"})).post("/raw", hashUploadRoute);
+    try app.resolveChains();
+    const gzip_field = [_]hpack.Field{.{ .name = "content-encoding", .value = "gzip" }};
+
+    // Past the 32 KiB window several times, with matches reaching across it.
+    const text = try testing.allocator.alloc(u8, 120_000);
+    defer testing.allocator.free(text);
+    var prng: std.Random.DefaultPrng = .init(11);
+    for (text, 0..) |*byte, i| byte.* = if (i % 5000 < 4000) "0123456789abcdef"[i % 16] else prng.random().int(u8);
+    var want_buf: [40]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{x}:{d}", .{ std.hash.Wyhash.hash(0, text), text.len });
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzippedText(&zipped, text);
+    try testing.expect(zipped.written().len < 60_000);
+
+    var ok = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/hash", .fields = &gzip_field, .body = zipped.written(), .frame = 4_000 });
+    defer ok.deinit();
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    try testing.expectEqualStrings(want, ok.body);
+
+    // A route that named gzip gets the bytes as they came.
+    var raw = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/raw", .fields = &gzip_field, .body = zipped.written(), .frame = 4_000 });
+    defer raw.deinit();
+    try testing.expectEqual(@as(u16, 200), raw.status);
+    var raw_want: [40]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&raw_want, "{x}:{d}", .{ std.hash.Wyhash.hash(0, zipped.written()), zipped.written().len }), raw.body);
+
+    // Four MiB of zeros are a few kilobytes of gzip and thirty-two times the
+    // route's `max_bytes`.
+    const zeros = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(zeros);
+    @memset(zeros, 0);
+    var bomb_zip: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer bomb_zip.deinit();
+    try gzippedText(&bomb_zip, zeros);
+    try testing.expect(bomb_zip.written().len < 60_000);
+    var bomb = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/hash", .fields = &gzip_field, .body = bomb_zip.written(), .frame = 4_000 });
+    defer bomb.deinit();
+    try testing.expectEqual(@as(u16, 413), bomb.status);
+
+    var bad = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/hash", .fields = &gzip_field, .body = text[0..2_000], .frame = 4_000 });
+    defer bad.deinit();
+    try testing.expectEqual(@as(u16, 400), bad.status);
+
+    var other = try h2test.roundTrip(&app, .{
+        .method = "POST",
+        .path = "/hash",
+        .fields = &.{.{ .name = "content-encoding", .value = "br" }},
+        .body = "abc",
+    });
+    defer other.deinit();
+    try testing.expectEqual(@as(u16, 415), other.status);
+}
+
+fn abortRoute(c: *Ctx) anyerror!void {
+    var out = try c.stream(200, "text/plain");
+    try out.writeAll("partial");
+    try out.flush();
+    return out.abort();
+}
+
+fn abortIgnoredRoute(c: *Ctx) anyerror!void {
+    var out = try c.stream(200, "text/plain");
+    try out.writeAll("partial");
+    try out.flush();
+    out.abort() catch {};
+}
+
+test "a stream that is aborted resets its stream with INTERNAL_ERROR and never ends the body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/abort", abortRoute);
+    try app.get("/ignored", abortIgnoredRoute);
+    try app.get("/ping", pingRoute);
+    try app.resolveChains();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try h2test.requestOn(&client, 1, .{ .path = "/abort" });
+    try h2test.requestOn(&client, 3, .{ .path = "/ignored" });
+    try h2test.requestOn(&client, 5, .{ .path = "/ping" });
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    for ([_]u31{ 1, 3 }) |id| {
+        try testing.expectEqual(h2.ErrorCode.internal_error, got.rst(id).?);
+        // Nothing carried END_STREAM: the client was not told the body was whole.
+        for (got.frames.items) |f| if (f.head.stream == id and f.head.type != .rst_stream)
+            try testing.expect(!f.head.has(h2.Flags.end_stream));
+    }
+    // And the connection and its other streams go on.
+    try testing.expectEqualStrings("pong", try dataOn(&got, 5));
+    try testing.expect(got.goaway() == null);
 }
 
 test "a body that arrived whole before the handler read it is not asked for with a 100 Continue" {

@@ -111,6 +111,12 @@ pub const Jitter = @import("backoff.zig").Jitter;
 /// `nilo_http`'s `Socket` and `nilo_fetch`'s `WebSocket` are the two callers.
 pub const ws_frame = @import("ws_frame.zig");
 
+/// A gzip compressor started in place, never on a stack
+/// ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+/// `nilo_http`'s response compression and `nilo_fetch`'s request body are
+/// the two callers.
+pub const deflate = @import("deflate.zig");
+
 /// A directory for one test, with the path to it that `std.testing.tmpDir`
 /// does not give ([ADR 250](../docs/adr/250-a-test-directory-hands-back-its-path.md)).
 /// `nilo.testing.tmpDir` is this one.
@@ -128,4 +134,5 @@ test {
     _ = @import("trace.zig");
     _ = @import("tmp.zig");
     _ = @import("ws_frame.zig");
+    _ = @import("deflate.zig");
 }

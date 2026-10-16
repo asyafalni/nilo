@@ -227,6 +227,12 @@ pub const App = struct {
     /// getting it wrong means running no auth.
     docs_chains: []const []const mw.Middleware = &.{},
     static_chains: std.ArrayList([]const []const mw.Middleware) = .empty,
+    /// What the chains above were resolved against (`wiring.shapeOf`), 0
+    /// while they are not. Lets a caller that resolves per request, the test
+    /// client, skip the work when nothing was registered since.
+    chains_shape: std.atomic.Value(u64) = .init(0),
+    /// Held by whoever is resolving through `resolveChainsIfChanged`.
+    resolving: std.atomic.Value(bool) = .init(false),
     /// Set when the server should stop. Read by the Engine's accept loop
     /// and by every connection between requests.
     stop: bulkhead.Stop = .{},
@@ -1394,6 +1400,7 @@ pub const App = struct {
     pub const checkMiddlewarePaths = wiring.checkMiddlewarePaths;
     pub const middlewarePathGap = wiring.middlewarePathGap;
     pub const resolveChains = wiring.resolveChains;
+    pub const resolveChainsIfChanged = wiring.resolveChainsIfChanged;
     pub const missingService = wiring.missingService;
     pub const writeOpenApi = wiring.writeOpenApi;
     pub const serveRequest = serve.serveRequest;

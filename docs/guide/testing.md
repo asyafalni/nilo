@@ -132,7 +132,8 @@ The jar follows the rules of a browser that a test can be wrong about: a cookie 
 | `answer.body` | the bytes after the head, still chunk-framed if it was a stream |
 | `answer.text(&buf)` | the body as a client sees it, framing undone |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
-| `answer.json(T, arena)` | the body read back as a value |
+| `answer.decoded(arena)` | the body, inflated when the answer is gzipped |
+| `answer.json(T, arena)` | the body read back as a value (inflated first when gzipped) |
 | `answer.raw` | everything, exactly as it went on the wire |
 | `answer.head` | the status line and headers |
 | `answer.chunked` | whether it arrived in chunks |
@@ -146,6 +147,25 @@ try testing.expectEqual(@as(usize, 36), made.id.len);
 ```
 
 It removes chunk framing first and copies everything into the arena, so what it returns survives the next request on the same client. Fields you did not ask for are ignored: you are asking about part of the response, not checking its whole shape. When the shape *is* what you are checking, ask for `std.json.Value`.
+
+**Compression is tested on the wire.** `app.compress` gzips an answer only for a client that offered it, so a test offers it and reads the result back:
+
+```zig
+try wired.app.compress(.{});
+
+const packed_body = try nilo.testing.gzip(arena, json);   // a request body under Content-Encoding
+const answer = try wired.sendRequest(.{
+    .method = "POST",
+    .path = "/ingest",
+    .body = packed_body,
+    .headers = &.{
+        .{ .name = "Content-Encoding", .value = "gzip" },
+        .{ .name = "Accept-Encoding", .value = "gzip" },
+    },
+});
+try testing.expectEqualStrings("gzip", answer.header("Content-Encoding").?);
+const text = try answer.decoded(arena);   // .body and .bytes stay the compressed bytes
+```
 
 A client can be reused for as many requests as you like. Each one gets a fresh arena, exactly as a real connection does between requests.
 
@@ -173,6 +193,19 @@ Use `Client.init(gpa, .{ .response_bytes = 1 << 20 })` for a stream that produce
 **What `listen()` would have set, a test sets on the App.** A Client never calls `listen()`, so the App has the default limits; `wired.app.limits.max_body = 4096` is what `listen(.{ .max_body = 4096 })` copies there, and `max_in_flight` and `request_deadline_ms` sit beside it. `app.session_key` is the same kind of field ([Sessions](./sessions.md)).
 
 None of this is on the request path, and none of it exists in a running server.
+
+### Detached work from a handler
+
+**A handler that calls `nilo.spawn` works under a client too.** With no server, `spawn` runs the function on a runner the test clients lend, and `wired.settle()` (or `client.settle()`) waits for it, so the test can assert on its effect:
+
+```zig
+try wired.app.post("/orders", createOrder);   // spawns sendReceipt(&outbox, id)
+_ = try wired.post("/orders", body);
+wired.settle();
+try testing.expectEqual(@as(usize, 1), outbox.sent());
+```
+
+Work that never returns, a ticker, is not settled: it is cut off when the last client is deinitialised. Ordinary single-threaded assertions need `settle` first, because the work runs on another thread. With neither a client nor a server (a handler called as a plain function), `nilo.spawn` is still `error.NoServer`.
 
 ### Checking and starting services in a test
 

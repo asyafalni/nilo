@@ -226,9 +226,10 @@ pub const Limits = @import("bulkhead.zig").Limits;
 /// ```
 ///
 /// The server counts it while it runs and cuts it off when the shutdown
-/// grace period ends, exactly as it does a connection. `error.NoServer` if
-/// nothing is listening yet — which is what a unit test calling a handler
-/// directly gets.
+/// grace period ends, exactly as it does a connection. With no server, a live
+/// `testing.Client` lends a runner (and `client.settle()` waits for the work);
+/// with neither, `error.NoServer`, which is what a unit test calling a handler
+/// directly gets (ADR 028).
 ///
 /// Two things do not travel into it. The first is a compile error and the
 /// second is not caught:

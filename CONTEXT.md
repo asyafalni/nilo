@@ -121,7 +121,7 @@ A `*` as the last segment of a pattern, matching the whole rest of the path and 
 _Avoid_: wildcard route, splat, glob
 
 **Stream**:
-A response written in pieces because its length is not known when the head goes out. Held by the handler, not returned by it. Nothing is allocated per piece, and `finish` is what says where the body ends.
+A response written in pieces because its length is not known when the head goes out. Held by the handler, not returned by it. Nothing is allocated per piece, and `finish` is what says where the body ends. `abort` breaks it off instead, so the client sees a failed transfer and not a short body that looks complete.
 _Avoid_: chunked response, writer, body writer
 
 **Trailer**:

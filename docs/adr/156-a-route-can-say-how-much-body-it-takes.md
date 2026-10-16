@@ -83,7 +83,11 @@ the buffer the handler passes in — and it carries a `max_bytes` of its own
 ([ADR 019](019-a-request-that-lasts-is-still-one-request.md)) because the question it
 answers is a different one: not "how much may sit in memory" but "how much may
 the client send at all". A route that streams a body sets that number on the
-stream, where it always has.
+stream, where it always has. **That holds on HTTP/2 as well**: the connection
+collects a body only for a route that reads it whole, and one read in pieces is
+held by the stream's window and its own `max_bytes` (ADR 260). A test says so
+on each framing, both named `a body read through bodyStream is held to its own
+max_bytes, not to maxBody or max_body`.
 
 ## What it costs
 

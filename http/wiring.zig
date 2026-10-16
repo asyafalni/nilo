@@ -234,6 +234,7 @@ pub fn checkMiddlewarePaths(self: *const App) error{MiddlewarePathParam}!void {
 /// gotcha is middleware registered after a route silently not applying
 /// to it (ADR 008).
 pub fn resolveChains(self: *App) !void {
+    self.chains_shape.store(0, .release);
     freeChains(self);
     for (self.router.routes.items) |*r| {
         r.chain = try mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, r.method, r.pattern, r.pattern);
@@ -258,6 +259,47 @@ pub fn resolveChains(self: *App) !void {
     try sizeMetrics(self);
     try sizeCompressors(self);
     if (self.trace_hooks) |hooks| try hooks.size(self);
+    self.chains_shape.store(shapeOf(self), .release);
+}
+
+/// What the chains were resolved against, as one number: how much of each
+/// list `resolveChains` reads there is, and which optional parts are set.
+/// Never 0, which is "not resolved".
+fn shapeOf(self: *const App) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const counts = [_]usize{
+        self.router.routes.items.len,  self.scoped.items.len,
+        self.exemptions.items.len,     self.attached.items.len,
+        self.body_limits.items.len,    self.static_sets.items.len,
+        self.operations.items.len,     self.exposed.items.len,
+        @intFromBool(self.docs_options != null),
+        @intFromBool(self.compress_options != null),
+        @intFromBool(self.metrics_table != null),
+        @intFromBool(self.tracer != null),
+    };
+    h.update(std.mem.sliceAsBytes(&counts));
+    return h.final() | 1;
+}
+
+/// `resolveChains`, unless the chains already stand for what is registered:
+/// for a caller that may come back many times, a test client sending a
+/// request at a time, and from several threads (the
+/// rule is ADR 008's: `listen()` resolves once).
+///
+/// **Why not `resolveChains` every time.** It frees the chains it replaces,
+/// so a second thread mid-request on the old chain read freed memory. A
+/// registration made between two calls still shows (a route, a middleware,
+/// an exemption, an attachment, a limit, a static set, an exposed number, or
+/// `docs`/`compress`/`metrics`/`trace` being switched on) because each moves
+/// a count in `shapeOf`; the first caller after it resolves again, and the
+/// others wait for it. A change that moves no count (a handler swapped in
+/// place) is not seen, and none can be made.
+pub fn resolveChainsIfChanged(self: *App) !void {
+    if (self.chains_shape.load(.acquire) == shapeOf(self)) return;
+    while (self.resolving.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) std.Thread.yield() catch {};
+    defer self.resolving.store(false, .release);
+    if (self.chains_shape.load(.acquire) == shapeOf(self)) return;
+    try resolveChains(self);
 }
 
 /// Give `trace()` its rings, one per executor thread, for the reason the

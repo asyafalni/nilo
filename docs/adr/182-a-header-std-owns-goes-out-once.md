@@ -31,8 +31,11 @@ The explicit fields — `Begin.host`, `.authorization`, `.content_type`,
 header line. A field set explicitly is an override, as it was.
 
 `accept-encoding` is the one with a second half. The line goes out as the
-caller wrote it, but the client still decodes nothing, so the `accept_encoding`
-array std checks the *answer* against stays identity-only. A caller who
+caller wrote it, but what the client *reads* is decided by the build and not by
+the line: the `accept_encoding` array std checks the answer against is
+identity-only, and with `-Dfetch_gzip` it holds gzip as well
+([ADR 292](./292-a-fetch-build-can-read-a-gzip-answer.md)), in which case a
+gzip answer is decoded whatever the line said. Without the flag a caller who
 asks for `gzip` gets `error.HttpContentEncodingUnsupported` when a server
 obliges, rather than a `Str` full of gzip — which is the trap this module's
 header comment already describes, kept shut from the other side.

@@ -103,9 +103,12 @@ the assembly of a `ReleaseFast` build. On a fiber that is 99 KB held at
 the high-water mark for the life of the connection (ADR 062), released
 only when the connection goes idle (ADR 062): four thousand busy
 keep-alive connections would hold four hundred megabytes for a feature
-meant to save bandwidth. `compress.reset` does what `init` does, field by
-field, into the slot's own memory, and measures 40 bytes of stack the
-same way. It depends on the fields `Compress` has in the pinned Zig, and
+meant to save bandwidth. `core.deflate.resetIn` (it lived in `http/compress.zig`
+as `reset` until `nilo_fetch` needed it too, ADR 293) does what `init` does,
+field by field, into the slot's own memory, and measures 40 bytes of stack
+the same way. The one thing a field copy cannot supply, the writer's vtable,
+is read from a compressor built at compile time, so no slot is ever started
+by `Compress.init`. It depends on the fields `Compress` has in the pinned Zig, and
 `test "a compressor reset in place produces what a fresh one does"` holds
 it byte for byte against `init`'s own output, twice over on one slot, so
 the second use sees what the first left behind.
@@ -268,7 +271,7 @@ only to ask whether it carried a body, and the headers only to ask about
 
 ## Consequences
 
-- `http/compress.zig`: `Options`, `Level`, `Pool`, `reset`, and the
+- `http/compress.zig`: `Options`, `Level`, `Pool`, and the
   `acceptsGzip` and `compressible` that `static.zig` and `serve.zig` now
   import from here.
 - `http/ctx.zig`: `_compressors`, and `send` runs `squeezed` before the

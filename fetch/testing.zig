@@ -113,6 +113,16 @@ pub const Canned = struct {
     /// `requestBody` reads it out.
     body_seen: [1024]u8 = undefined,
     body_seen_len: usize = 0,
+    /// What the head announced, kept or not: `requestBodyDecoded` refuses a
+    /// body it holds only the start of.
+    body_claimed: usize = 0,
+    /// What `serveUpload` read: the chunked body's payload bytes as they
+    /// arrived (the first 8 KiB), how many of them, and how many chunks.
+    /// Atomic because a test reads them from the client's side while the
+    /// body is still going out: that is what they are for.
+    upload_seen: [8192]u8 = undefined,
+    upload_seen_len: std.atomic.Value(usize) = .init(0),
+    chunks_seen: std.atomic.Value(usize) = .init(0),
     /// A Wyhash (seed 0) and a count of every body byte `serveWithBody` read, the 1 KiB kept or not: a body that lost a
     /// block in the middle matches in the bytes kept and in nothing else.
     body_hash: u64 = 0,
@@ -186,15 +196,65 @@ pub const Canned = struct {
         self.body_len = body.len;
     }
 
+    /// `reply`, with `plain` gzipped and `Content-Encoding: gzip` added to the
+    /// headers: what a server that compresses sends, for a caller whose
+    /// decode path is under test (ADR 292). Both the gzip stream and the
+    /// header block are written into `out`, which the answer then points
+    /// into, so it must outlive the exchange; `error.NoSpaceLeft` when it is
+    /// too small. The stream is in `body`, where a test can corrupt it, and
+    /// a server that compresses regardless of `accept-encoding: identity`
+    /// is this answer to any request. The length it claims is the gzip's.
+    pub fn replyGzip(self: *Canned, out: []u8, status: []const u8, headers: []const u8, plain: []const u8) !void {
+        const flate = std.compress.flate;
+        var sink: std.Io.Writer = .fixed(out);
+        // The compressor wants a window it can slide, and the answer is
+        // small enough for the test thread's stack to hold it.
+        var window: [flate.max_window_len]u8 = undefined;
+        var compress = try flate.Compress.init(&sink, &window, .gzip, .default);
+        try compress.writer.writeAll(plain);
+        try compress.finish();
+        const packed_len = sink.end;
+        const line = "Content-Encoding: gzip\r\n";
+        if (out.len - packed_len < line.len + headers.len) return error.NoSpaceLeft;
+        @memcpy(out[packed_len..][0..line.len], line);
+        @memcpy(out[packed_len + line.len ..][0..headers.len], headers);
+        self.reply(status, out[packed_len..][0 .. line.len + headers.len], out[0..packed_len]);
+    }
+
     /// The request head that arrived, one line per header and `\n` between
     /// them, as it was on the wire. Empty until a `serve*` has read one.
     pub fn request(self: *const Canned) []const u8 {
         return self.seen[0..self.seen_len];
     }
 
-    /// The request body that arrived, up to the first kilobyte.
+    /// The request body that arrived, up to the first kilobyte, **as it was
+    /// on the wire**: gzipped bytes if the client gzipped them
+    /// ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
     pub fn requestBody(self: *const Canned) []const u8 {
         return self.body_seen[0..self.body_seen_len];
+    }
+
+    /// The value of the request's `content-encoding` header, or null.
+    pub fn requestEncoding(self: *const Canned) ?[]const u8 {
+        return headerLine(self.request(), "content-encoding");
+    }
+
+    /// The request body with its content coding undone, in memory from
+    /// `gpa` that the caller frees: what a test compares with the bytes it
+    /// meant to send. `gzip` is the one coding there is; a body under none
+    /// comes back copied. `error.BodyTruncated` for one larger than the
+    /// kilobyte kept, which would decode to nonsense.
+    pub fn requestBodyDecoded(self: *const Canned, gpa: std.mem.Allocator) ![]u8 {
+        if (self.body_claimed > self.body_seen_len) return error.BodyTruncated;
+        const wire = self.requestBody();
+        const coding = self.requestEncoding() orelse return gpa.dupe(u8, wire);
+        if (!std.ascii.eqlIgnoreCase(coding, "gzip")) return error.UnknownCoding;
+        return inflateGzip(gpa, wire);
+    }
+
+    /// The payload `serveUpload` has read so far, which is whole chunks.
+    pub fn uploadSeen(self: *const Canned) []const u8 {
+        return self.upload_seen[0..self.upload_seen_len.load(.acquire)];
     }
 
     /// Accept one connection, read the request whole — head and the body
@@ -216,6 +276,7 @@ pub const Canned = struct {
         // And the body the head announced, kept up to what fits so a test
         // about what went out can read it back; the rest is read and dropped
         // so the answer is not written while the request is still arriving.
+        self.body_claimed = body_len;
         self.body_seen_len = @min(body_len, self.body_seen.len);
         try reader.interface.readSliceAll(self.body_seen[0..self.body_seen_len]);
         if (body_len > self.body_seen_len) _ = try reader.interface.discard(.limited(body_len - self.body_seen_len));
@@ -664,6 +725,55 @@ pub const Canned = struct {
         }
     }
 
+    /// Accept one connection, read the head, then read a **chunked request
+    /// body** chunk by chunk and answer it when the last chunk comes. Each
+    /// chunk is on `upload_seen` and counted on `chunks_seen` the moment it
+    /// has arrived, so a test can see that the first line of an upload was
+    /// there before the caller had written the second
+    /// ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+    /// It answers with `status`, `headers` and `body` as `serveOne` does.
+    pub fn serveUpload(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        const r = &reader.interface;
+        _ = try self.readHead(r);
+
+        var at: usize = 0;
+        while (true) {
+            const size_line = std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n");
+            const hex = if (std.mem.indexOfScalar(u8, size_line, ';')) |semi| size_line[0..semi] else size_line;
+            const n = try std.fmt.parseInt(usize, hex, 16);
+            if (n == 0) {
+                // The trailer, up to its blank line.
+                while (std.mem.trimEnd(u8, try r.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
+                break;
+            }
+            var left = n;
+            while (left > 0) {
+                const piece = try r.take(@min(left, in_buf.len));
+                const room = self.upload_seen.len - at;
+                const keep = @min(piece.len, room);
+                @memcpy(self.upload_seen[at..][0..keep], piece[0..keep]);
+                at += keep;
+                left -= piece.len;
+            }
+            try r.discardAll(2);
+            self.upload_seen_len.store(at, .release);
+            _ = self.chunks_seen.fetchAdd(1, .release);
+        }
+
+        var out_buf: [4 << 10]u8 = undefined;
+        var writer = stream.writer(self.io, &out_buf);
+        const w = &writer.interface;
+        try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n{s}\r\n", .{ self.status, self.body_len, self.headers });
+        if (self.body) |bytes| try w.writeAll(bytes) else try w.splatByteAll('x', self.body_len);
+        try w.flush();
+    }
+
     /// `body_len` bytes of `x` as **chunked** transfer coding, in chunks of
     /// at most 1,000: the framing that reads through a buffer if any does.
     pub fn serveChunked(self: *Canned) !void {
@@ -868,6 +978,25 @@ pub const Canned = struct {
         self.server.socket.close(self.io);
     }
 };
+
+/// A header's value out of a block of `\n`-separated lines, by name,
+/// case-insensitively, or null.
+fn headerLine(block: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+/// `gzipped` inflated into memory from `gpa`.
+pub fn inflateGzip(gpa: std.mem.Allocator, gzipped: []const u8) ![]u8 {
+    var in: std.Io.Reader = .fixed(gzipped);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var d: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+    return d.reader.allocRemaining(gpa, .unlimited);
+}
 
 /// One step of what `Canned.serveWebSocket` plays at a client.
 pub const WsStep = union(enum) {

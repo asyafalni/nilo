@@ -41,9 +41,10 @@
 //!
 //! Handing a compressor back does not make it reusable: `finish` puts its
 //! writer into the failing state, and the standard library's only way out
-//! is `init`, which is the 99 KB temporary above. `reset` below does what
-//! `init` does, field by field, into memory that is already there:
-//! 40 bytes of stack, measured the same way. It depends on the fields
+//! is `init`, which is the 99 KB temporary above. `core.deflate.resetIn`
+//! does what `init` does, field by field, into memory that is already there:
+//! 40 bytes of stack, measured the same way. It lives in core because the
+//! client gzips a request body the same way (ADR 293), and it depends on the fields
 //! `std.compress.flate.Compress` has in the Zig this toolkit is pinned to,
 //! and `test "a compressor reset in place produces what a fresh one does"`
 //! holds it there byte for byte.
@@ -63,6 +64,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("nilo_build");
 const flate = std.compress.flate;
+const core = @import("nilo_core");
 const http1 = @import("http1.zig");
 const bulkhead = @import("bulkhead.zig");
 
@@ -173,9 +175,6 @@ pub fn PoolOf(comptime which: Backend) type {
         } else struct {
             state: flate.Compress,
             window: [flate.max_window_len]u8,
-            /// The vtable `Compress.init` gave the writer, kept because `finish`
-            /// replaces it with the failing one and `reset` has to put it back.
-            vtable: *const std.Io.Writer.VTable,
         };
 
         /// `count` compressors, built here, on the thread that is building
@@ -189,13 +188,13 @@ pub fn PoolOf(comptime which: Backend) type {
 
             const mapping: Mapping = switch (which) {
                 .std => {
-                    // `init` writes the gzip header into its output and asserts
-                    // there is room for it. This output is thrown away.
+                    // The first `reset` writes the gzip header into its output,
+                    // which is thrown away; a slot is never started with
+                    // `Compress.init` (`core.deflate`, ADR 293).
                     var scratch: [16]u8 = undefined;
                     for (slots) |*slot| {
                         var discard: std.Io.Writer = .fixed(&scratch);
-                        slot.state = try flate.Compress.init(&discard, &slot.window, .gzip, options.level.flateOptions());
-                        slot.vtable = slot.state.writer.vtable;
+                        try core.deflate.resetIn(&slot.state, &slot.window, &discard, options.level.flateOptions());
                     }
                 },
                 .libdeflate => try placeCompressors(slots, options.level.libdeflateLevel()),
@@ -318,7 +317,7 @@ pub fn PoolOf(comptime which: Backend) type {
                 return squeezed.bytes();
             }
             var out = std.Io.Writer.Allocating.initCapacity(arena, body.len / 2 + 64) catch return null;
-            reset(slot, &out.writer, self.options.level.flateOptions()) catch return null;
+            core.deflate.resetIn(&slot.state, &slot.window, &out.writer, self.options.level.flateOptions()) catch return null;
             slot.state.writer.writeAll(body) catch return null;
             slot.state.finish() catch return null;
 
@@ -327,32 +326,6 @@ pub fn PoolOf(comptime which: Backend) type {
             return squeezed;
         }
     };
-}
-
-/// What `flate.Compress.init` does, into a compressor that is already there.
-///
-/// Field for field the same as `init` in the pinned standard library, with
-/// one difference: the writer's vtable is the one `init` gave this slot
-/// rather than a fresh literal, because the functions in it are private to
-/// `Compress.zig`. `chain` is left as it is, as `init` leaves it undefined.
-fn reset(slot: *PoolOf(.std).Slot, output: *std.Io.Writer, opts: flate.Compress.Options) std.Io.Writer.Error!void {
-    const c = &slot.state;
-    try output.writeAll(flate.Container.gzip.header());
-    c.writer = .{ .buffer = &slot.window, .vtable = slot.vtable, .end = 0 };
-    c.history_len = 0;
-    c.history_end_unhashed = false;
-    c.bit_writer.output = output;
-    c.bit_writer.buffered = 0;
-    c.bit_writer.buffered_n = 0;
-    c.buffered_tokens.pos = 0;
-    c.buffered_tokens.n = 0;
-    @memset(&c.buffered_tokens.lit_freqs, 0);
-    @memset(&c.buffered_tokens.dist_freqs, 0);
-    @memset(&c.lookup.head, .{ .value = std.math.maxInt(u15), .is_null = true });
-    c.lookup.chain_pos = std.math.maxInt(u15);
-    c.container = .gzip;
-    c.opts = opts;
-    c.hasher = .init(.gzip);
 }
 
 /// Gzip `bytes` once, outside any request, into memory from `gpa` that the

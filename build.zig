@@ -92,7 +92,7 @@ const layers = [_]Layer{
         // `smoke-tls` may reach the internet. Named here rather than in
         // `in_tests` because it is not a layer and the import is not upward —
         // the same place `sql` puts `live_config`, for the same reason.
-        .may_import = &.{ "nilo_core", "net_config" },
+        .may_import = &.{ "nilo_core", "net_config", "fetch_config" },
         // `fetch/deadline.zig` names the server, because the one thing it
         // tests is a deadline the Engine has to fire and only a running
         // server has one (ADR 056, ADR 061). Same exception `sql` carries,
@@ -3781,6 +3781,9 @@ const Made = struct {
     owner: *std.Build,
     mode: std.lang.Optimize,
     core: ?*std.Build.Module = null,
+    /// `fetch_gzip`, for `fetch_made`: two modules built from one root with
+    /// different flags are two modules.
+    flag: bool = false,
     module: *std.Build.Module,
 };
 var proto_made: std.ArrayList(Made) = .empty;
@@ -3804,17 +3807,39 @@ fn fetchFor(
     mode: std.lang.Optimize,
     core_mod: *std.Build.Module,
 ) *std.Build.Module {
+    return fetchWith(b, target, mode, core_mod, want_fetch_gzip);
+}
+
+/// `fetchFor`, with the gzip flag decided by the caller: a test root that
+/// needs the reading side whatever the flag says (ADR 292).
+fn fetchWith(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    mode: std.lang.Optimize,
+    core_mod: *std.Build.Module,
+    gzip: bool,
+) *std.Build.Module {
     for (fetch_made.items) |made| {
-        if (made.owner == b and made.mode == mode and made.core == core_mod) return made.module;
+        if (made.owner == b and made.mode == mode and made.core == core_mod and made.flag == gzip) return made.module;
     }
     const module = b.createModule(.{
         .root_source_file = b.path("fetch/fetch.zig"),
         .target = target,
         .optimize = mode,
-        .imports = &.{.{ .name = "nilo_core", .module = core_mod }},
+        .imports = &.{
+            .{ .name = "nilo_core", .module = core_mod },
+            .{ .name = "fetch_config", .module = fetchConfig(b, gzip) },
+        },
     });
-    remember(b, &fetch_made, .{ .owner = b, .mode = mode, .core = core_mod, .module = module });
+    remember(b, &fetch_made, .{ .owner = b, .mode = mode, .core = core_mod, .flag = gzip, .module = module });
     return module;
+}
+
+/// The one bool `fetch/fetch.zig` asks of the build: whether it reads gzip.
+fn fetchConfig(b: *std.Build, gzip: bool) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "gzip", gzip);
+    return opts.createModule();
 }
 
 /// A copy of `nilo_job` for one optimize mode (ADR 160).
@@ -3907,6 +3932,12 @@ var want_http2: bool = false;
 /// `-Dlibdeflate` (ADR 248): gzip through libdeflate rather than
 /// `std.flate`, for a response and for a static file gzipped at load.
 var want_libdeflate: bool = false;
+
+/// `-Dfetch_gzip` (ADR 292): `nilo_fetch` reads a gzip answer. A comptime
+/// constant of the module and not a field of `Settings`, so a program that
+/// does not pass it links no flate and holds no window, and its calls ask
+/// for identity as they always did.
+var want_fetch_gzip: bool = false;
 
 /// What every instance of the http module is given so that
 /// `http/engine/zio.zig` can ask `@import("nilo_build").tls` and, when the
@@ -4381,6 +4412,8 @@ pub const AppOptions = struct {
     tls: bool = false,
     http2: bool = false,
     libdeflate: bool = false,
+    /// `nilo_fetch` reads a gzip answer (ADR 292). Off until asked.
+    fetch_gzip: bool = false,
     /// A TLS library of the project's own, in place of nilo's pin (ADR 274):
     /// a module from `b.dependency("tls", …)` whose API is the one
     /// `docs/reference/app.md` lists. Implies `tls`, and nilo's pin is not
@@ -4399,6 +4432,36 @@ pub const AppBuilt = struct {
     /// instance of it.
     dependency: *std.Build.Dependency,
 };
+
+/// The `nilo-dev` run behind a `dev` step, one function for `nilo.app` and
+/// the examples so the argument order is held in one place (ADR 190).
+///
+/// **The order is the contract.** `nilo-dev` takes the binary before any
+/// `--` and everything after a `--` as the server's own arguments, and
+/// `addPassthruArgs` splices whatever follows `zig build dev --` into the
+/// argv where it is called. Called before the binary, `zig build dev -- -Dllvm
+/// -- server.toml` gave `nilo-dev -Dllvm -- server.toml <exe>`: the binary
+/// became a server argument and the runner printed its usage. So the
+/// passthrough goes last, and this panics at configure time if it is not,
+/// which no build gets past.
+fn devRun(b: *std.Build, tool: *std.Build.Step.Compile, built: *std.Build.Step.Compile, build_step: ?[]const u8) *std.Build.Step.Run {
+    const dev = b.addRunArtifact(tool);
+    dev.addArg("--zig");
+    dev.addFileArg(.zig_exe);
+    if (build_step) |step| dev.addArgs(&.{ "--build", step });
+    // A directory argument, because a file one would be an input the step
+    // hashes and this one is written by the build `nilo-dev` itself starts.
+    // Absolute because the runner's working directory may not be the root's.
+    dev.addDirectoryArg2(
+        .{ .relative = .{ .base = .install_bin, .sub_path = built.out_filename } },
+        .{ .make_absolute = true },
+    );
+    dev.addPassthruArgs();
+    const argv = dev.argv.items;
+    if (argv.len < 2 or argv[argv.len - 1] != .passthru or argv[argv.len - 2] != .decorated_directory)
+        @panic("nilo: the dev step must pass the binary before the passthrough arguments (ADR 190)");
+    return dev;
+}
 
 /// A whole project in one call from a dependent's `build.zig` (ADR 263):
 /// the executable with `nilo_http` imported (and `nilo_sql` when asked for),
@@ -4426,6 +4489,7 @@ pub fn app(b: *std.Build, options: AppOptions) AppBuilt {
         .tls_own = options.tls_module != null,
         .http2 = options.http2,
         .libdeflate = options.libdeflate,
+        .fetch_gzip = options.fetch_gzip,
     });
     if (options.tls_module) |own| dependency.module("nilo_http").addImport("tls", own);
 
@@ -4449,16 +4513,7 @@ pub fn app(b: *std.Build, options: AppOptions) AppBuilt {
     // dependency asked for the host. Nothing of that instance is fetched or
     // built beyond `nilo-dev`, which imports `std` alone.
     const host = b.dependency("nilo", .{ .target = b.graph.host, .optimize = .safe });
-    const dev = b.addRunArtifact(host.artifact("nilo-dev"));
-    dev.addArg("--zig");
-    dev.addFileArg(.zig_exe);
-    dev.addPassthruArgs();
-    // A directory argument, because a file one would be an input the step
-    // hashes and this one is written by the build `nilo-dev` itself starts.
-    dev.addDirectoryArg2(
-        .{ .relative = .{ .base = .install_bin, .sub_path = exe.out_filename } },
-        .{ .make_absolute = true },
-    );
+    const dev = devRun(b, host.artifact("nilo-dev"), exe, null);
     b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
 
     const tests = b.addTest(.{ .root_module = root });
@@ -4549,6 +4604,15 @@ pub fn build(b: *std.Build) void {
         bool,
         "libdeflate",
         "Gzip responses and static files with libdeflate instead of std.flate, and fetch it (ADR 248). Off until a dependent passes `.libdeflate = true`",
+    ) orelse false;
+
+    // Whether `nilo_fetch` reads a gzip answer (ADR 292). Off until asked,
+    // and a comptime constant of the module, so a build without it links no
+    // flate for an outbound call and its calls ask for identity.
+    want_fetch_gzip = b.option(
+        bool,
+        "fetch_gzip",
+        "Read a gzip answer in nilo_fetch, bounded on the decoded bytes (ADR 292). Off until a dependent passes `.fetch_gzip = true`",
     ) orelse false;
 
     // The bottom layer: what every other one agrees about, and nothing else
@@ -4648,9 +4712,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("fetch/fetch.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "nilo_core", .module = nilo_core }},
+        .imports = &.{
+            .{ .name = "nilo_core", .module = nilo_core },
+            .{ .name = "fetch_config", .module = fetchConfig(b, want_fetch_gzip) },
+        },
     });
-    remember(b, &fetch_made, .{ .owner = b, .mode = optimize, .core = nilo_core, .module = nilo_fetch });
+    remember(b, &fetch_made, .{ .owner = b, .mode = optimize, .core = nilo_core, .flag = want_fetch_gzip, .module = nilo_fetch });
 
     // The second Fitting: a queue, and a schedule (ADR 160, ADR 161).
     // Registered rather than bound, like `nilo_fetch`: `nilo_http` never
@@ -5098,6 +5165,22 @@ pub fn build(b: *std.Build) void {
             .use_llvm = testBackend(target, mode),
         });
         test_fetch_step.dependOn(&b.addRunArtifact(tests).step);
+
+        // The reading side of gzip, which the build above leaves off the way
+        // a dependent that passes no flag has it, so its suite is the proof
+        // that nothing changed. Its own root, `fetch/gzip_live.zig`, is
+        // built with the flag on whatever `-Dfetch_gzip` says (ADR 292).
+        const gzip_root = b.createModule(.{
+            .root_source_file = b.path("fetch/gzip_live.zig"),
+            .target = target,
+            .optimize = mode,
+            .imports = &.{
+                .{ .name = "nilo_core", .module = coreFor(b, target, mode) },
+                .{ .name = "fetch_config", .module = fetchConfig(b, true) },
+            },
+        });
+        const gzip_tests = b.addTest(.{ .root_module = gzip_root, .use_llvm = testBackend(target, mode) });
+        test_fetch_step.dependOn(&b.addRunArtifact(gzip_tests).step);
     }
 
     // The eighth Refusals table, held the way the other seven are, and the
@@ -5360,6 +5443,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "nilo_core", .module = mode_core },
                 .{ .name = "net_config", .module = net_config.createModule() },
+                .{ .name = "fetch_config", .module = fetchConfig(b, false) },
             },
         });
         const tests = b.addTest(.{ .root_module = root, .use_llvm = testBackend(target, mode) });
@@ -6659,21 +6743,8 @@ pub fn build(b: *std.Build) void {
         // absolute because the runner's working directory is the example's.
         // Incremental unless `-- --no-incremental` is passed: on the
         // self-hosted backend since Zig 0.17, and the default since (ADR 190).
-        const dev = b.addRunArtifact(dev_tool);
+        const dev = devRun(b, dev_tool, built, b.fmt("example-{s}", .{example.name}));
         dev.setCwd(b.path(b.fmt("examples/{s}", .{example.name})));
-        dev.addArg("--zig");
-        dev.addFileArg(.zig_exe);
-        dev.addArgs(&.{ "--build", b.fmt("example-{s}", .{example.name}) });
-        dev.addPassthruArgs();
-        // Where `install` will put the binary, which is a path the Maker
-        // knows and this file does not: a prefix is chosen after configuring.
-        // A directory argument rather than a file one, because a file
-        // argument is an input the step hashes, and this one is written by
-        // the build that `nilo-dev` itself starts.
-        dev.addDirectoryArg2(
-            .{ .relative = .{ .base = .install_bin, .sub_path = built.out_filename } },
-            .{ .make_absolute = true },
-        );
         b.step(b.fmt("dev-{s}", .{example.name}), b.fmt("{s} — restarted on every save", .{example.about})).dependOn(&dev.step);
     }
 }

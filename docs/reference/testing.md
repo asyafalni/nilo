@@ -28,8 +28,15 @@
 | `answer.setCookie(name)` | the whole `Set-Cookie` line that sets it |
 | `answer.text(&buf)` | the body with chunk framing removed, into a buffer you sized |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
-| `answer.json(T, arena)` | `!T`: the body parsed back into a value ([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)) |
+| `answer.decoded(arena)` | `bytes`, inflated when the answer says `Content-Encoding: gzip` (what `app.compress` sends). `bytes` and `text` stay the wire's bytes, so a test can assert the answer was compressed; another encoding is `error.UnsupportedEncoding` |
+| `testing.gzip(arena, bytes)` | `![]u8`: `bytes` as a gzip member, for a request sent with `Content-Encoding: gzip` set through `headers` |
+| `client.settle()` | waits for the work `nilo.spawn` started under a client; see [`nilo.spawn` under a client](#nilospawn-under-a-client) |
+| `answer.json(T, arena)` | `!T`: the body (inflated first when gzipped) parsed back into a value ([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)) |
 | `error.AnswerStale` | what the three above return once the client has sent a later request: `.body` borrows the client's single buffer while `.status` is a value, and without this error the two would silently disagree ([ADR 171](../adr/171-an-answer-knows-which-request-it-was.md)) |
+
+### `nilo.spawn` under a client
+
+**With no server running, `nilo.spawn` starts its function on a runner the testing clients lend** ([ADR 028](../adr/028-a-spawned-fiber-belongs-to-the-server.md)): a task on a `std.Io.Threaded` that lives as long as any `Client` or `Wired` does. A handler that spawns detached work behaves as in production, and the test calls `client.settle()` (`wired.settle()`) to wait for it before asserting on its effect. `deinit` of the last client cuts off whatever has not returned, so a ticker never outlives its test; do not `settle` one. Without a server and without a client, `nilo.spawn` is still `error.NoServer`, and `spawnLocal` (gRPC) is `error.NoServer` always, which is its inline path. `Conversation` lends no runner. The task is not a zio fiber: nothing counts it as a server would.
 
 ### `answer.json`
 
@@ -62,7 +69,8 @@ const answer = try wired.post("/partners", body);
 | `wired.app.limits.max_body = 4096` | what `listen(.{ .max_body = 4096 })` would have copied onto the App; `max_in_flight` and `request_deadline_ms` likewise |
 | `wired.get(path)` / `post(path, body)` / `put(path, body)` / `patch(path, body)` / `delete(path)` / `postWith(…)` / `request(…)` | the `Client` calls, without the `&app` |
 | `wired.sendRequest(r)` / `send(raw)` / `setHeader(n, v)` / `cookie(n)` | likewise |
-| `wired.io()` | the `std.Io` a handler gets from `c.io()` or an `io: std.Io` argument in a test: a process-wide `std.Io.Threaded`. Start a writer fiber on it with `io.concurrent`; `Wired` cannot run `app.spawn` ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
+| `wired.io()` | the `std.Io` a handler gets from `c.io()` or an `io: std.Io` argument in a test: a process-wide `std.Io.Threaded`. Start a writer fiber on it with `io.concurrent`; `Wired` cannot run `app.spawn` (the work an App registers; `nilo.spawn` from a handler runs, see above) ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
+| `wired.settle()` | `client.settle()` |
 | `wired.deinit()` | deinits the client, then the App |
 
 **Your routes and services stay yours.** `app` is a field, not something behind methods, so nothing here is a second API and no database is assumed. `Client` is unchanged, and is still what to use when a test needs two clients against one App: two addresses, two cookie jars.

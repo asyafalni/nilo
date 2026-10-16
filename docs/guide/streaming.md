@@ -156,6 +156,34 @@ fn tail(c: *nilo.Ctx) !void {
 
 A FIN ends it whatever the request said: a stream never ends, so a client that half-closed is waiting for nothing ([ADR 287](../adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)). `c.eventsFrom` needs none of this: its connection waits on the socket already.
 
+## Breaking a stream off
+
+A relay can fail after bytes have gone out: the upstream it reads from drops, a file under it is cut. The client must see a broken download and not a short file that looks complete, and `body.abort()` is how a handler says so:
+
+<!-- compiles -->
+```zig
+fn relay(c: *nilo.Ctx, upstream: *Upstream) !void {
+    var out = try c.stream(200, "application/octet-stream");
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = upstream.read(&buf) catch return out.abort();
+        if (n == 0) break;
+        try out.writeAll(buf[0..n]);
+    }
+    try out.finish();
+}
+
+const Upstream = struct {
+    fn read(_: *Upstream, _: []u8) error{Broke}!usize {
+        return 0;
+    }
+};
+```
+
+On HTTP/1.1 the connection closes without the terminating chunk (a body that promised a `Content-Length` closes short of it), so the client reports a transfer that did not complete. On HTTP/2 the stream is reset with `INTERNAL_ERROR`, the code for a failure on the server's side; `CANCEL` would say the data was no longer wanted, which a client may read as nothing having gone wrong. What was flushed before stays sent, what was buffered is dropped, and the connection is not kept for another request.
+
+`abort()` returns `error.StreamAborted`, so `return out.abort();` is the whole call site and nothing after it can write to a body that is over. Without the `return` it still holds: a later write is `error.WriteFailed`, `finish()` does nothing, and the response is broken off when the handler returns, whatever it returns. A handler that returns any other error after the head has gone does the same thing, with the error in the log; `abort()` is the same decision made where it can be read. `events.abort()` is the same for an event stream whose source failed. An HTTP/1.0 client has no chunked encoding, and a body that ends where the connection does cannot be told from a short one by anything in the protocol, so there `abort` can only close.
+
 ## What an open stream costs
 
 **A held stream costs one fiber, and much more than the 4,669 bytes of an idle connection.** A stream is a handler that has not returned, so it keeps its buffers (an idle connection gives them back, a streaming one is using them) and its stack at the high-water mark of everything the handler has touched ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). Lowering `read_buffer` and `write_buffer` in `listen()` reduces it directly, which it does not for an idle connection.

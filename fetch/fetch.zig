@@ -112,6 +112,13 @@ const core = @import("nilo_core");
 
 const Str = core.Str;
 
+/// Whether this build reads a gzip answer (`-Dfetch_gzip`,
+/// [ADR 292](../docs/adr/292-a-fetch-build-can-read-a-gzip-answer.md)).
+/// A constant, so everything under it is analysed only when it is true and
+/// a build without the flag links no flate for a call that dials out.
+pub const reads_gzip = @import("fetch_config").gzip;
+const gunzip = @import("gzip.zig");
+
 /// How a struct of params is encoded; internal, so that the module root names
 /// only what the reference lists.
 const encoding = @import("params.zig");
@@ -143,6 +150,13 @@ pub const WebSocket = websocket.WebSocket;
 pub const retry = @import("retry.zig");
 pub const Retry = retry.Retry;
 
+/// A request body sent under a content coding, and the chunked body a
+/// caller writes ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+/// `fetch.gzip` is a `Coding`; naming it is what links the compressor.
+pub const encode = @import("encode.zig");
+pub const Coding = encode.Coding;
+pub const gzip = encode.gzip;
+
 /// The header a request's id travels under (ADR 158). nilo's own spelling,
 /// the one `Ctx.requestId` reads on the way in and the logger writes on the
 /// way out.
@@ -168,6 +182,10 @@ pub const Client = struct {
     limits: core.Limits = .none,
     settings: Settings,
     started: bool = false,
+    /// The compressor a call that sends its body gzipped takes and gives
+    /// back (ADR 293). Null until the first such call, so a client that
+    /// never compresses holds one pointer.
+    stash: encode.Stash = .{},
     /// What `settings.proxy` became, built by `nilo_start` and read by std
     /// through `inner.http_proxy` and `fresh.http_proxy`. On the heap, with
     /// its host and its `Proxy-Authorization` value, so that std's pointer
@@ -341,6 +359,20 @@ pub const Client = struct {
         /// `Settings.roots`, not this. See `Tls` for what else it costs
         /// ([ADR 290](../docs/adr/290-a-call-can-skip-the-certificate-check-and-only-that-call.md)).
         tls: Tls = .verified,
+        /// Send the body under this coding: `fetch.gzip`, or
+        /// `fetch.gzip.with(.{ .level = .fastest })`. The body is
+        /// compressed into the Scope's memory, `Content-Length` is the
+        /// compressed size and `Content-Encoding` names the coding. **Left
+        /// null, nothing is linked and nothing changes.** A body shorter
+        /// than the coding's `min_bytes`, or one that does not shrink, goes
+        /// out as it is; so does one the call already gave a
+        /// `content-encoding` line. **A server that does not read the coding
+        /// answers 415 naming the codings it reads in `Accept-Encoding`, and
+        /// the call sends the body once more, as it was** (the answer to
+        /// that is `Response.sent_encoding`, null). The 415 is not
+        /// remembered between calls: a caller that sees null there stops
+        /// asking ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+        encoding: ?encode.Coding = null,
     };
 
     /// Whether an `https://` call checks the certificate. See `Call.tls`.
@@ -382,6 +414,11 @@ pub const Client = struct {
         /// that sized an allocation from `content-length` has to hear about
         /// that rather than be handed a buffer with a tail of nothing in it.
         BodyTooShort,
+        /// The answer said `Content-Encoding: gzip` and its bytes do not
+        /// decode: not gzip at all, a corrupt block, a checksum or a length
+        /// the footer disagrees with, or a body that ended inside the stream.
+        /// Only in a build with `-Dfetch_gzip` (ADR 292).
+        BodyEncodingInvalid,
         /// A call was made before `listen()` ran. A Fitting is finished at
         /// startup like any other service; a unit test that calls a handler
         /// directly without an App gets this.
@@ -424,6 +461,10 @@ pub const Client = struct {
         /// and the other is not dialled over TCP on the strength of a
         /// `Location` ([ADR 272](../docs/adr/272-a-call-names-the-socket-it-goes-over.md)).
         RedirectLeavesSocket,
+        /// `begin` was given a body that only `beginUpload` sends, or
+        /// `beginUpload` a body of its own or a method that frames none
+        /// (ADR 293).
+        InvalidUpload,
         OutOfMemory,
     } || std.Io.net.UnixAddress.ConnectError || std.Uri.ParseError || std.http.Client.RequestError ||
         std.http.Client.Request.ReceiveHeadError ||
@@ -462,6 +503,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         // Read before std's `deinit`, which leaves `inner` undefined.
         const gpa = self.inner.allocator;
+        self.stash.deinit(gpa);
         if (self.started) {
             // The bundle is the caller's, shared by both std clients: leave
             // each with an empty one so that neither frees it.
@@ -784,7 +826,7 @@ pub const Client = struct {
         // decided, and std's slot is then left out so it goes once
         // (ADR 182).
         const given = Exchange.Given.of(lines);
-        const head = try ex.begin(self, .{
+        var opts: Exchange.Begin = .{
             .method = method,
             .url = url,
             .headers = headers,
@@ -798,10 +840,43 @@ pub const Client = struct {
             .route_left_ms = core.timeLeftOf(c),
             .stall_ms = call.stall_ms,
             .redirects = .{ .follow = &redirect_buffer },
+            .gzip = reads_gzip,
             // A target's standing headers are written for its own origin
             // and stay there (ADR 183).
             .origin_only = standing.headers,
-        });
+        };
+
+        // The body under the coding the call named (ADR 293). Nothing here
+        // is reached, or linked, by a call that named none.
+        var sent: ?encode.Coding = null;
+        if (call.encoding) |coding| if (body) |plain| {
+            if (plain.len >= coding.min_bytes and !namesHeader(headers, "content-encoding")) {
+                if (try coding.vtable.squeeze(&self.stash, self.inner.allocator, c.arena(), plain, coding.level)) |small| {
+                    const coded = try c.arena().alloc(std.http.Header, headers.len + 1);
+                    @memcpy(coded[0..headers.len], headers);
+                    coded[headers.len] = .{ .name = "content-encoding", .value = coding.name };
+                    opts.headers = coded;
+                    opts.body = .{ .slice = small };
+                    sent = coding;
+                }
+            }
+        };
+        var head = try ex.begin(self, opts);
+
+        // **A server that does not read the coding answers 415 and names
+        // the codings it does** (`Accept-Encoding`, RFC 9110 section
+        // 12.5.3), and the body was a slice, so it can go again as it was.
+        // Once: the second answer is the answer. A 415 whose list names the
+        // coding is about something else and is handed back.
+        if (sent) |coding| if (head.status == .unsupported_media_type and !encode.lists(head.header("accept-encoding"), coding.name)) {
+            ex.end();
+            ex = .idle;
+            opts.headers = headers;
+            opts.body = if (body) |bytes| .{ .slice = bytes } else .none;
+            opts.route_left_ms = core.timeLeftOf(c);
+            sent = null;
+            head = try ex.begin(self, opts);
+        };
 
         // Where a followed redirect ended, written out before the redirect
         // buffer goes: one arena allocation on a call that was redirected
@@ -818,6 +893,7 @@ pub const Client = struct {
             .status = head.status,
             .headers = kept,
             .redirected = landed,
+            .sent_encoding = if (sent) |coding| coding.name else null,
             .body = try ex.take(c, call.max_body orelse self.settings.max_body),
         };
     }
@@ -1036,6 +1112,11 @@ pub const Exchange = struct {
     /// whether reading the rest of it is cheaper than a new connection. Null
     /// is a body of unknown length, which counts as too much.
     announced: ?u64 = null,
+    /// The decoder of a gzip answer, from `begin` until `end`; null for any
+    /// other. One pointer, and **no field at all** in a build without
+    /// `-Dfetch_gzip`: the state is on the heap because by ADR 062 anything
+    /// on this struct is held per inbound connection (ADR 292).
+    unzip: if (reads_gzip) ?*gunzip.Reading else void = if (reads_gzip) null else {},
     permit: bool = false,
     open: bool = false,
     /// Whether the attempt in hand is on a connection taken out of the pool,
@@ -1138,6 +1219,15 @@ pub const Exchange = struct {
         /// `Call.tls`, for a caller that drives an `Exchange`. A followed
         /// redirect to another origin is `.verified` again (ADR 290).
         tls: Client.Tls = .verified,
+        /// Read a gzip answer: advertise it, and decode it for `take`,
+        /// `readInto`, `pipe`, `stream` and `reader` alike, so what is read is
+        /// the body and `Head.content_length` is the length on the wire. The
+        /// calls on `Client` set it; a caller driving an `Exchange` that
+        /// wants the bytes as the server stored them (an object store) leaves
+        /// it out and gets identity, as before. **Has no effect in a build
+        /// without `-Dfetch_gzip`** (`reads_gzip`), where a gzip answer is
+        /// `error.HttpContentEncodingUnsupported` (ADR 292).
+        gzip: bool = false,
     };
 
     /// What a 3xx with a `Location` means to a call. See `Begin.redirects`.
@@ -1172,6 +1262,144 @@ pub const Exchange = struct {
         none,
         slice: []const u8,
         stream: struct { reader: *std.Io.Reader, len: u64 },
+        /// A chunked body the caller writes (`beginUpload`), and nothing
+        /// anybody writes by hand: `begin` refuses it. It is a variant of
+        /// this union because the length is mandatory on `stream` for a
+        /// reason, and a body of unknown length is something a caller asks
+        /// for by calling another function, not by leaving a number out
+        /// (ADR 293).
+        upload: *Upload,
+    };
+
+    /// A chunked request body the caller writes, a piece at a time, from
+    /// `beginUpload` to `end` ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+    ///
+    /// ```zig
+    /// var ex: fetch.Exchange = .idle;
+    /// defer ex.end();
+    /// var up: fetch.Exchange.Upload = .{};
+    /// defer up.deinit();
+    /// try ex.beginUpload(client, c, &up, .{ .method = .POST, .url = url, .timeout_ms = 0 }, fetch.gzip);
+    /// try up.writer().writeAll("{\"t\":1}\n");
+    /// try up.writer().flush();        // the line is on the wire, whole
+    /// const head = try up.end();      // the answer's head; `ex.take` reads the rest
+    /// ```
+    ///
+    /// **`flush` on `writer()` is the unit**: it ends a chunk, and under a
+    /// coding it is a sync flush first, so the server can decode everything
+    /// written so far without waiting for the rest. **Some servers refuse a
+    /// chunked body**: S3 and the services like it answer 411, which is why
+    /// `Body.stream` asks for a length (ADR 174) and this is a function of
+    /// its own. The call is bounded by `timeout_ms` as a whole; an upload
+    /// that is meant to stay open says `0`. A redirect is handed back as
+    /// itself, never followed: the body is spent.
+    ///
+    /// Not copyable once begun: its writer finds the rest by address.
+    pub const Upload = struct {
+        ex: *Exchange = undefined,
+        /// What `end` hands to `landed` once the answer's head is read.
+        opts: Begin = undefined,
+        gpa: ?std.mem.Allocator = null,
+        body: std.http.BodyWriter = undefined,
+        chunk: []u8 = &.{},
+        coding: ?Coding = null,
+        spare: ?*encode.Spare = null,
+        stash: ?*encode.Stash = null,
+        out: std.Io.Writer = .{ .buffer = &.{}, .vtable = &out_vtable },
+
+        /// One chunk is at most this much: a `flush` ends it sooner.
+        pub const buffer_len = 16 << 10;
+
+        const out_vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flushAll };
+
+        /// Where the body is written. A `flush` on it puts everything
+        /// written so far on the wire as one chunk.
+        pub fn writer(self: *Upload) *std.Io.Writer {
+            return &self.out;
+        }
+
+        /// Where the plain bytes go: the coding's compressor, or the chunk
+        /// writer itself.
+        fn sink(self: *Upload) *std.Io.Writer {
+            if (self.spare) |sp| return self.coding.?.vtable.writer(sp);
+            return &self.body.writer;
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *Upload = @fieldParentPtr("out", w);
+            const to = self.sink();
+            var n: usize = 0;
+            for (data[0 .. data.len - 1]) |piece| {
+                try to.writeAll(piece);
+                n += piece.len;
+            }
+            const last = data[data.len - 1];
+            for (0..splat) |_| {
+                try to.writeAll(last);
+                n += last.len;
+            }
+            return n;
+        }
+
+        fn flushAll(w: *std.Io.Writer) std.Io.Writer.Error!void {
+            const self: *Upload = @fieldParentPtr("out", w);
+            try self.sink().flush();
+            if (self.spare != null) try self.body.writer.flush();
+            // std ends a chunk with its `\r\n` when the next write begins,
+            // so without this the last bytes flushed sit one chunk-trailer
+            // short of being whole, and a peer that frames by chunk would
+            // hold the line back until the next one. This is the step
+            // `chunkedDrain` takes at its next call, taken now.
+            if (self.body.state == .chunk_len and self.body.state.chunk_len == 2) {
+                try self.body.http_protocol_output.writeAll("\r\n");
+                self.body.state.chunk_len = 0;
+            }
+            try self.body.flush();
+            // A body going out is progress, the way `uploadStream` stamps it
+            // (ADR 056).
+            if (self.ex.stall_ms != 0) self.ex.mark();
+        }
+
+        /// Ends the body and reads the head of the answer, which `ex.take`
+        /// and the other readers then carry on from. **A server that
+        /// answered early and closed** (a session that ended, a 404 sent
+        /// before the body was done) makes the writes fail, and `end`
+        /// still reads what it said: the status is the news.
+        pub fn end(self: *Upload) Client.Error!Head {
+            const ex = self.ex;
+            var broken = false;
+            if (self.spare) |sp| self.coding.?.vtable.finish(sp) catch {
+                broken = true;
+            };
+            if (!broken and self.spare != null) self.body.writer.flush() catch {
+                broken = true;
+            };
+            if (!broken) self.body.end() catch {
+                broken = true;
+            };
+            self.release();
+            if (broken) ex.req.keep_alive = false;
+            ex.bounded(readAnswer, .{ex}) catch |err| return ex.blame(err);
+            return ex.landed(self.opts, std.Uri.parse(self.opts.url) catch unreachable, max_redirects);
+        }
+
+        fn readAnswer(ex: *Exchange) !void {
+            ex.res = try ex.req.receiveHead(&.{});
+        }
+
+        fn release(self: *Upload) void {
+            const gpa = self.gpa orelse return;
+            if (self.spare) |sp| if (self.stash) |st| st.give(sp, gpa);
+            self.spare = null;
+            if (self.chunk.len != 0) gpa.free(self.chunk);
+            self.chunk = &.{};
+        }
+
+        /// Gives back the compressor and the chunk buffer. Safe after
+        /// `end`, after a failure, and on an `Upload` never begun.
+        pub fn deinit(self: *Upload) void {
+            self.release();
+        }
     };
 
     /// The response head, and the window in which it can be read.
@@ -1257,6 +1485,44 @@ pub const Exchange = struct {
     /// Take a permit, arm the deadline, send the head and the body, and read
     /// the response head: everything up to the first byte of the body.
     pub fn begin(self: *Exchange, client: *Client, opts: Begin) Client.Error!Head {
+        if (opts.body == .upload) return error.InvalidUpload;
+        const uri = try self.arm(client, opts);
+        return self.walk(client, uri, opts);
+    }
+
+    /// Start a chunked upload: take a permit, arm the deadline, send the
+    /// head, and leave `up` ready to be written to (`Upload`). The body is
+    /// the caller's to write, under `coding` when one is given, and the
+    /// head has `transfer-encoding: chunked` and, under a coding, a
+    /// `content-encoding`. `opts.body` is `.none` and the method is one
+    /// that frames a body (POST, PUT, PATCH); either other way is
+    /// `error.InvalidUpload`. A call to a server that answers 411 to a
+    /// chunked body wants `Body.stream` and a length instead (ADR 293).
+    pub fn beginUpload(self: *Exchange, client: *Client, c: anytype, up: *Upload, opts: Begin, coding: ?Coding) Client.Error!void {
+        comptime core.checkScope(@TypeOf(c), "fetch.beginUpload");
+        if (opts.body != .none or !opts.method.requestHasBody()) return error.InvalidUpload;
+        const gpa = client.inner.allocator;
+        var hop = opts;
+        if (coding) |co| {
+            const coded = try c.arena().alloc(std.http.Header, opts.headers.len + 1);
+            @memcpy(coded[0..opts.headers.len], opts.headers);
+            coded[opts.headers.len] = .{ .name = "content-encoding", .value = co.name };
+            hop.headers = coded;
+        }
+        hop.body = .{ .upload = up };
+        up.* = .{ .ex = self, .opts = hop, .gpa = gpa, .coding = coding, .stash = &client.stash };
+        const uri = try self.arm(client, hop);
+        try self.dispatch(client, uri, hop);
+        // The head was refused on its way out and an answer came instead:
+        // there is no body to write.
+        if (self.heard) return error.WriteFailed;
+        if (coding) |co| up.spare = try co.vtable.open(&client.stash, gpa, co.level, &up.body.writer);
+    }
+
+    /// The part of a call that comes before the first byte: the permit, the
+    /// deadline, and the URL parsed. `begin` goes on from here by walking
+    /// redirects, `beginUpload` by sending a head and handing back a writer.
+    fn arm(self: *Exchange, client: *Client, opts: Begin) Client.Error!std.Uri {
         if (!client.started) return error.NotStarted;
         self.client = client;
 
@@ -1328,7 +1594,12 @@ pub const Exchange = struct {
             if (ms != 0) self.deadline_us = core.monotonicMicros() + @as(i64, ms) * std.time.us_per_ms;
             self.armNearer();
         } else self.bound.arm(client.limits, ms);
+        return uri;
+    }
 
+    /// The rest of `begin`: the head sent, with its one retry onto a
+    /// connection the peer had closed, and the redirects walked.
+    fn walk(self: *Exchange, client: *Client, uri: std.Uri, opts: Begin) Client.Error!Head {
         // **One retry, and only onto a connection the peer had already
         // closed.** Not a retry policy: `std.http.Client` pools keep-alive
         // connections and every server reaps an idle one, so the first call
@@ -1408,6 +1679,14 @@ pub const Exchange = struct {
             try self.dispatch(client, here, hop);
         }
 
+        return self.landed(opts, here, left);
+    }
+
+    /// The head just read, as the caller gets it: the redirect `refuse`
+    /// turns into an error, a body-less answer ended, and the body reader
+    /// set up. `left` is how many redirects the walk had left, and `here`
+    /// where it ended.
+    fn landed(self: *Exchange, opts: Begin, here: std.Uri, left: u8) Client.Error!Head {
         // Read out now, because `Response.reader` deliberately invalidates
         // them: std sets the head's slices to `undefined` the moment the body
         // stream starts, and it is right to — the bytes they point at are
@@ -1455,6 +1734,15 @@ pub const Exchange = struct {
         self.inner = self.res.reader(opts.transfer_buffer);
         self.tap.vtable = &tap_vtable;
         self.reader = if (self.stall_ms != 0) &self.tap else self.inner;
+        if (comptime reads_gzip) if (opts.gzip) if (gunzip.coding(self.res.head.content_encoding)) |how| {
+            // The decoder reads what the clocks watch, so a stall is still
+            // seen, and everything that reads `reader` after this reads the
+            // body (ADR 292). `announced` stays the length on the wire: it is
+            // what `end` weighs a drain against.
+            const reading = try gunzip.Reading.open(self.client.inner.allocator, self.reader.?, how);
+            self.unzip = reading;
+            self.reader = reading.reader();
+        };
         return head;
     }
 
@@ -1472,6 +1760,15 @@ pub const Exchange = struct {
                 {
                     self.forget();
                     continue;
+                }
+                // Said where it is free: a log call links std's formatting into
+                // every ReleaseFast program that dials out, 1,952 bytes of a
+                // 954,208-byte one (`bench/result/fetch.md`), so only a Debug
+                // build says how to read the answer. The reference says it for
+                // the rest (ADR 292).
+                if (builtin.mode == .debug and !reads_gzip and err == error.HttpContentEncodingUnsupported) {
+                    std.log.warn("nilo_fetch: an answer came under a Content-Encoding this build does not read; " ++
+                        "pass .fetch_gzip = true to b.dependency(\"nilo\", ...) (-Dfetch_gzip) to read gzip (ADR 292)", .{});
                 }
                 return self.blame(err);
             };
@@ -1799,7 +2096,7 @@ pub const Exchange = struct {
         // because it cannot be replayed onto a second one if the first turns
         // out to be a corpse. Every other body keeps the pool, and the replay
         // in `begin` protects it.
-        const std_client = if (opts.body == .stream) &client.fresh else &client.inner;
+        const std_client = if (opts.body == .stream or opts.body == .upload) &client.fresh else &client.inner;
         self.reused = false;
         self.heard = false;
         const picked = try pickConnection(client, std_client, uri, opts.unix_socket, opts.tls);
@@ -1816,7 +2113,7 @@ pub const Exchange = struct {
                 .content_type = slot(opts.content_type, given.content_type),
                 .user_agent = slot(opts.user_agent, given.user_agent),
                 .connection = slot(null, given.connection),
-                .accept_encoding = if (given.accept_encoding) .omit else .{ .override = "identity" },
+                .accept_encoding = if (given.accept_encoding) .omit else .{ .override = if (reads_gzip and opts.gzip) "gzip, identity" else "identity" },
             },
         }) catch |err| {
             // `request` never took it, so nobody else will give it back.
@@ -1861,6 +2158,13 @@ pub const Exchange = struct {
         // bytes.
         self.req.accept_encoding = @splat(false);
         self.req.accept_encoding[@backingInt(std.http.ContentEncoding.identity)] = true;
+        // A build that reads gzip reads it whatever was asked for: a server
+        // that gzips regardless of `identity` is the case this is for, and
+        // a caller's own `accept-encoding: gzip` line is then answered with
+        // the body and not an error (ADR 292).
+        if (comptime reads_gzip) {
+            if (opts.gzip) self.req.accept_encoding[@backingInt(std.http.ContentEncoding.gzip)] = true;
+        }
 
         // **The body decides, not the method**
         // ([ADR 174](../docs/adr/174-the-body-decides-not-the-method.md)).
@@ -1876,6 +2180,9 @@ pub const Exchange = struct {
             return self.earlyAnswer(error.WriteFailed);
         };
 
+        // An upload's answer is read by `Upload.end`, after the caller has
+        // written the body (ADR 293).
+        if (opts.body == .upload) return;
         self.res = try self.req.receiveHead(&.{});
     }
 
@@ -2334,6 +2641,15 @@ pub const Exchange = struct {
                 try w.writeAll(bytes);
                 try self.req.connection.?.flush();
             },
+            .upload => |up| {
+                // The caller writes this body, a piece at a time, and each
+                // `flush` is one chunk on the wire. The buffer is heap for
+                // the same reason `.stream`'s is, and is freed by
+                // `Upload.deinit`.
+                self.req.transfer_encoding = .chunked;
+                up.chunk = try self.client.inner.allocator.alloc(u8, Upload.buffer_len);
+                up.body = try self.req.sendBody(up.chunk);
+            },
             .stream => |src| {
                 // With a `stall_ms` the source is read through `tap`, so that
                 // every chunk that leaves it moves the silence clock: nothing
@@ -2496,7 +2812,7 @@ pub const Exchange = struct {
     fn replayable(body: Body) bool {
         return switch (body) {
             .none, .slice => true,
-            .stream => false,
+            .stream, .upload => false,
         };
     }
 
@@ -2546,7 +2862,7 @@ pub const Exchange = struct {
     pub fn take(self: *Exchange, c: anytype, max: usize) Client.Error!Str {
         comptime core.checkScope(@TypeOf(c), "exchange.take");
         const reader = self.reader orelse unreachable; // begin first, then take
-        if (self.announced) |len| if (len <= max) {
+        if (self.announced) |len| if (len <= max and !self.decoding()) {
             const buf = try c.arena().alloc(u8, @intCast(len));
             self.bounded(std.Io.Reader.readSliceAll, .{ reader, buf }) catch |err| switch (err) {
                 error.EndOfStream => return error.BodyTooShort,
@@ -2554,9 +2870,13 @@ pub const Exchange = struct {
             };
             return c.str(buf);
         };
+        // A gzip answer lands here whatever its length, because the length
+        // announced is the wire's. `max` is counted on the decoded bytes, so
+        // a few hundred bytes of gzip cannot become more than `max` of body
+        // (ADR 292).
         const bytes = self.bounded(std.Io.Reader.allocRemaining, .{ reader, c.arena(), std.Io.Limit.limited(max) }) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooLarge,
-            else => |e| return self.blame(e),
+            else => |e| return self.fail(e),
         };
         return c.str(bytes);
     }
@@ -2571,7 +2891,7 @@ pub const Exchange = struct {
         const reader = self.reader orelse unreachable; // begin first, then read
         return self.bounded(std.Io.Reader.readSliceAll, .{ reader, buf }) catch |err| switch (err) {
             error.EndOfStream => error.BodyTooShort,
-            else => |e| self.blame(e),
+            else => |e| self.fail(e),
         };
     }
 
@@ -2580,7 +2900,7 @@ pub const Exchange = struct {
     /// wants: the ceiling is the transfer buffer rather than the body.
     pub fn pipe(self: *Exchange, w: *std.Io.Writer) Client.Error!u64 {
         const reader = self.reader orelse unreachable; // begin first, then pipe
-        return self.bounded(std.Io.Reader.streamRemaining, .{ reader, w }) catch |err| return self.blame(err);
+        return self.bounded(std.Io.Reader.streamRemaining, .{ reader, w }) catch |err| return self.fail(err);
     }
 
     /// One chunk of the body into `w`, at most `limit` bytes, and how many
@@ -2602,10 +2922,29 @@ pub const Exchange = struct {
         while (true) {
             const n = self.bounded(std.Io.Reader.stream, .{ reader, w, limit }) catch |err| switch (err) {
                 error.EndOfStream => return 0,
-                else => |e| return self.blame(e),
+                else => |e| return self.fail(e),
             };
             if (n != 0) return n;
         }
+    }
+
+    /// Whether the body being read is a gzip answer being decoded.
+    fn decoding(self: *const Exchange) bool {
+        if (comptime !reads_gzip) return false;
+        return self.unzip != null;
+    }
+
+    /// `blame`, after asking whether the failure was the bytes: a decoder
+    /// that gave up on what the server sent is `BodyEncodingInvalid`, and one
+    /// that failed because the connection did is the clocks' to name
+    /// (ADR 292).
+    fn fail(self: *Exchange, err: anytype) Client.Error {
+        if (comptime reads_gzip) {
+            if (self.unzip) |reading| {
+                if (std.mem.eql(u8, @errorName(err), "ReadFailed") and reading.undecodable()) return error.BodyEncodingInvalid;
+            }
+        }
+        return self.blame(err);
     }
 
     /// `Client.blame`, asked about every clock at once.
@@ -2791,7 +3130,9 @@ pub const Exchange = struct {
                     conn.closing = true;
                     return;
                 }
-                const r = self.reader orelse return;
+                // The wire, never the decoded side: a leftover of a gzip
+                // answer is dropped bytes, not bytes to inflate (ADR 292).
+                const r = if (comptime reads_gzip) (if (self.unzip) |reading| reading.source else self.reader orelse return) else self.reader orelse return;
                 _ = r.discardRemaining() catch {
                     conn.closing = true;
                 };
@@ -2924,6 +3265,12 @@ pub const Exchange = struct {
             self.reader = null;
             self.announced = null;
         }
+        // After the drain above, which reads the wire through the decoder's
+        // source (ADR 292).
+        if (comptime reads_gzip) if (self.unzip) |reading| {
+            reading.close();
+            self.unzip = null;
+        };
         self.bound.release();
         self.deadline_us = 0;
         self.expired = false;
@@ -2971,6 +3318,12 @@ pub const Response = struct {
     /// whole-body calls. Without the userinfo and the fragment, so it is
     /// safe to log ([ADR 183](../docs/adr/183-a-redirect-is-a-decision-with-a-name.md)).
     redirected: ?[]const u8 = null,
+    /// The coding the request body went out under, or null when it went as
+    /// it was: no `Call.encoding`, a body too small or not shrinking, or a
+    /// server that answered 415 and was sent it again plain. A caller that
+    /// asked and reads null here can stop asking this server
+    /// ([ADR 293](../docs/adr/293-a-request-body-can-be-sent-gzipped.md)).
+    sent_encoding: ?[]const u8 = null,
     /// Request-lifetime text. It is in the Scope's arena, so it goes when the
     /// request does and nothing has to be freed — and it may not outlive the
     /// request without `.keep()`, like every other `Str`.
@@ -3423,6 +3776,8 @@ test {
     _ = @import("params.zig");
     _ = @import("retry.zig");
     _ = @import("retry_live.zig");
+    _ = @import("send_live.zig");
+    _ = @import("encode.zig");
     _ = @import("websocket.zig");
 }
 

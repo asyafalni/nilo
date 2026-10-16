@@ -11,9 +11,9 @@ Refusing every encoding once meant refusing gzip too. Decoding it was set aside 
 
 ## Decision
 
-**A body under any `Content-Encoding` but `identity` or `gzip` is a 415 naming the header, unless the route's chain says it reads that coding itself. A body under `gzip` is inflated once into the arena, in place of the bytes that arrived, and nothing after that line knows how it was sent.**
+**A body under any `Content-Encoding` but `identity` or `gzip` is a 415 naming the header, unless the route's chain says it reads that coding itself. A body under `gzip` is inflated once into the arena, in place of the bytes that arrived, and nothing after that line knows how it was sent. `c.bodyStream()` decodes gzip as the body is read, on a window held in the arena.**
 
-**A route can read a coding itself** (`nilo.bodyEncodings(.{"snappy"})`, [ADR 283](./283-a-route-can-read-a-content-encoding-itself.md)): for an App that has one, the refusal below is held back until the route is matched, and a body under a coding the matched route names reaches `c.body()` and `c.bodyStream()` as it arrived. Every other route, and every App that has none, is refused as this ADR says.
+**A route can read a coding itself** (`nilo.bodyEncodings(.{"snappy"})`, [ADR 283](./283-a-route-can-read-a-content-encoding-itself.md)): for an App that has one, the refusal below is held back until the route is matched, and a body under a coding the matched route names reaches `c.body()` and `c.bodyStream()` as it arrived (naming `"gzip"` passes gzip through undecoded on both). Every other route, and every App that has none, is refused as this ADR says.
 
 ### Why 415 and not 400
 
@@ -35,15 +35,23 @@ In `finish`, at the blank line, rather than in the header arm that reads the val
 
 `Content-Encoding` on a GET with nothing under it says nothing about anything. Refusing it would turn a request everybody answers into a 415 over a header with no effect, the opposite of the rule [ADR 070](./070-a-request-nobody-else-would-answer-is-refused.md) states: refuse what nobody else would answer, not what everybody else ignores.
 
-### What still does not decode
+### `c.bodyStream()` decodes gzip too
 
-`c.bodyStream()` refuses any coding with a 415 of its own, except on a route that reads the coding itself (ADR 283), where it hands the bytes over as they came. A stream hands bytes out as they arrive into the caller's buffer and holds nothing, so there is no buffer to be the history, and the caller's own buffer is handed a piece at a time; decoding on that path needs a window per stream (the pool question again) or a decoder over the caller's buffer with a minimum size, and it is not the path the Collector takes.
+A stream hands bytes out into the caller's buffer, which may be eight bytes, so the trick `c.body()` uses (the destination is the inflater's history) has no destination to reach back into. The decoder takes a window of its own, `std.compress.flate.Decompress` in the mode that keeps one, and **the window lives in the request arena, allocated when `bodyStream()` is called on a gzipped body and never otherwise**: 73,000 bytes or so in one allocation (the decoder's 3,384 bytes of tables, its 65,536-byte window and a 4,096-byte buffer for the wire bytes). ADR 062 is why it is not a local of the handler: a fiber keeps its stack at its high-water mark for the life of the connection, and the arena is reset when the request ends, so a connection that took one gzipped upload holds nothing for it afterwards. A request without a gzipped body pays eight bytes of the handler's `Body` (a pointer that stays null) and one compare.
+
+**The ceiling is counted on decoded bytes as they are produced**, not read off the trailer: a stream cannot size an allocation by it, and a trailer is the sender's word. The byte that crosses `max_bytes` is `error.BodyTooLarge` (a 413 through `statusFor`), so a bomb of a few kilobytes that inflates to gigabytes is stopped after `max_bytes + 1` bytes of work. The bytes on the wire are held to the same number, as for any body, which stops a stream of empty blocks that never decodes to anything. `incoming.seen()` and `size()` count the wire bytes; what the handler read is what it counted.
+
+**A body that does not decode is `error.BadEncodedBody`**, a 400 through `statusFor`, in the cases `c.body()` refuses: not gzip, cut short, corrupt, a trailer that disagrees with the bytes, and a second member or other bytes after the first. A body that is empty under the header is empty, as `c.body()` reads it. The wire failing (a client that stopped, a chunk that is not one) keeps the errors it had.
+
+**Any other coding is still a 415 on a streaming route**, and `bodyEncodings` still hands the bytes over as they came. Both framings behave the same: the decoder reads the body through the same reader, which on HTTP/2 is the stream's pipe (ADR 260).
 
 **The head is not rewritten.** `header("Content-Encoding")` still says `gzip` and `header("Content-Length")` still gives the wire length after `body()` has inflated it, because the head is read where it lies ([ADR 085](./085-every-header-without-handing-out-the-head.md)) and there is nothing to remove a line from. A proxy handler forwarding `body()` with the request's own headers sends plain bytes labelled `gzip`; `Ctx.body`'s doc comment names the trap and says what to send instead.
 
 ## What was rejected
 
 **Refusing the coding on every route with no way round.** The position this ADR first held, and the one that shipped: the refusal is made while the head is read, before any route matches, so a receiver whose protocol is a coding nilo does not decode (Prometheus remote-write sends snappy and no client setting avoids it) could not be written at all, not even over `bodyStream()`. ADR 283 holds the refusal back for an App that has a route which reads a coding, and leaves it where it was for every other.
+
+**Refusing every coding on `c.bodyStream()`.** The position this ADR held until a caller parsed an NDJSON upload straight off the wire to keep its working set fixed, which `c.body()` gives up by holding the decoded body. The cost it named was a window per stream, and the arena is where one costs least (see above).
 
 **Decoding `deflate` too.** HTTP's `deflate` is a zlib stream some clients send raw, and telling the two apart is a heuristic; nothing that pushes telemetry sends it, and the 415 names gzip specifically rather than guess.
 
@@ -59,7 +67,7 @@ In `finish`, at the blank line, rather than in the header arm that reads the val
 
 | Axis | Cost |
 |---|---|
-| Allocations per request | unchanged on a request that is not gzipped. A gzipped one pays one more arena allocation, of the inflated size exactly, on top of the one or two `readSizedBody` already makes for the compressed bytes; the compressed copy is not freed separately, it is arena memory and goes with the request |
+| Allocations per request | unchanged on a request that is not gzipped. A gzipped one read with `c.body()` pays one more arena allocation, of the inflated size exactly, on top of the one or two `readSizedBody` already makes for the compressed bytes; the compressed copy is not freed separately, it is arena memory and goes with the request. One read with `c.bodyStream()` pays one, of about 73,000 bytes, and no copy of the body |
 | Memory per idle connection | unchanged for a connection that never sends a gzipped body. The inflater's state is 3,384 bytes of Huffman tables (`@sizeOf(std.compress.flate.Decompress)`, measured) on the handler's stack while `body()` runs, and since a fiber's stack is its high-water mark for the life of the connection ([ADR 062](./062-where-a-connection-waits-is-what-it-costs.md)), a connection that has ever sent one holds up to 3.4 KB more than one that has not. That is 1.5% of the 230,096 bytes a compressor's state was measured at, the number that kept the outbound direction out |
 | Throughput and p99 | nothing on a request without the header; `finish` tests an enum instead of a bool, the same instruction. The inflating itself is a loop with no wait in it, since the compressed bytes are already in the arena, so the fiber does not suspend inside it |
 | Binary size | `std.compress.flate.Decompress`, which `http/static.zig` already links for its own tests, and which a program serving gzipped static files already carries the compressor's half of. Unmeasured on its own; small against ADR 017's running total |

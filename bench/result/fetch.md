@@ -597,6 +597,79 @@ The cost is on the calls that set a `stall_ms` only (a syscall per 16 KiB instea
 
 **Can it be pushed further.** Yes, by `sendfile`, once std has it. Not otherwise on loopback: the shipped row is 6% over the floor that sends from memory.
 
+## Reading a gzip answer: what it costs (ADR 292)
+
+Run on 2026-10-16, AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.17.0, at `88209de` plus the change that adds `-Dfetch_gzip` ([ADR 292](../../docs/adr/292-a-fetch-build-can-read-a-gzip-answer.md)). `bench/release/fetch.zig` (a 100-byte plain answer, the control) and `bench/release/fetch_gzip.zig` (a gzip answer decoded into the Scope), built `-Doptimize=ReleaseFast -Dstrip=true -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3`, the upstream a thread in the same process. The base is `git archive 88209de` built with the same newest harness, in a scratch directory, the same afternoon. Instructions are `perf stat -e instructions:u` pinned to a core at two counts (2,000 and 12,000 calls; 40 and 240 for 1 MiB), the difference over the difference, as `bench/release.py` does with cachegrind (not installed here). The JSON is synthetic (`{"id":N,"name":"host-N","state":"running"}` records, padded with spaces to the length), so the ratio is a ceiling for real answers.
+
+**Binary size, `bench/release/fetch.zig`, stripped:**
+
+| build | bytes | over base |
+|---|---|---|
+| `88209de` | 954,208 | |
+| this tree, no flag | 954,224 | +16 |
+| this tree, `-Dfetch_gzip` | 977,648 | +23,440 |
+
+The 16 bytes are the name `BodyEncodingInvalid` in the error set. The first draft logged how to opt in from the unsupported-coding path in every build and cost **+1,968 bytes** with the flag off, 1,952 of them std's log formatting; the log is now under `builtin.mode == .debug`, where it is free, and the number above is what shipped. `bench/release/fetch_gzip.zig` is 999,448 bytes because it also compresses its own answer.
+
+**Stack, the frame of the function the call chain inlines into** (`sub $N,%rsp` of `start.posixCallMainAndExit` in an unstripped build): 6,440 B at `88209de`, 6,440 B with no flag, 6,456 B with the flag (the one pointer on `Exchange`). The 73,136-byte `gzip.Reading` (window 65,536, input buffer 4,096, flate's state 3,384 with its reader, the rest the CRC, count and pointers) is on the heap, per gzip answer.
+
+**CPU a call, the plain 100-byte answer (instructions):**
+
+| build | per call |
+|---|---|
+| no flag | 9,798 |
+| `-Dfetch_gzip` | 9,747 |
+
+An answer that is not gzip pays nothing for the flag (the spread of the two is the noise of a loopback socket).
+
+**CPU a call, a gzip answer:**
+
+| decoded | instructions | time | arena bytes |
+|---|---|---|---|
+| 4 KiB | 123,665 (about 114,000 more than the plain call) | n/a | 6,369 |
+| 1 MiB | 18.2 million | 2.34 ms (about 450 MB/s) | 1.28 million |
+
+The arena figure is the growing read `take` falls back on for a body of unknown length (the length announced is the wire's); the body is the last doubling of it. A body that is read into a writer of the caller's (`pipe`) allocates none of it.
+
+**What the rows decided.** The log line that says how to opt in is in Debug builds only, because 1,952 bytes on every program that dials out buys a sentence the docs hold. The CRC-32 and the length of the footer are checked by nilo because `std.compress.flate.Decompress` reads them and compares nothing: a test flips one byte in the middle of a stream and one in each of the footer's fields, and none of the three is an error without the check. Direct mode (no window, the destination's buffer as the history) would take the 65,536 bytes off `take` and cannot serve `pipe`, `stream` or `readInto`, which write into buffers of the caller's choosing, so it was not taken.
+
+**Can it be pushed further.** The 4 KiB figure is dominated by building the Huffman tables for one dynamic block, which is std's; a table cached per stream would not help a one-shot answer. The 1 MiB figure is std's inflate (about 17 instructions a byte). libdeflate's decompressor is faster and is C, and `-Dlibdeflate` brings the compressor only ([ADR 248](../../docs/adr/248-gzip-is-libdeflate-when-a-build-asks-for-it.md)); not tried.
+
+**Not measured.** An HTTPS answer (the decode is below the TLS reader and does not change with it); a flag-on build under load with many connections decoding at once (each holds 73 KB for the length of its read, so 500 concurrent gzip answers hold 36.6 MB of heap that identity does not); the `bench/release.py` columns, because `fetch_gzip` is built only with `-Dfetch_gzip`, which a ref older than the flag refuses.
+
+## A request body sent gzipped: what it costs (ADR 293)
+
+**What was run.** On 16 October 2026, at `88209de` plus the working tree, on the 16-thread Linux 7.2.5 development host, other tracks building at the same time (so the microseconds are an upper edge, not a floor). Two measurements, both `ReleaseFast`, built with `zig build-exe` against `fetch/fetch.zig` and `core/core.zig` directly.
+
+**Binary size** (`-OReleaseFast -fstrip`, `x86_64-linux-gnu`; a program that creates a `Client`, starts it and posts a runtime-sized body, so nothing folds away). The "before" is `git archive HEAD` built beside it.
+
+| program | bytes |
+|---|---|
+| before this change, `post(…, .{})` | 965,280 |
+| after, `post(…, .{})` (names no coding) | 965,952 (+672) |
+| after, `post(…, .{ .encoding = fetch.gzip })` | 1,027,584 (+61,632 over the one before this change) |
+
+The 672 bytes are what every program that dials out carries: the branch on `Call.encoding`, the one-pointer stash freed in `deinit`, the 415 check and the head split in `begin`. The compressor is in only the program that wrote `fetch.gzip`, which a runtime enum switched on in `send` could not have promised. (A first version of this program posted `"hello"`, and the whole compressor folded away at 5 bytes under `min_bytes`; the two binaries came out byte for byte the same. A runtime-sized body is what shows the difference.)
+
+**CPU** to gzip a JSON body of the shape an agent posts (container inventory, about 6 bytes in 1 at the default level), through `fetch.gzip.vtable.squeeze` on a kept compressor, best of five runs of 2,000 (4 KB) and 20 (1 MB):
+
+| body | level | compressed | time |
+|---|---|---|---|
+| 4,164 B | fastest | 755 B | 29 us |
+| 4,164 B | default | 664 B | 30 us |
+| 4,164 B | best | 647 B | 40 us |
+| 1,048,681 B | fastest | 148,195 B | 5.8 ms |
+| 1,048,681 B | default | 103,009 B | 6.2 ms |
+| 1,048,681 B | best | 96,575 B | 21.1 ms |
+
+On 4 KB the three levels are within 10 us of each other (`.best` aside), and a 64 KB hash table is refilled to make the compressor reusable on every call, which is a fixed cost no level changes (not separated out here): the level matters from about 100 KB. The time is the calling thread's, held for the body's length; on an agent whose host runs other people's work, `.fastest` is the setting. For comparison, `bench/result/http.md` has zstd 3 at 2.6 ms for 69 KB on a megabyte of a different body; this change builds no zstd.
+
+**Stack.** `Compress.init` writes 99,048 bytes of stack before its first byte (ADR 211). The compressing path ran in a thread with a 48 KB stack in Debug and a 12 KB stack in ReleaseSafe; the standard library's own `init` aborts on 48 KB. `fetch/encode.zig` holds the first as a test.
+
+**Decision it moved.** The compressor is kept on the `Client` (a stash of one) rather than allocated per call: `~288 KB` is over glibc's mmap threshold, and a per-call allocation would be a map, a page-fault per touched page and an unmap on every compressed post.
+
+**Can it go further.** libdeflate does this in a quarter to a third of the time (ADR 248) and `nilo_fetch` cannot name it today; that is a flag on the module if a caller's CPU asks for it.
+
 ## What is still missing
 
 - **A quiet machine.** The load average was between 6 and 18 across these runs

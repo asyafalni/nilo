@@ -61,6 +61,7 @@ A request: `readHead` → `parseHead` → the head is *borrowed* from the read b
 | `.tls = true` (`-Dtls`) | tls.zig; without it there is no `tls` module and the Engine's every use is under `@import("nilo_build").tls`. With `.http2` as well, a TLS listener offers `h2` and `http/1.1` by ALPN and serves what was chosen | 212, 259 |
 | `.http2 = true` (`-Dhttp2`) | nothing: HTTP/2 and gRPC are `http/h2.zig`, `hpack.zig`, `h2conn.zig` (the connection) and `grpc.zig` (the envelope). A call reaches the App as its fields and its message through `serve.serveRequest` (`Arrival.call`), held to every rule an HTTP/1.1 head is (RFC 9113 §8 for any method), so a gRPC method is an ordinary route and any other request is served as HTTP, on a plain listener by its first bytes and on a TLS one by ALPN. A WebSocket stays HTTP/1.1 | 220, 259 |
 | `.libdeflate = true` (`-Dlibdeflate`) | libdeflate's compressor, from its release tarball, compiled `ReleaseFast` and `FREESTANDING` by `libdeflateFor` in `build.zig`, never with `lib/utils.c` (whose weak `memcpy` would win the link for the whole program). `compress.backend` picks it for the pool and for static gzip | 248 |
+| `.fetch_gzip = true` (`-Dfetch_gzip`) | nothing: `nilo_fetch` reads a gzip answer (`fetch/gzip.zig`), counted against `max_body` on the decoded bytes and checked against the footer. `fetch.reads_gzip` is a comptime constant from the generated `fetch_config`, so a build without the flag links no flate and pays 16 B; this repository's `fetch/gzip_live.zig` root is built with it on whatever the flag says | 292 |
 
 It is the flag, not `.lazy = true`, that keeps a dependency out: `b.lazyDependency` is a request, and called unconditionally it ran for every dependent. This repository's own http test root is built with TLS and gRPC whatever the flags say, and links libdeflate so `compress.zig`'s tests hold both pools; its App keeps the default backend, so `zig build test -Dlibdeflate` is the run of the App through libdeflate. `zig build fetch-check -Dnetwork` builds `bench/dependent/` against two cold caches and fails on anything but zio landing; it needs the internet, so it is not on `test`. `zig build tzdata-check -Dnetwork` fails when IANA has published a time zone release newer than the one `nilo_job` carries (`job.tzdata_version`); also off `test`, and `-Dtzdata=<dir>` builds against the output of `job/tzdata/refresh.py --out <dir>` (ADR 161).
 
@@ -116,7 +117,7 @@ No `-Dtest-filter` is wired in, so build steps are all-or-nothing. What runs sta
 ```
 zig test http/range.zig --test-filter "a suffix range"   # also cookie, patch, names, json
 zig test core/core.zig                                   # and id/, config/, pw/, cache/, jwt/, proto/
-zig test --dep nilo_core -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig
+zig test --dep nilo_core --dep fetch_config -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig -Mfetch_config=fetch/config_off.zig
 zig test --dep nilo_core --dep nilo_tzdata -Mroot=job/job.zig -Mnilo_core=core/core.zig -Mnilo_tzdata=job/tzdata/tzdata.zig
 ```
 

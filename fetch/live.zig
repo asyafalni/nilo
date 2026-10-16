@@ -1241,8 +1241,39 @@ test "the body is asked for uncompressed, so what comes back is the body" {
             // that was caught, against a real endpoint; this is the half of
             // it that runs with no network, so deleting the line in `send`
             // fails in `zig build test` rather than only in `smoke-tls`.
-            try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: identity") != null);
-            try testing.expect(std.mem.indexOf(u8, head, "gzip") == null);
+            // A build with `-Dfetch_gzip` says it reads gzip, and reads it
+            // (ADR 292, `gzip_live.zig`).
+            if (fetch.reads_gzip) {
+                try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: gzip, identity") != null);
+            } else {
+                try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: identity") != null);
+                try testing.expect(std.mem.indexOf(u8, head, "gzip") == null);
+            }
+        }
+    }.run);
+}
+
+test "a gzip answer is an error naming the unsupported encoding in a build that does not read it" {
+    // The build a dependent gets by default (ADR 292). `gzip_live.zig` is the
+    // same scenario in a build that reads it.
+    if (fetch.reads_gzip) return error.SkipZigTest;
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var wire: [4 << 10]u8 = undefined;
+            var canned = try Canned.open(io);
+            defer canned.close();
+            try canned.replyGzip(&wire, "200 OK", "", "{\"a\":1}");
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            try testing.expectError(error.HttpContentEncodingUnsupported, client.get(&scope, try canned.url(&buf), .{}));
         }
     }.run);
 }

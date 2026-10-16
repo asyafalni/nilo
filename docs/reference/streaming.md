@@ -25,6 +25,7 @@
 | `s.flush()` | send what is buffered |
 | `s.live()` | false once the server is stopping |
 | `s.finish()` | ends the body. **Required** |
+| `s.abort()` | breaks the response off: the client sees a failed transfer, never a short body that looks complete. HTTP/1.1 closes the connection without the terminating chunk (or short of its `Content-Length`), HTTP/2 resets the stream with `INTERNAL_ERROR`. Returns `error.StreamAborted`, so `return s.abort();` is the call site. Later writes are `error.WriteFailed` and `finish` does nothing |
 | `s.writer` | a plain `std.Io.Writer` |
 
 ## `Events`
@@ -38,7 +39,8 @@
 | `e.retry(millis)` | the browser's reconnect delay |
 | `e.live()` | false once the server is stopping, or `e.sleep` found the client gone |
 | `e.sleep(ms)` | `error{Canceled}!void`: wait up to `ms` for the next thing to send, and return early when the client is gone, after which `live()` is false. A FIN ends it whatever the request said, because a stream never ends and a half-closed client is waiting for nothing. Without it a stream that writes only when it has something holds its connection until a write fails ([ADR 287](../adr/287-a-handler-can-ask-whether-its-client-is-still-there.md)) |
-| `e.close()` | |
+| `e.close()` | ends the stream |
+| `e.abort()` | breaks it off as `Stream.abort` does, for a feed whose source failed and should not read as having ended |
 
 **Multi-line text is split where the browser would split it**: at LF, CRLF **and a lone CR**. So `data` and `comment` are sent as one field per line, and a value cannot start an event of its own. `name` and `id` are single lines by definition: a CR or LF in either, or in `json`'s name, returns `error.EventFieldBreaksLine`, and nothing is written.
 

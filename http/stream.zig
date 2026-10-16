@@ -89,6 +89,10 @@ pub const Open = struct {
     /// over as far as the handler is concerned, and its end, with the
     /// trailers, is written when the chain has unwound (ADR 008).
     finished: bool = false,
+    /// `abort` was called: the body is broken off and its end is never
+    /// written, so the client sees a transfer that failed and not a short
+    /// body that looks complete (ADR 019).
+    aborted: bool = false,
 };
 
 /// End a body: the promise checked, then the marker and the trailers where
@@ -203,10 +207,47 @@ pub const Stream = struct {
         return !stopping.load(.acquire);
     }
 
-    /// End the body. Required, and safe to call twice.
+    /// Break the response off. The client sees a transfer that failed, never a
+    /// short body that looks complete: on HTTP/1.1 the connection is closed
+    /// without the terminating chunk (a body that promised a `Content-Length`
+    /// is closed short of it), and on HTTP/2 the stream is reset with
+    /// `INTERNAL_ERROR`, the code a server uses for a failure that is its own
+    /// (`CANCEL` says the data is no longer wanted, which a client may take as
+    /// no failure at all).
+    ///
+    /// ```zig
+    /// while (try upstream.next(&buf)) |piece| try out.writeAll(piece);
+    /// if (upstream.failed()) return out.abort();
+    /// try out.finish();
+    /// ```
+    ///
+    /// **It returns the error `StreamAborted` and does not return the handler**,
+    /// so `return out.abort();` is the whole call site: the handler unwinds,
+    /// and no later line can write to a body that is over. Called without
+    /// the `return` it still holds: what was written stays written, what was
+    /// buffered and not flushed is dropped, a later write fails with
+    /// `error.WriteFailed`, `finish` is a no-op, and App breaks the response
+    /// off when the handler returns, whatever it returns. Called on a body
+    /// that has ended already it changes nothing.
+    ///
+    /// **A body that ends where the connection does has nothing to tell a
+    /// broken one from a short one by**: an HTTP/1.0 client has no chunked
+    /// encoding, and `abort` can only close there (ADR 019).
+    pub fn abort(self: *Stream) error{StreamAborted} {
+        const open = if (self._open.*) |*o| o else return error.StreamAborted;
+        open.aborted = true;
+        if (self._force_close) |flag| flag.* = true;
+        // Anything buffered is dropped, and the buffer is taken away so that
+        // a write from here on goes to `drain`, which refuses it.
+        self.writer.buffer = &.{};
+        self.writer.end = 0;
+        return error.StreamAborted;
+    }
+
+    /// End the body. Required, and safe to call twice, and after `abort`.
     pub fn finish(self: *Stream) !void {
         const before = self._open.* orelse return;
-        if (before.finished) return;
+        if (before.finished or before.aborted) return;
         // Flushed before the record is cleared, not after: `drain` reads it
         // to know how to frame what it is writing, and a null one means the
         // body has already ended. Re-read afterwards, because the flush is
@@ -264,6 +305,12 @@ pub const Stream = struct {
         // finished body — but silently dropping what a handler wrote is how
         // somebody spends an afternoon looking for the missing half of a
         // report, so it says so once.
+        // Broken off on purpose: what is written to it now is refused, and
+        // the handler has been told once, by `abort` itself.
+        if (self._open.*) |o| if (o.aborted) {
+            w.end = 0;
+            return error.WriteFailed;
+        };
         const current: ?Open = if (self._open.*) |o| (if (o.finished) null else o) else null;
         const open = current orelse {
             if (total > 0) std.log.warn(
@@ -485,6 +532,13 @@ pub const Events = struct {
 
     pub fn close(self: *Events) !void {
         return self.stream.finish();
+    }
+
+    /// Break the stream off instead of ending it: `Stream.abort`. For a
+    /// handler that relays a source which failed, where `close` would say
+    /// the feed ended and the client should not look for more.
+    pub fn abort(self: *Events) error{StreamAborted} {
+        return self.stream.abort();
     }
 };
 

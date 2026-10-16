@@ -291,7 +291,7 @@ try app.with(nilo.maxBody(1024)).post("/sign-in", signIn);
 
 **`nilo.maxBody` returns an `mw.Limited`**, the middleware together with the limit it gives (a [`nilo.Late(usize)`](#nilolate)), so that `use`, `useOn`, `with` and `without` can keep the number for the gRPC side. It goes wherever a middleware goes; a program that stored it in a `nilo.Middleware` variable uses its `.run` field.
 
-**It does not affect `c.bodyStream()`**, which holds nothing in the arena and has its own `max_bytes` ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)). `maxBody(0)` is a compile error.
+**It does not affect `c.bodyStream()`**, which holds nothing in the arena and has its own `max_bytes` ([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)), on HTTP/1.1 and on HTTP/2 alike. `maxBody(0)` is a compile error.
 
 **Handed the address of a `usize` instead of a number, it reads the limit from there on each request**, for a limit that comes from configuration: an ingest route whose cap is an environment setting. The variable is a container-level `var` that outlives the App, filled before `listen()`, as `cors.reading`'s `Origins` is:
 

@@ -1597,6 +1597,11 @@ pub const Ctx = struct {
     /// arena and refuses past a megabyte. Content-Length and chunked look
     /// the same from here, as they do to `body()`.
     ///
+    /// **A body under `Content-Encoding: gzip` is decoded as it is read**,
+    /// bounded on decoded bytes by `max_bytes`, on a window of about 73 KB
+    /// taken from the request arena for that request alone (ADR 089). A
+    /// request that is not gzipped allocates nothing, as above.
+    ///
     /// A body left half-read is fine — App discards the rest so the
     /// connection is clean for the next request.
     pub fn bodyStream(self: *Ctx) !body_mod.Body {
@@ -1608,15 +1613,12 @@ pub const Ctx = struct {
         // Asking twice would hand out two readers into one stream, and the
         // second would get whatever the first left.
         std.debug.assert(self._body == null and self._incoming == null);
-        // A stream hands the bytes out as they arrive and holds nothing, so
-        // there is nowhere to inflate a gzipped body into: the destination
-        // that `body()` uses as the inflater's window is the caller's buffer
-        // here, and it is handed back a piece at a time (ADR 089). Refused
-        // with the status the parser gives every other coding, and the
-        // sentence says which side to change.
-        if (self._request.content_encoding != .identity and !self._body_as_sent) return fail.status(
+        // A coding other than gzip is not read here, with the status the
+        // parser gives every other coding. A route that reads one itself
+        // named it (ADR 283) and gets the bytes as they came.
+        if (self._request.content_encoding == .other and !self._body_as_sent) return fail.status(
             415,
-            "this route reads its body as a stream, which is not decoded — send it as identity",
+            "this route reads its body as a stream, which decodes Content-Encoding: gzip and nothing else — send it as identity or gzip",
             .{},
         );
 
@@ -1638,6 +1640,11 @@ pub const Ctx = struct {
         self._incoming = .start(self._request, options.max_bytes);
         var incoming: body_mod.Body = .init(self._in, &self._incoming.?);
         incoming._watch = self._watch;
+        // A gzip body is decoded as it is read, on a window held in the arena
+        // for this request alone (ADR 089). A body that is empty has nothing
+        // to decode, and a request without the header pays for none of it.
+        if (self._request.content_encoding == .gzip and !self._body_as_sent and self.announcesBody())
+            try incoming.decodeGzip(self._arena);
         return incoming;
     }
 

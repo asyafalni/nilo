@@ -1519,6 +1519,13 @@ pub fn sleep(ms: u64) error{Canceled}!void {
 /// is running rather than by the fiber that started it (ADR 028).
 pub const spawn = engine.spawn;
 
+/// The runner `spawn` falls back to when no server runs, lent by the testing
+/// clients (ADR 028). Not part of the contract an Engine is swapped against
+/// beyond answering `spawn` the same way.
+pub const acquireTestRunner = engine.acquireTestRunner;
+pub const releaseTestRunner = engine.releaseTestRunner;
+pub const settleTestRunner = engine.settleTestRunner;
+
 /// `spawn`, kept on the calling fiber's thread: for work that answers the
 /// fiber that started it, a gRPC call answering its connection (ADR 220).
 pub const spawnLocal = engine.spawnLocal;

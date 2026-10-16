@@ -260,6 +260,23 @@ pub const Answer = struct {
         return self.text(try arena.alloc(u8, self.body.len));
     }
 
+    /// The body as a client that sent `Accept-Encoding: gzip` reads it: `bytes`,
+    /// inflated when the answer says `Content-Encoding: gzip` (what
+    /// `app.compress` and a precompressed static file send), and `bytes`
+    /// unchanged otherwise. Into memory the caller owns, like `bytes`.
+    ///
+    /// `bytes` and `text` stay the wire's bytes on purpose: a test that asserts
+    /// the answer *was* compressed reads them, and `header("Content-Encoding")`
+    /// beside them. Another encoding is `error.UnsupportedEncoding`, not
+    /// guessed at.
+    pub fn decoded(self: Answer, arena: std.mem.Allocator) ![]const u8 {
+        const wire = try self.bytes(arena);
+        const coding = self.header("Content-Encoding") orelse return wire;
+        if (std.ascii.eqlIgnoreCase(coding, "identity")) return wire;
+        if (!std.ascii.eqlIgnoreCase(coding, "gzip")) return error.UnsupportedEncoding;
+        return @import("encoded.zig").inflate(arena, wire, max_decoded) catch error.BadEncodedBody;
+    }
+
     /// The body read back as `T`
     /// ([ADR 147](../docs/adr/147-a-response-is-read-back-the-way-it-was-written.md)).
     ///
@@ -275,18 +292,47 @@ pub const Answer = struct {
     /// client's typo and gets a 400; a response with more fields than the test
     /// asked about is the ordinary case.
     ///
+    /// A gzipped answer is inflated first (`decoded`).
+    ///
     /// Everything is copied into `arena`, so what comes back outlives the
     /// client's response buffer and the next request on it. **Read it before
     /// that request**: an answer asked for its body after the client has
     /// answered another is `error.AnswerStale`, not the other one's body.
     pub fn json(self: Answer, comptime T: type, arena: std.mem.Allocator) !T {
         try self.fresh();
-        return std.json.parseFromSliceLeaky(T, arena, try self.bytes(arena), .{
+        return std.json.parseFromSliceLeaky(T, arena, try self.decoded(arena), .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
     }
 };
+
+/// The most `Answer.decoded` inflates, so a test of a runaway answer fails
+/// rather than fills memory.
+const max_decoded = 64 << 20;
+
+/// `bytes` as a gzip member, for a request body sent under
+/// `Content-Encoding: gzip`, into `arena`:
+///
+/// ```zig
+/// const packed_body = try nilo.testing.gzip(arena, json);
+/// _ = try client.sendRequest(&app, .{ .method = "POST", .path = "/ingest", .body = packed_body,
+///     .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} });
+/// ```
+///
+/// std's own compressor, so a test is std writing what the server reads. It
+/// lives here and not in `encoded.zig` so a program that never tests does not
+/// link a compressor for the request path (ADR 089).
+pub fn gzip(arena: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    // `Compress.init` asserts its output has somewhere to write.
+    var out: std.Io.Writer.Allocating = try .initCapacity(arena, 64);
+    defer out.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress: std.compress.flate.Compress = try .init(&out.writer, &window, .gzip, .default);
+    try compress.writer.writeAll(bytes);
+    try compress.finish();
+    return out.toOwnedSlice();
+}
 
 /// A value rendered the way it goes over the wire, for a failure message
 /// somebody can read
@@ -448,7 +494,7 @@ pub const Client = struct {
             app_mod.warnIfBuiltDifferently();
         }
 
-        return .{
+        const client: Client = .{
             .gpa = gpa,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .buffer = try gpa.alloc(u8, options.response_bytes + 1),
@@ -460,9 +506,29 @@ pub const Client = struct {
             .keep_cookies = options.cookies,
             .read_buffer = options.read_buffer,
         };
+        // After the last thing that can fail, so `deinit` is the one release.
+        bulkhead.acquireTestRunner();
+        return client;
     }
 
+    /// Wait until every task `nilo.spawn` started under this client has
+    /// returned, so a test can assert on what detached work did. With no
+    /// server running, `spawn` runs its function on a runner the testing
+    /// clients lend (ADR 028); without this call the work is only cut off,
+    /// not awaited, when the last client is deinitialised. Work that never
+    /// returns (a ticker) must not be awaited: leave it to `deinit`.
+    ///
+    /// The runner is one for the process, so this also waits for work another
+    /// live client started.
+    pub fn settle(self: *Client) void {
+        _ = self;
+        bulkhead.settleTestRunner();
+    }
+
+    /// Cuts off whatever `nilo.spawn` started and has not returned, unless a
+    /// later client still holds the runner; `settle` first to await it.
     pub fn deinit(self: *Client) void {
+        bulkhead.releaseTestRunner();
         for (self.sticky.items) |h| {
             self.gpa.free(h.name);
             self.gpa.free(h.value);
@@ -623,8 +689,10 @@ pub const Client = struct {
     /// the caller's, exactly as given. The jar still *reads* the answer, so
     /// signing in with a hand-written request and going on with `get` works.
     pub fn send(self: *Client, app: *App, raw_request: []const u8) !Answer {
-        // What `listen()` would have done. Idempotent, so calling it once
-        // per request costs nothing after the first.
+        // What `listen()` would have done. Resolved again only when
+        // something was registered since the last time, so a second thread
+        // sending through the same App never meets chains being freed, and a
+        // route registered between two sends still takes effect.
         //
         // **`checkServices` is deliberately not here** (ADR 180). It was, for
         // an afternoon, and it refused a test that drives an App to fetch
@@ -634,7 +702,7 @@ pub const Client = struct {
         // answered where the route actually needs one, in `typed.zig`, which
         // has no false positive to have. `app.checkServices()` is public for a
         // test that wants the whole gate.
-        try app.resolveChains();
+        try app.resolveChainsIfChanged();
 
         // A copy, because a connection's read buffer is written to: a
         // WebSocket message is unmasked where it lies (ADR 216). Handed a
@@ -778,6 +846,11 @@ pub const Wired = struct {
     pub fn deinit(self: *Wired) void {
         self.client.deinit();
         self.app.deinit();
+    }
+
+    /// `Client.settle`: wait for the work `nilo.spawn` started.
+    pub fn settle(self: *Wired) void {
+        self.client.settle();
     }
 
     pub fn get(self: *Wired, path: []const u8) !Answer {
@@ -976,7 +1049,7 @@ fn parse(raw: []const u8, keep_alive: bool) !Answer {
 
 /// A real server for a test, on the real Engine, on a port the kernel chose.
 ///
-/// `Wired` has no server, so `app.spawn` cannot run there and `nilo.io()`
+/// `Wired` has no server, so `app.spawn` (the work an App starts itself) cannot run there and `nilo.io()`
 /// answers a process-wide `std.Io.Threaded`. A test of what only a running
 /// server does (a fiber `app.spawn` started that drains a queue a route
 /// fills, an idle deadline firing with no request in flight) starts one here
@@ -1315,7 +1388,7 @@ pub const Conversation = struct {
     /// back. The conversation can be reused: the queue is cleared, so the next
     /// `open` sends only what was queued after this one.
     pub fn open(self: *Conversation, app: *App, path: []const u8) !Talk {
-        try app.resolveChains();
+        try app.resolveChainsIfChanged();
 
         var request: std.ArrayList(u8) = .empty;
         defer request.deinit(self.gpa);
@@ -2282,4 +2355,145 @@ test "put, patch and delete send their method, and the first two their body" {
     defer client.deinit();
     try testing.expectEqualStrings("again", (try client.put(&wired.app, "/thing", "again")).body);
     try testing.expectEqual(@as(u16, 201), (try client.delete(&wired.app, "/thing")).status);
+}
+
+var slow_entered: std.atomic.Value(bool) = .init(false);
+var slow_release: std.atomic.Value(bool) = .init(false);
+
+fn passThrough(c: *@import("ctx.zig").Ctx, next: @import("middleware.zig").Next) anyerror!void {
+    try next.run(c);
+}
+
+fn slowHandler(c: *@import("ctx.zig").Ctx) anyerror!void {
+    slow_entered.store(true, .release);
+    while (!slow_release.load(.acquire)) std.Thread.yield() catch {};
+    try c.sendText(200, "slow");
+}
+
+fn sendSlow(app: *App, out: *u16) void {
+    var client = Client.init(testing.allocator, .{}) catch return;
+    defer client.deinit();
+    const answer = client.get(app, "/slow") catch return;
+    out.* = answer.status;
+}
+
+test "sending does not rebuild the chains, so a second thread on one App is safe" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+    try wired.app.use(passThrough);
+    try wired.app.get("/slow", slowHandler);
+    try wired.app.get("/fast", plain);
+
+    _ = try wired.get("/fast");
+    const before = wired.app.router.routes.items[0].chain.ptr;
+    _ = try wired.get("/fast");
+    try testing.expectEqual(before, wired.app.router.routes.items[0].chain.ptr);
+
+    // A route registered between two sends still takes effect, and the
+    // middleware reaches it.
+    try wired.app.get("/later", plain);
+    try testing.expectEqual(@as(u16, 201), (try wired.get("/later")).status);
+    try testing.expect(wired.app.router.routes.items[2].chain.len > 0);
+
+    // The case that crashed: one thread inside a handler, the chain it holds
+    // in use, while another sends.
+    slow_entered.store(false, .release);
+    slow_release.store(false, .release);
+    var status: u16 = 0;
+    const slow = try std.Thread.spawn(.{}, sendSlow, .{ &wired.app, &status });
+    while (!slow_entered.load(.acquire)) std.Thread.yield() catch {};
+    for (0..20) |_| try testing.expectEqual(@as(u16, 201), (try wired.get("/fast")).status);
+    slow_release.store(true, .release);
+    slow.join();
+    try testing.expectEqual(@as(u16, 200), status);
+}
+
+var spawned_ran: std.atomic.Value(u32) = .init(0);
+
+fn bumpSpawned(by: u32) void {
+    _ = spawned_ran.fetchAdd(by, .monotonic);
+}
+
+fn spawnsWork(c: *@import("ctx.zig").Ctx) anyerror!void {
+    try @import("http.zig").spawn(bumpSpawned, .{5});
+    try c.sendText(202, "started");
+}
+
+test "a handler that spawns detached work sees it run under a Client once the client settles" {
+    spawned_ran.store(0, .release);
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+    try wired.app.get("/go", spawnsWork);
+
+    try testing.expectEqual(@as(u16, 202), (try wired.get("/go")).status);
+    wired.settle();
+    try testing.expectEqual(@as(u32, 5), spawned_ran.load(.acquire));
+}
+
+var leaving_go: std.atomic.Value(bool) = .init(false);
+
+/// Spawns again on its way out, after the test has started tearing down.
+fn spawnsOnItsWayOut() void {
+    var waited: usize = 0;
+    while (!leaving_go.load(.acquire) and waited < 1_000_000) : (waited += 1) std.Thread.yield() catch {};
+    for (0..10_000) |_| std.Thread.yield() catch {};
+    @import("http.zig").spawn(bumpSpawned, .{1}) catch {};
+}
+
+fn spawnsLeaver(c: *@import("ctx.zig").Ctx) anyerror!void {
+    try @import("http.zig").spawn(spawnsOnItsWayOut, .{});
+    try c.sendText(202, "started");
+}
+
+test "work that spawns while the last client is cutting it off does not hang the teardown" {
+    leaving_go.store(false, .release);
+    var wired = try Wired.init(testing.allocator, .{});
+    try wired.app.get("/go", spawnsLeaver);
+    try testing.expectEqual(@as(u16, 202), (try wired.get("/go")).status);
+    leaving_go.store(true, .release);
+    // Before the cut-off waited outside the runner's lock, this never
+    // returned: the work's `spawn` spun on the lock the cut-off held while
+    // it waited for that same work.
+    wired.deinit();
+}
+
+test "a gzipped request body goes in and a gzipped answer is read back decoded" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+    try wired.app.compress(.{});
+    try wired.app.post("/echo", echoBody);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var many: std.ArrayList(u8) = .empty;
+    for (0..60) |_| try many.appendSlice(a, "{\"name\":\"Alpha Widget\",\"tags\":[\"a\",\"b\",\"a\",\"b\"]}");
+    const plain_body = many.items;
+    const packed_body = try gzip(a, plain_body);
+    try testing.expect(packed_body.len < plain_body.len);
+
+    const answer = try wired.client.sendRequest(&wired.app, .{
+        .method = "POST",
+        .path = "/echo",
+        .body = packed_body,
+        .headers = &.{
+            .{ .name = "Content-Encoding", .value = "gzip" },
+            .{ .name = "Accept-Encoding", .value = "gzip" },
+        },
+    });
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqualStrings("gzip", answer.header("Content-Encoding").?);
+    try testing.expect(answer.body.len < plain_body.len);
+    try testing.expectEqualStrings(plain_body, try answer.decoded(a));
+
+    // Without the offer the answer is plain, and `decoded` is `bytes`.
+    const offered_not = try wired.client.sendRequest(&wired.app, .{
+        .method = "POST",
+        .path = "/echo",
+        .body = packed_body,
+        .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }},
+    });
+    try testing.expect(offered_not.header("Content-Encoding") == null);
+    try testing.expectEqualStrings(plain_body, try offered_not.decoded(a));
 }

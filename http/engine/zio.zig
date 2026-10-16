@@ -3142,12 +3142,105 @@ pub fn serverIo() ?std.Io {
 
 /// Start `func` in a fiber of its own, owned by the running server.
 ///
-/// `error.NoServer` if there is no server running, which is what a unit
-/// test calling a handler directly gets — the caller decides whether that
-/// is a failure or a no-op.
+/// **Three answers, by what is running** (ADR 028):
+///
+/// - A server: a fiber of the accept loop's group, counted while it runs and
+///   cut off when the grace period ends.
+/// - No server, but a test client alive (`testing.Client`, `Wired`; see
+///   `acquireTestRunner`): a task on that client's own `std.Io.Threaded`,
+///   which `Client.settle` waits for and `Client.deinit` cuts off. It is
+///   not a fiber of a zio Runtime and nothing counts it as a server would,
+///   but it runs `func` with `args` and lets a test see the effect.
+/// - Neither: `error.NoServer`, which is what a unit test calling a handler
+///   directly gets. The caller decides whether that is a failure or a no-op.
+///
+/// `spawnLocal` and `spawnLocalExact` keep the last answer in every case:
+/// what they start is a gRPC call that has an inline path of its own.
 pub fn spawn(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
-    const group = background.load(.acquire) orelse return error.NoServer;
-    return group.spawn(Spawned(func).run, .{args});
+    if (background.load(.acquire)) |group| return group.spawn(Spawned(func).run, .{args});
+    return spawnOnTestRunner(func, args);
+}
+
+// ---- the runner a test client lends `spawn` ----
+//
+// One per process, shared by every testing client alive at once and counted:
+// a client that came and went must not leave work of another test's
+// `Wired` without a runner. Held in statics rather than on the clients so
+// `spawn` finds it without being told, as it finds `background`. The lock is
+// a spin because it is held for a few instructions and `Io.Mutex` would
+// need the very `Io` this is making.
+
+var runner_lock: std.atomic.Value(bool) = .init(false);
+var runner_refs: usize = 0;
+/// Set while the last share is cutting off what still runs. The cut-off waits
+/// for that work outside the lock, so work that calls `spawn` on its way out
+/// gets `error.NoServer` instead of spinning on a lock its own cancel holds.
+var runner_closing: bool = false;
+var runner_threaded: std.Io.Threaded = undefined;
+var runner_group: std.Io.Group = .init;
+
+fn lockRunner() void {
+    while (runner_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.Thread.yield() catch {};
+}
+
+fn unlockRunner() void {
+    runner_lock.store(false, .release);
+}
+
+/// Take a share of the runner `spawn` falls back to when no server runs;
+/// the first share starts it. Pair every call with `releaseTestRunner`.
+pub fn acquireTestRunner() void {
+    lockRunner();
+    while (runner_closing) {
+        unlockRunner();
+        std.Thread.yield() catch {};
+        lockRunner();
+    }
+    defer unlockRunner();
+    if (runner_refs == 0) {
+        runner_threaded = .init(std.heap.page_allocator, .{});
+        runner_group = .init;
+    }
+    runner_refs += 1;
+}
+
+/// Give a share back. The last one cuts off whatever is still running (a
+/// ticker that never returns must not outlive the test) and stops the runner.
+pub fn releaseTestRunner() void {
+    lockRunner();
+    runner_refs -= 1;
+    if (runner_refs > 0) return unlockRunner();
+    runner_closing = true;
+    unlockRunner();
+    runner_group.cancel(runner_threaded.io());
+    runner_threaded.deinit();
+    lockRunner();
+    runner_closing = false;
+    unlockRunner();
+}
+
+/// Wait until everything `spawn` started on the test runner has returned.
+/// Work that never returns waits for ever: cancel by releasing the last
+/// share instead.
+pub fn settleTestRunner() void {
+    lockRunner();
+    const live = runner_refs > 0 and !runner_closing;
+    unlockRunner();
+    if (!live) return;
+    runner_group.await(runner_threaded.io()) catch {};
+}
+
+fn spawnOnTestRunner(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
+    const Run = struct {
+        fn run(a: std.meta.ArgsTuple(@TypeOf(func))) void {
+            const result = @call(.auto, func, a);
+            if (@typeInfo(@TypeOf(result)) == .error_union) _ = result catch {};
+        }
+    };
+    lockRunner();
+    defer unlockRunner();
+    if (runner_refs == 0 or runner_closing) return error.NoServer;
+    runner_group.concurrent(runner_threaded.io(), Run.run, .{args}) catch return error.NoServer;
 }
 
 /// `spawn`, on the executor of the fiber that calls it rather than the next

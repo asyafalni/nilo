@@ -92,6 +92,11 @@ pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]
     // `ReadFailed`. Both are the stream's fault and one answer.
     _ = inflating.reader.streamRemaining(&w) catch return error.BadEncodedBody;
     if (w.end != announced) return error.BadEncodedBody;
+    // The length agreeing is not the bytes agreeing: a flipped bit inside a
+    // literal decodes to a wrong byte of the right count. std's decoder reads
+    // the trailer's CRC-32 and compares nothing (Zig 0.17), so it is
+    // compared here.
+    if (std.hash.Crc32.hash(out[0..announced]) != inflating.container_metadata.gzip.crc) return error.BadEncodedBody;
     return out[0..announced];
 }
 
@@ -123,6 +128,19 @@ test "a gzipped body comes back as the bytes that were compressed, in one alloca
     defer arena.deinit();
     const out = try inflate(arena.allocator(), packed_bytes, 1 << 20);
     try testing.expectEqualStrings(text, out);
+}
+
+test "a stream whose bytes disagree with its CRC is refused, though its length agrees" {
+    const gpa = testing.allocator;
+    const text = repeat("{\"name\":\"wati\",\"tags\":[\"a\",\"b\"]}", 20);
+    const packed_bytes = try gzipped(gpa, text);
+    defer gpa.free(packed_bytes);
+    // The trailer's CRC, changed: the deflate data and ISIZE still decode
+    // to a body of exactly the announced length.
+    packed_bytes[packed_bytes.len - 8] ^= 0x01;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try testing.expectError(error.BadEncodedBody, inflate(arena.allocator(), packed_bytes, 1 << 20));
 }
 
 test "a stream that ends in an empty block, the way a flushed Go writer ends one, inflates whole" {

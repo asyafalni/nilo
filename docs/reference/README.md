@@ -197,6 +197,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
 
 - [Testing](./testing.md#testing-1)
   - [`testing.Client`](./testing.md#testingclient)
+  - [`nilo.spawn` under a client](./testing.md#nilospawn-under-a-client)
   - [`answer.json`](./testing.md#answerjson)
   - [`testing.Wired`](./testing.md#testingwired)
   - [`testing.Live`](./testing.md#testinglive)
@@ -316,6 +317,8 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [Responses with no body](./fetch.md#responses-with-no-body)
   - [Errors](./fetch.md#errors)
   - [Compression](./fetch.md#compression)
+  - [Sending a body compressed](./fetch.md#sending-a-body-compressed)
+  - [`fetch.Exchange.Upload`](./fetch.md#fetchexchangeupload)
   - [What it does not do](./fetch.md#what-it-does-not-do)
   - [`fetch.Target`](./fetch.md#fetchtarget)
   - [`fetch.Retry`](./fetch.md#fetchretry)

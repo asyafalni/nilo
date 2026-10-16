@@ -7766,6 +7766,74 @@ test "a stream nobody finished still leaves the connection usable" {
     try testing.expect(result.keep_alive);
 }
 
+/// Relays a source that fails after bytes have gone out.
+fn streamThenAbort(c: *Ctx) anyerror!void {
+    var out = try c.stream(200, "text/plain");
+    try out.writeAll("partial");
+    try out.flush();
+    try out.writeAll("lost in the buffer");
+    return out.abort();
+}
+
+/// The same, with the error ignored: App still breaks the response off.
+fn streamAbortAndReturn(c: *Ctx) anyerror!void {
+    var out = try c.stream(200, "text/plain");
+    try out.writeAll("partial");
+    try out.flush();
+    out.abort() catch {};
+    // Refused, not buffered, and `finish` after it changes nothing.
+    try testing.expectError(error.WriteFailed, out.writeAll("more"));
+    try out.finish();
+}
+
+fn promisedThenAbort(c: *Ctx) anyerror!void {
+    var out = try c.streamWith(200, "text/plain", .{ .length = 100 });
+    try out.writeAll("partial");
+    try out.flush();
+    return out.abort();
+}
+
+fn eventsThenAbort(c: *Ctx) anyerror!void {
+    var events = try c.events();
+    try events.send(.{ .data = "one" });
+    return events.abort();
+}
+
+test "a stream that is aborted ends the connection without the terminating chunk" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/returned", streamThenAbort);
+    try app.get("/ignored", streamAbortAndReturn);
+    try app.get("/promised", promisedThenAbort);
+    try app.get("/events", eventsThenAbort);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    for ([_][]const u8{ "/returned", "/ignored" }) |path| {
+        var request: [64]u8 = undefined;
+        const result = h.send(&app, try std.fmt.bufPrint(&request, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{path}));
+        // The head and the piece that was flushed went out, and nothing
+        // after them: no zero-length chunk to say the body is whole.
+        try testing.expect(std.mem.indexOf(u8, result.response, "Transfer-Encoding: chunked\r\n") != null);
+        const body = result.response[std.mem.indexOf(u8, result.response, "\r\n\r\n").? + 4 ..];
+        try testing.expectEqualStrings("7\r\npartial\r\n", body);
+        try testing.expect(!result.keep_alive);
+    }
+
+    // A body that promised a length is closed short of it.
+    const promised = h.send(&app, "GET /promised HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, promised.response, "Content-Length: 100\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, promised.response, "\r\n\r\npartial"));
+    try testing.expect(!promised.keep_alive);
+
+    // An event stream too: the end of a feed and its failure are different.
+    const events = h.send(&app, "GET /events HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, events.response, "data: one\n\n") != null);
+    try testing.expect(std.mem.indexOf(u8, events.response, "0\r\n\r\n") == null);
+    try testing.expect(!events.keep_alive);
+}
+
 fn streamManyPieces(c: *Ctx) anyerror!void {
     var body = try c.stream(200, "text/plain");
     for (0..200) |i| {
@@ -9103,7 +9171,157 @@ test "a gzipped body that does not decode is a 400 that names the coding, and on
     try testing.expect(std.mem.startsWith(u8, refused.response, "HTTP/1.1 413"));
 }
 
-test "a body read as a stream is not decoded, and says so with a 415" {
+/// Reads its body through `bodyStream` into a hash, so a body of any size is
+/// compared without being held: the decoded bytes' Wyhash, their count and
+/// the count of wire bytes `seen` reports.
+fn hashBody(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStreamWith(.{ .max_bytes = 256 * 1024 });
+    var buf: [1000]u8 = undefined;
+    var hasher: std.hash.Wyhash = .init(0);
+    var total: u64 = 0;
+    while (try incoming.read(&buf)) |part| {
+        hasher.update(part);
+        total += part.len;
+    }
+    try c.sendText(200, try std.fmt.allocPrint(c._arena, "{x}:{d}", .{ hasher.final(), total }));
+}
+
+/// What `hashBody` answers for `text`.
+fn hashOf(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{x}:{d}", .{ std.hash.Wyhash.hash(0, text), text.len });
+}
+
+/// 200 KB that compress and also run past the 32 KiB window many times, with
+/// back-references reaching across it.
+fn windowedText(gpa: std.mem.Allocator) ![]u8 {
+    const text = try gpa.alloc(u8, 200_000);
+    var prng: std.Random.DefaultPrng = .init(7);
+    const random = prng.random();
+    for (text, 0..) |*byte, i| byte.* = if (i % 5000 < 3000) "0123456789abcdef"[i % 16] else random.int(u8);
+    return text;
+}
+
+test "a gzip body read as a stream is decoded as it is read, and equals the plain bytes" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/hash", hashBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const text = try windowedText(testing.allocator);
+    defer testing.allocator.free(text);
+    const want = try hashOf(testing.allocator, text);
+    defer testing.allocator.free(want);
+
+    const raw = try gzippedRequest(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", text);
+    defer testing.allocator.free(raw);
+    const result = h.send(&app, raw);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, result.response, want));
+    try testing.expect(result.keep_alive);
+
+    // The plain body is read as it was, beside it.
+    const plain = try std.fmt.allocPrint(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}", .{ text.len, text });
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, plain).response, want));
+}
+
+test "a gzip body read as a stream across chunks is decoded the same, and an empty one is empty" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/hash", hashBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const text = repeat("a line of text that is sent chunked and gzipped, ", 400);
+    const want = try hashOf(testing.allocator, text);
+    defer testing.allocator.free(want);
+    const whole = try gzippedRequest(testing.allocator, "X: y\r\n", text);
+    defer testing.allocator.free(whole);
+    const packed_bytes = whole[std.mem.indexOf(u8, whole, "\r\n\r\n").? + 4 ..];
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try wire.appendSlice(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n");
+    var at: usize = 0;
+    while (at < packed_bytes.len) : (at += 37) {
+        const piece = packed_bytes[at..@min(at + 37, packed_bytes.len)];
+        try wire.print(testing.allocator, "{x}\r\n{s}\r\n", .{ piece.len, piece });
+    }
+    try wire.appendSlice(testing.allocator, "0\r\n\r\n");
+    const result = h.send(&app, wire.items);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, result.response, want));
+
+    // A header over no body decodes to no body.
+    const empty = h.send(&app, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, empty.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, empty.response, ":0"));
+}
+
+test "a gzip body that inflates past max_bytes is refused as it is read, however small it is on the wire" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/hash", hashBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    // 4 MiB of zeros is a few kilobytes of gzip, under every limit on the
+    // wire and sixteen times the route's `max_bytes` once inflated.
+    const bomb = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(bomb);
+    @memset(bomb, 0);
+    const raw = try gzippedRequest(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", bomb);
+    defer testing.allocator.free(raw);
+    try testing.expect(raw.len < 64 * 1024);
+    const result = h.send(&app, raw);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 413"));
+}
+
+test "a gzip body read as a stream that does not decode is the 400 body() gives" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/hash", hashBody);
+    try app.post("/echo", echoBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const text = repeat("0123456789abcdef", 2000);
+    const good = try gzippedRequest(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", text);
+    defer testing.allocator.free(good);
+
+    // Not gzip at all, a stream cut short, and a member followed by bytes
+    // that are not one: each is a 400 that names the coding.
+    const not_gzip = h.send(&app, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 27\r\n\r\n{\"name\":\"wati\",\"a\":1,\"b\":2}");
+    try testing.expect(std.mem.startsWith(u8, not_gzip.response, "HTTP/1.1 400"));
+
+    const body_at = std.mem.indexOf(u8, good, "\r\n\r\n").? + 4;
+    const cut_len = (good.len - body_at) / 2;
+    const cut = try std.fmt.allocPrint(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}", .{ cut_len, good[body_at..][0..cut_len] });
+    defer testing.allocator.free(cut);
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, cut).response, "HTTP/1.1 400"));
+
+    const tail = try std.fmt.allocPrint(testing.allocator, "POST /hash HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}trailing", .{ good.len - body_at + 8, good[body_at..] });
+    defer testing.allocator.free(tail);
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, tail).response, "HTTP/1.1 400"));
+
+    // A trailer whose CRC disagrees with the bytes: the length still agrees,
+    // and std's decoder compares no checksum, so this is the stream's own.
+    const flipped = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(flipped);
+    flipped[flipped.len - 8] ^= 0x01;
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, flipped).response, "HTTP/1.1 400"));
+
+    // The same bytes through `c.body()` are the same answer.
+    const through_body = h.send(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 27\r\n\r\n{\"name\":\"wati\",\"a\":1,\"b\":2}");
+    try testing.expect(std.mem.startsWith(u8, through_body.response, "HTTP/1.1 400"));
+}
+
+test "a body under a coding other than gzip is still a 415 to a route that reads it as a stream" {
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.post("/weigh", weighBody);
@@ -9111,11 +9329,27 @@ test "a body read as a stream is not decoded, and says so with a 415" {
 
     var h = Harness.init();
     defer h.deinit();
-    const raw = try gzippedRequest(testing.allocator, "POST /weigh HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", "twenty bytes of body");
-    defer testing.allocator.free(raw);
-    const result = h.send(&app, raw);
+    const result = h.send(&app, "POST /weigh HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\nContent-Length: 3\r\n\r\nabc");
     try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 415"));
-    try testing.expect(std.mem.indexOf(u8, result.response, "stream") != null);
+    try testing.expect(std.mem.indexOf(u8, result.response, "gzip") != null);
+}
+
+test "a route that names gzip in bodyEncodings reads the compressed bytes through bodyStream, undecoded" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.with(@import("bodyencodings.zig").with(.{"gzip"})).post("/weigh", weighBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const text = repeat("the same line again, ", 200);
+    const raw = try gzippedRequest(testing.allocator, "POST /weigh HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", text);
+    defer testing.allocator.free(raw);
+    const wire = raw[std.mem.indexOf(u8, raw, "\r\n\r\n").? + 4 ..];
+    const result = h.send(&app, raw);
+    const want = try std.fmt.allocPrint(testing.allocator, "\"bytes\":{d}", .{wire.len});
+    defer testing.allocator.free(want);
+    try testing.expect(std.mem.indexOf(u8, result.response, want) != null);
 }
 
 // ---- who the client is (X-Forwarded-For) ----

@@ -16,6 +16,10 @@ const Program = struct {
     imports: []const []const u8,
     /// Built with `.sql = true`, the flag that brings pg.zig and SQLite.
     sql: bool = false,
+    /// Built with `.fetch_gzip = true`, and only when the package is given
+    /// `-Dfetch_gzip`: a ref older than the flag refuses the option, so
+    /// nothing that names it is configured by default (ADR 292).
+    fetch_gzip: bool = false,
 };
 
 pub const programs = [_]Program{
@@ -28,6 +32,7 @@ pub const programs = [_]Program{
     .{ .name = "proto", .imports = &.{"nilo_proto"} },
     .{ .name = "fetch", .imports = &.{ "nilo_fetch", "nilo_core" } },
     .{ .name = "fetch_ws", .imports = &.{ "nilo_fetch", "nilo_core" } },
+    .{ .name = "fetch_gzip", .imports = &.{ "nilo_fetch", "nilo_core" }, .fetch_gzip = true },
     .{ .name = "job", .imports = &.{ "nilo_job", "nilo_core" } },
     .{ .name = "job_zoned", .imports = &.{"nilo_job"} },
     .{ .name = "sql", .imports = &.{ "nilo_sql", "nilo_core" }, .sql = true },
@@ -38,6 +43,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Leave debug info out, as every size here is measured") orelse true;
+    // Every program that names nilo_fetch is built with the flag when this is
+    // given, so `fetch` and `fetch_gzip` can be compared on one binary size.
+    const fetch_gzip = b.option(bool, "fetch_gzip", "Build against nilo with `.fetch_gzip = true` (ADR 292)") orelse false;
 
     const harness = b.createModule(.{
         .root_source_file = b.path("harness.zig"),
@@ -47,8 +55,14 @@ pub fn build(b: *std.Build) void {
 
     for (programs) |p| {
         const step = b.step(p.name, b.fmt("Build the program that measures nilo_{s}", .{p.name}));
+        if (p.fetch_gzip and !fetch_gzip) {
+            step.dependOn(&b.addFail("this program needs -Dfetch_gzip").step);
+            continue;
+        }
         const nilo = if (p.sql)
             b.dependency("nilo", .{ .target = target, .optimize = optimize, .sql = true })
+        else if (fetch_gzip)
+            b.dependency("nilo", .{ .target = target, .optimize = optimize, .fetch_gzip = true })
         else
             b.dependency("nilo", .{ .target = target, .optimize = optimize });
 

@@ -48,6 +48,10 @@ pub const Error = error{
     /// promised a `Content-Length` and stopped short, or closed inside a
     /// chunk's data. Not the clean end `read` reports as null (ADR 019).
     BodyTruncated,
+    /// The body arrived under `Content-Encoding: gzip` and is not a gzip
+    /// stream: corrupt, cut short, or followed by more bytes than one member
+    /// (ADR 089).
+    BadEncodedBody,
     ReadFailed,
     EndOfStream,
     WriteFailed,
@@ -149,6 +153,10 @@ pub const Body = struct {
     /// behind this — a Body a test built against a fixed reader. A stretch of
     /// handler time ends at every read (ADR 013).
     _watch: ?*watchdog.Watch = null,
+    /// The gzip layer, in the request arena, when the body arrived under
+    /// `Content-Encoding: gzip` (`decodeGzip`, ADR 089). Null otherwise, and
+    /// the only thing a body that is not gzip carries of it.
+    _gz: ?*Gzip = null,
 
     /// The body as a buffered `std.Io.Reader`, for a parser that peeks, takes
     /// a line or refills as it goes: `std.json.Reader`, `takeDelimiter` over
@@ -257,7 +265,29 @@ pub const Body = struct {
             else
                 error.BadChunk;
         }
+        if (self._gz) |g| switch (g.failed) {
+            .none => {},
+            .too_large => return error.BodyTooLarge,
+            .bad => return error.BadEncodedBody,
+        };
         return error.ReadFailed;
+    }
+
+    /// Read the body through a gzip decoder, bounded on decoded bytes by
+    /// `max_bytes` (ADR 089). One arena allocation of `@sizeOf(Gzip)` bytes
+    /// (72,000 or so: the decoder's tables, its 64 KiB window and a 4 KiB
+    /// input buffer), made here and only for a body that arrived gzipped.
+    /// The arena is where a byte is cheapest (ADR 062): a handler's stack
+    /// would keep it for the life of the connection.
+    pub fn decodeGzip(self: *Body, arena: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const g = try arena.create(Gzip);
+        g.* = .{
+            .body = self,
+            .raw = .{ .vtable = &.{ .stream = Gzip.rawStream }, .buffer = &g.raw_buffer, .seek = 0, .end = 0 },
+            .dec = undefined,
+        };
+        g.dec = .init(&g.raw, .gzip, &g.window);
+        self._gz = g;
     }
 
     /// nilo's own: `Ctx.bodyStream` builds one of these.
@@ -379,7 +409,12 @@ pub const Body = struct {
         // not.
         const token = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, token);
+        if (self._gz) |g| return g.pull(self, w, limit);
+        return self.pullWire(w, limit);
+    }
 
+    /// The bytes of the body as they came on the wire, de-framed.
+    fn pullWire(self: *Body, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const run = try self.runLength();
         if (run == 0) return error.EndOfStream;
         const open = self.transported();
@@ -398,6 +433,13 @@ pub const Body = struct {
         const token = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, token);
 
+        if (self._gz) |g| {
+            var gone: std.Io.Writer.Discarding = .init(&.{});
+            return g.pull(self, &gone.writer, limit) catch |err| switch (err) {
+                error.WriteFailed => unreachable,
+                else => |e| e,
+            };
+        }
         const run = try self.runLength();
         if (run == 0) return error.EndOfStream;
         const open = self.transported();
@@ -405,6 +447,95 @@ pub const Body = struct {
         self.advance(n);
         if (open and self._progress.seen > self._progress.max_bytes) return self.breakOff();
         return n;
+    }
+};
+
+/// A body under `Content-Encoding: gzip`, decoded as it is read (ADR 089).
+///
+/// `std.compress.flate.Decompress` in the mode that keeps its own window: the
+/// shortcut `encoded.zig` takes for `c.body()` (the destination is the
+/// history) needs a destination that holds the whole body, and a streamed
+/// read writes into the caller's buffer, which may be eight bytes. So the
+/// window is a buffer of its own, and it lives here, in the request arena,
+/// allocated only for a body that arrived gzipped: a request without one pays
+/// nothing, and a fiber's stack, which is kept for the life of the
+/// connection, never holds it (ADR 062).
+///
+/// **Two bounds.** The bytes on the wire are held to `max_bytes` as for any
+/// body, and the decoded bytes to the same number, counted here: a body that
+/// inflates past it is `error.BodyTooLarge`, found as the byte that crosses
+/// it is produced, never after an allocation of the announced size. A
+/// compressed body is smaller than what it holds, so the second bound is the
+/// one that bites; the first stops a stream of empty blocks that never
+/// decodes to anything.
+pub const Gzip = struct {
+    /// The `Body` the handler holds, refreshed at each read: it is returned by
+    /// value from `bodyStreamWith`, so its address at the time of `decodeGzip`
+    /// is not the one the handler keeps.
+    body: *Body,
+    /// The wire bytes, de-framed, for the decoder to read.
+    raw: std.Io.Reader,
+    dec: std.compress.flate.Decompress,
+    decoded: u64 = 0,
+    /// What went by, checked against the member's trailer when it ends:
+    /// `std.compress.flate.Decompress` reads the trailer and compares nothing
+    /// (Zig 0.17), so without this a flipped byte would decode silently.
+    crc: std.hash.Crc32 = .init(),
+    failed: enum { none, too_large, bad } = .none,
+    raw_buffer: [4096]u8 = undefined,
+    window: [std.compress.flate.max_window_len]u8 = undefined,
+
+    fn rawStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Gzip = @alignCast(@fieldParentPtr("raw", r));
+        return self.body.pullWire(w, limit);
+    }
+
+    fn pull(self: *Gzip, body: *Body, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        self.body = body;
+        const max = body._progress.max_bytes;
+        // One byte past the ceiling is asked for, so a body that goes on past
+        // it is told from one that ends there.
+        const ask = limit.min(.limited64(max - self.decoded +| 1));
+        var hashed: std.Io.Writer.Hashed(std.hash.Crc32) = .initHasher(w, self.crc, &.{});
+        defer self.crc = hashed.hasher;
+        const n = self.dec.reader.stream(&hashed.writer, ask) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            error.EndOfStream => return self.ended(hashed.hasher.final()),
+            error.ReadFailed => {
+                // The wire failed (cut, slow, too large), and that is what
+                // `explain` says; otherwise the decoder did. A body with no
+                // bytes at all under the header is an empty body, as
+                // `body()` reads it.
+                const wire_failed = body._progress.state == .cut or body._progress.state == .broken;
+                if (!wire_failed) {
+                    if (body._progress.seen == 0 and self.dec.err != null and self.dec.err.? == error.EndOfStream) return error.EndOfStream;
+                    self.failed = .bad;
+                }
+                return error.ReadFailed;
+            },
+        };
+        self.decoded += n;
+        if (self.decoded > max) {
+            self.failed = .too_large;
+            return error.ReadFailed;
+        }
+        return n;
+    }
+
+    /// The gzip member ended: so must the body, or it carried a second member
+    /// or bytes that are not gzip, which `c.body()` refuses as well.
+    fn ended(self: *Gzip, crc: u32) std.Io.Reader.StreamError {
+        const trailer = self.dec.container_metadata.gzip;
+        if (trailer.crc != crc or trailer.count != @as(u32, @truncate(self.decoded))) {
+            self.failed = .bad;
+            return error.ReadFailed;
+        }
+        _ = self.raw.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        self.failed = .bad;
+        return error.ReadFailed;
     }
 };
 
