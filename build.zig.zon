@@ -95,6 +95,14 @@
             .hash = "N-V-__8AANkgBgCZosn_JabRa_Pm-AMJtzCRfMWzALMRadIE",
             .lazy = true,
         },
+        // libzstd behind `-Dzstd` (ADR 295), lazy and behind its flag for
+        // the reason libdeflate is. The upstream release tarball, compiled by
+        // `build.zig` itself, so a Zig release changes nothing here.
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+            .lazy = true,
+        },
     },
     // One directory per module that ships (ADR 038), and this list is the
     // one place that has to remember they exist — held by a comptime check
@@ -110,6 +118,7 @@
         "cache",
         "jwt",
         "proto",
+        "zstd",
         "fetch",
         "job",
         "http",

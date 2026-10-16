@@ -8,7 +8,7 @@ Read the guide to learn what something is for, and this reference for its exact 
 
 ## Modules
 
-Twelve modules ship, and a project links only the ones it imports ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
+Thirteen modules ship, and a project links only the ones it imports ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 | Module | What it is | Page |
 |---|---|---|
@@ -21,6 +21,7 @@ Twelve modules ship, and a project links only the ones it imports ([ADR 038](../
 | `nilo_cache` | an expiring cache in this process | [`cache.md`](./cache.md) |
 | `nilo_jwt` | verifying a token someone else signed | [`jwt.md`](./jwt.md) |
 | `nilo_proto` | protobuf messages read and written as plain structs | [`proto.md`](./proto.md) |
+| `nilo_zstd` | zstd compressed and decompressed in memory the caller provides | [`zstd.md`](./zstd.md) |
 | `nilo_fetch` | calling another service's HTTP API | [`fetch.md`](./fetch.md) |
 | `nilo_job` | work that runs later, again, or on a schedule, queued in your database | [`job.md`](./job.md) |
 | `nilo_core` | `Str`, the [Scope](./core.md#scope) and [percent coding](./core.md#nilo_corepercent), shared by the other modules | [`core.md`](./core.md) |
@@ -409,3 +410,16 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [Errors](./proto.md#errors)
   - [`proto.Reader`](./proto.md#protoreader)
   - [What it does not do](./proto.md#what-it-does-not-do)
+
+**[nilo_zstd](./zstd.md)**: `nilo_zstd` compresses and decompresses zstd with libzstd's contexts placed in memory the caller provides, behind `.zstd = true`, with no allocation inside and no libc.
+
+- [`nilo_zstd`](./zstd.md#nilo_zstd-1)
+  - [`zstd.EncodeOptions`](./zstd.md#zstdencodeoptions)
+  - [`zstd.Compressor`](./zstd.md#zstdcompressor)
+  - [`zstd.StreamCompressor`](./zstd.md#zstdstreamcompressor)
+  - [`zstd.Decompressor`](./zstd.md#zstddecompressor)
+  - [`zstd.StreamDecoder`](./zstd.md#zstdstreamdecoder)
+  - [`zstd.Frame`](./zstd.md#zstdframe)
+  - [`zstd.CompressorPool` and `zstd.DecompressorPool`](./zstd.md#zstdcompressorpool-and-zstddecompressorpool)
+  - [Errors](./zstd.md#errors)
+  - [What it does not do](./zstd.md#what-it-does-not-do)

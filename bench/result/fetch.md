@@ -670,6 +670,63 @@ On 4 KB the three levels are within 10 us of each other (`.best` aside), and a 6
 
 **Can it go further.** libdeflate does this in a quarter to a third of the time (ADR 248) and `nilo_fetch` cannot name it today; that is a flag on the module if a caller's CPU asks for it.
 
+## Sending and reading zstd: what it costs (ADR 295)
+
+**What was run.** On 16 October 2026, AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.17.0, at `33eff19` plus the working tree (the base is `git archive 33eff19` built in a scratch directory with the same harness the same afternoon), other tracks building at the same time. `bench/release/fetch.zig` (the control), `fetch_gzip.zig` and the new `fetch_zstd.zig` (a 4 KiB or 1 MiB JSON answer under the coding, decoded into the Scope) and `fetch_zstd_send.zig` (a POST of a body of that size under `fetch.zstd`, `fetch.gzip`, or no coding: the constants at the top of the file), built `-Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3`, stripped for sizes. Instructions are `perf stat -e instructions:u` pinned to a core at two counts, the difference over the difference (4 KB: 2,000 and 12,000 for reading and 50 and 250 for sending; 1 MiB: 10 and 40); CPU time is `task-clock` over the same counts, best of three. The bodies are synthetic JSON records (`{"id":N,"name":"container-N","state":"running"}`), so the ratios are a ceiling for real ones.
+
+**Binary size, `bench/release/fetch.zig`, stripped:**
+
+| build | bytes | over base |
+|---|---|---|
+| `33eff19` | 953,760 | |
+| this tree, no flag | 953,760 | +0 |
+| this tree, `-Dzstd` | 953,760 | +0 |
+| this tree, `-Dfetch_gzip` | 977,648 | +23,888 |
+| this tree, `-Dfetch_zstd` | 1,045,888 | +92,128 |
+| this tree, both | 1,068,992 | +115,232 |
+
+| program that posts a runtime-sized body | bytes | over naming no coding |
+|---|---|---|
+| naming no coding | 957,552 | |
+| `fetch.gzip` | 1,019,248 | +61,696 |
+| `fetch.zstd` | 1,413,456 | +455,904 |
+
+A build that does not pass `-Dfetch_zstd` and a program that does not write `fetch.zstd` are byte for byte the size they were, including a build that passed `-Dzstd`: the import of `nilo_zstd` in `fetch/` is lazy. The 455,904 are the encoder and the estimate functions (stage 1 measured +409,696 for a program that only compresses); the four-function vtable of a `Coding` links the one-shot and the streaming compressor together, which is the price of a coding being a value (ADR 293), and a program that sends only slices pays for the stream it never opens. Pulling the stream out of the vtable would take the upload to its own constant; not done, nothing asks.
+
+**Stack, the frame of the function the call chain inlines into** (`sub $N,%rsp` of `start.posixCallMainAndExit`, unstripped): 5,960 B at `33eff19`, and 5,960 B for this tree with no flag, with `-Dfetch_zstd`, and with both flags. The decoder is one pointer on the `Exchange` and the contexts are on the heap.
+
+**CPU a call reading (instructions, time a call):**
+
+| decoded | gzip | zstd |
+|---|---|---|
+| 4 KiB | 123,525 | 58,841 (11 us against 24) |
+| 1 MiB | 18.2 million (2,145 us) | 7.9 million (406 us) |
+
+The plain 100-byte answer is unchanged by either flag (the control, `fetch.zig`, ran at 9,798 and 9,747 for ADR 292). Heap per answer, from the client's allocator: gzip 73,136 bytes; zstd 16.5 KB and then the context, 112,416 bytes for a small announced frame, 1,537,824 for one that announces a megabyte, 2,586,400 for a stream that announces nothing (level 3's 2^21 window) and 8,877,856 at the 8 MB cap. The 4 KiB and 1 MiB frames above announce their length.
+
+**CPU a call sending (instructions over the same call with no coding; CPU time a call; compressed size):**
+
+| body | coding | instructions | CPU | wire |
+|---|---|---|---|---|
+| 4,057 B | none | 9,152 | 38 us | 4,057 |
+| 4,057 B | gzip default | 285,273 | 70 us | 390 |
+| 4,057 B | zstd default | 99,878 | 43 us | 226 |
+| 1,048,546 B | none | 18,250 | 58 us | 1,048,546 |
+| 1,048,546 B | gzip default | 81.2 million | 5,361 us | 73,048 |
+| 1,048,546 B | zstd default | 13.5 million | 552 us | 31,702 |
+
+By level on the megabyte: gzip fastest 72,440 B, default 73,048, best 59,521; zstd fastest 25,760, default 31,702, best (level 6) 20,400. On 4 KB the three zstd levels are within 7 bytes of each other. zstd is about a third of gzip's instructions on 4 KB, a sixth on a megabyte, and 42 to 57% smaller.
+
+**Compressor memory** (`Compressor.contextSize`, kept in the `Client`'s stash up to 4 MiB): level 1, 73,744 bytes for 4 KB and 582,672 for a megabyte; level 3, 90,128 and 1,303,568; level 6, 90,128 and 3,662,864; level 12, 275,919 and 13,100,048; level 19, 275,919 and 18,088,078. A chunked upload with the window held to 2^18: 1,107,473 at level 1, 1,828,369 at 3, 4,187,665 at 6, 26,207,761 at 10, 51,373,585 at 12, 85,721,743 at 19. These are why `.best` is 6 and why a context over 4 MiB is freed with its call.
+
+**What the rows decided.** zstd's `.best` is 6, not 19: 19 is about 0.2 s a megabyte (stage 1) and 18 MB of context. `Level` became `.fastest | .default | .best | .exact` so one value names a level in either coding. The kept context is capped at 4 MiB. A zstd body refused by a server that reads gzip goes out plain, not gzipped, because the other compressor would be linked into every program that sends zstd. The decoder is sized at the first read, not when the answer announces zstd, because the frame's header says what it needs (112 KB against the 2.6 MB a level 3 stream needs).
+
+**Found on the way, not fixed (not zstd's).** A POST of a body larger than the write buffer on a pooled connection took **41 ms a call** against the release program's upstream (a plain `std.Io.net` server on a thread): `nilo_fetch` does not set `TCP_NODELAY`, std writes the head and the body as separate segments, and the Nagle algorithm holds the second until the peer's delayed ACK. It is the same with no coding at all (`send_none`), so it is the 41 ms of `send_gzip_4096` and `send_zstd_4096` too, and it is why the instruction counts above are the figure and the wall clock is not. `http/engine/zio.zig` sets `setNoDelay(true)` on its sockets; the client's connections are std's. Worth its own entry in `docs/todo.md`.
+
+**Can it be pushed further.** The 1 MiB read is libzstd's decoder at about 2.6 GB/s of output on this body; the 4 KiB read is 58,841 instructions of which the plain call is 9,800 (where the rest goes was not profiled). The send side is libzstd's `compress2` at level 3; `.fastest` on a megabyte is 20% smaller than `.default` on this body and not faster at this size, which is the body and not the library. A trained dictionary would beat a factor of two on the 4 KB body (ADR 295); not built.
+
+**Not measured.** An HTTPS answer (the decode is below the TLS reader); a flag-on build under load with many connections decoding at once (each holds 16.5 KB and its context for the length of its read, so 500 concurrent small zstd answers hold 64 MB); `bench/release.py` columns, because `fetch_zstd` and `fetch_zstd_send` are built only with `-Dfetch_zstd` and `-Dzstd`, which a ref older than the flags refuses.
+
 ## What is still missing
 
 - **A quiet machine.** The load average was between 6 and 18 across these runs

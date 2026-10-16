@@ -361,7 +361,7 @@ The response only mentions it when there is something to say: `Connection: close
 try app.compress(.{});
 ```
 
-From then on, every answer that is text, at least a kilobyte long, and going to a client whose `Accept-Encoding` accepts gzip goes out gzipped, whether it came from `sendJson`, `sendText`, `send` or a typed handler returning a value. The response carries `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that sent no `Accept-Encoding`, or `gzip;q=0`, gets the body unchanged and no `Content-Encoding`.
+From then on, every answer that is text, at least a kilobyte long, and going to a client whose `Accept-Encoding` accepts gzip goes out gzipped (or zstd, see below), whether it came from `sendJson`, `sendText`, `send` or a typed handler returning a value. The response carries `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that sent no `Accept-Encoding`, or `gzip;q=0`, gets the body unchanged and no `Content-Encoding`.
 
 | | Default |
 |---|---|
@@ -385,6 +385,15 @@ const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .li
 ```
 
 Nothing in your code changes, and the same bodies go out gzipped. A 4 KB JSON answer takes about 9 µs rather than 37 and comes out a little smaller, a megabyte about 2.4 ms rather than 7, and a server on sixteen threads holds less memory than the default build, because a libdeflate compressor costs nothing resident until it is used. What you pay is about 42 KB of binary and a C library compiled into it, with no libc needed; a build without the flag fetches and compiles none of it.
+
+**A build can also answer zstd.** Passing `.zstd = true` to the dependency (`-Dzstd` in this repository) builds libzstd into the program, and `app.compress(.{})` then answers a client that asks for `zstd` in zstd, with no change in your code ([ADR 295](../adr/295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)):
+
+```zig
+// build.zig
+const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .zstd = true });
+```
+
+The client picks by `Accept-Encoding`: the highest `q` wins and **zstd wins a tie**, so a browser's `gzip, deflate, br, zstd` gets zstd, curl's `gzip, deflate` gets gzip, `zstd;q=0` is never given zstd, and a client that takes gzip is never left without when zstd cannot answer. The answer carries `Content-Encoding: zstd` and the same `Vary`, weak `ETag` and left-alone cases as gzip. **What it buys is time first:** a 4 KB JSON answer takes about 5 µs where libdeflate's takes 10 and the standard library's 25, a megabyte takes 0.5 ms where libdeflate takes 2.4 and is 13% smaller; at 40 KB to 160 KB a libdeflate gzip is 8% to 19% smaller than zstd's. **What it costs** is a second compressor per thread, 1.3 MB of address space each at the default `max_bytes` (90 KB resident after a small body, 0.9 MB after a megabyte), about 410 KB of binary, and a body over `max_bytes` (a megabyte where that is zero) going to gzip. `.zstd = false` in the options keeps gzip alone in a build that has the flag. A build without the flag fetches and links none of it. In a test, `answer.decoded(arena)` reads the answer back.
 
 ## Content types
 

@@ -3,6 +3,7 @@
 **Status:** accepted
 **Topic:** [http1-protocol](../design/http1-protocol.md)
 **Extends:** [ADR 089](./089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
+**Applies:** [ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md) (zstd is a coding a build can read)
 
 ## Context
 
@@ -36,7 +37,7 @@
 
 **Adding the compile-time check for a typed body on a route that names a coding.** The chain is resolved at `listen()`, where a global `use` can add the middleware to a route written without it, so the compiler cannot see the pair. The run-time 415 is the check that holds.
 
-**Decoding snappy or zstd in nilo**, so the route need not. A codec per coding is binary size on the axis ADR 017 holds, for formats the handler's author already has a library for, and it would be one more coding to answer for. If one is common enough to earn it, it is its own decision, and this one is the seam it would sit behind.
+**Decoding snappy or zstd in nilo**, so the route need not. Snappy stays refused. zstd moved ([ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)): a build with `-Dzstd` decodes it, and the reason was a caller that sends it to a nilo server and a library that costs its binary size only in the program that asks. The seam this ADR is still holds for it: **naming `"zstd"` in `bodyEncodings` passes the frame through undecoded in either build**, as naming `"gzip"` does, and the 415's `Accept-Encoding` lists `zstd` once, whether the build reads it or the chain names it. The original reasoning follows. A codec per coding is binary size on the axis ADR 017 holds, for formats the handler's author already has a library for, and it would be one more coding to answer for. If one is common enough to earn it, it is its own decision, and this one is the seam it would sit behind.
 
 ## What it costs
 

@@ -1,6 +1,6 @@
 # nilo
 
-An HTTP framework for Zig, and the toolkit it is built from: twelve modules for the ordinary jobs, of which the largest is the framework. It puts the comfort of writing code first, and keeps performance alongside it rather than after it. It is aimed at people who are used to Go or Node and are giving Zig a try.
+An HTTP framework for Zig, and the toolkit it is built from: thirteen modules for the ordinary jobs, of which the largest is the framework. It puts the comfort of writing code first, and keeps performance alongside it rather than after it. It is aimed at people who are used to Go or Node and are giving Zig a try.
 
 ## Language
 

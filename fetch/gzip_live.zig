@@ -288,7 +288,7 @@ test "an Exchange pipes the decoded body, under a stall bound as well" {
                 .method = .GET,
                 .url = try canned.url(&url_buf),
                 .stall_ms = 5_000,
-                .gzip = true,
+                .decode = true,
             });
             // The length on the wire, which is not the length of the body.
             try testing.expectEqual(@as(?u64, canned.body_len), head.content_length);

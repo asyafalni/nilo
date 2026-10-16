@@ -92,6 +92,19 @@ pub const Options = struct {
     /// a download is better compressed ahead of time or not at all. Zero
     /// takes the limit off (ADR 211).
     max_bytes: usize = 1024 * 1024,
+    /// Whether a client that asks for `zstd` is answered in it (ADR 295). On
+    /// by default and **only meaningful in a build that has `-Dzstd`**: without
+    /// the flag there is no encoder, nothing reads this, and gzip answers
+    /// exactly as it always did. Off in a build that has it, the App holds no
+    /// zstd compressors at all (a `.zstd` build that wants gzip's behaviour and
+    /// not zstd's memory).
+    ///
+    /// **The body ceiling for zstd is `max_bytes`, and a megabyte where that
+    /// is zero**: a zstd context is sized for the largest body it will take
+    /// (1,303,568 bytes mapped a thread for a megabyte at `.default`), so
+    /// "no limit" cannot be a context for any length. A body over it goes to
+    /// gzip, which has no such bound.
+    zstd: bool = true,
 };
 
 pub const Level = enum {
@@ -107,6 +120,18 @@ pub const Level = enum {
         };
     }
 
+    /// zstd's level for each name (ADR 295): 1, 3 and 6. `.best` is 6 and not
+    /// 19: level 6 takes about what libdeflate's default takes on a megabyte
+    /// (2.4 ms), so the time `max_bytes` bounds holds for every name, and the
+    /// levels above it are for a file compressed once at load.
+    pub fn zstdLevel(self: Level) i32 {
+        return switch (self) {
+            .fastest => 1,
+            .default => 3,
+            .best => 6,
+        };
+    }
+
     /// libdeflate's level for each name (ADR 248). `.best` is 7 and not 9:
     /// on a megabyte libdeflate 9 takes 17.7 ms, longer than the standard
     /// library's own `.best`, and 7 is smaller than that in 4.2 ms, which
@@ -119,6 +144,20 @@ pub const Level = enum {
         };
     }
 };
+
+/// Whether this build answers `Accept-Encoding: zstd` (ADR 295): the build
+/// passed `.zstd = true`. A program without it links no zstd.
+pub const zstd_enabled = build_options.zstd;
+
+/// Whether libzstd is in this program at all. True in a build that chose it,
+/// and in this repository's own http test root whichever was chosen, so the
+/// tests below hold the zstd pool in every run (as `libdeflate_linked` does).
+pub const zstd_linked = build_options.zstd_linked;
+
+const zstd = if (zstd_linked) @import("nilo_zstd") else struct {};
+
+/// The ceiling on a body zstd compresses when `max_bytes` is zero.
+const zstd_default_max: usize = 1024 * 1024;
 
 /// Which deflate this build gzips with (ADR 248). The standard library's
 /// unless the build passed `.libdeflate = true`, and the same answer for
@@ -142,8 +181,16 @@ pub const Pool = PoolOf(backend);
 /// is never analysed, which is what takes `std.flate`'s compressor out of a
 /// libdeflate build (ADR 248).
 pub fn PoolOf(comptime which: Backend) type {
+    return PoolWith(which, zstd_enabled);
+}
+
+/// `PoolOf` with zstd named: a test holds the pool with zstd in a build that
+/// did not ask for it, as it holds both gzip backends (ADR 295).
+pub fn PoolWith(comptime which: Backend, comptime with_zstd: bool) type {
     if (which == .libdeflate and !libdeflate_linked)
         @compileError("libdeflate is not linked into this build: pass `.libdeflate = true` to the nilo dependency (ADR 248)");
+    if (with_zstd and !zstd_linked)
+        @compileError("libzstd is not linked into this build: pass `.zstd = true` to the nilo dependency (ADR 295)");
     return struct {
         const Self = @This();
 
@@ -164,6 +211,12 @@ pub fn PoolOf(comptime which: Backend) type {
         /// libdeflate's compressors, all in one mapping kept off huge
         /// pages; nothing for the standard library's, which live in `slots`.
         mapping: Mapping,
+        /// zstd's compressors, one per thread in a mapping of their own (the
+        /// pool is `zstd.CompressorPool`), or null when `Options.zstd` is off.
+        /// Nothing at all in a build without zstd (ADR 295).
+        zstd_slots: ZstdSlots = if (with_zstd) null else {},
+
+        const ZstdSlots = if (with_zstd) ?zstd.CompressorPool else void;
 
         const Mapping = if (which == .libdeflate) []align(std.heap.page_size_min) u8 else void;
 
@@ -199,12 +252,22 @@ pub fn PoolOf(comptime which: Backend) type {
                 },
                 .libdeflate => try placeCompressors(slots, options.level.libdeflateLevel()),
             };
-            return .{
+            errdefer if (which == .libdeflate) std.heap.page_allocator.free(mapping);
+            var self: Self = .{
                 .slots = slots,
                 .free = free,
                 .options = options,
                 .mapping = mapping,
             };
+            if (with_zstd and options.zstd) {
+                self.zstd_slots = try zstd.CompressorPool.init(gpa, count, .{ .level = options.level.zstdLevel() }, zstdCeiling(options));
+            }
+            return self;
+        }
+
+        /// The largest body a zstd slot is sized for.
+        fn zstdCeiling(options: Options) usize {
+            return if (options.max_bytes == 0) zstd_default_max else options.max_bytes;
         }
 
         /// Every compressor in one mapping of its own, each starting on a
@@ -237,6 +300,7 @@ pub fn PoolOf(comptime which: Backend) type {
         }
 
         pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            if (with_zstd) if (self.zstd_slots) |*z| z.deinit(gpa);
             if (which == .libdeflate) std.heap.page_allocator.free(self.mapping);
             gpa.free(self.free);
             gpa.free(self.slots);
@@ -325,8 +389,70 @@ pub fn PoolOf(comptime which: Backend) type {
             if (squeezed.len >= body.len) return null;
             return squeezed;
         }
+
+        /// Whether this pool holds zstd compressors: a build with zstd and an
+        /// `Options.zstd` that was not turned off.
+        pub fn offersZstd(self: *const Self) bool {
+            return with_zstd and self.zstd_slots != null;
+        }
+
+        /// A body compressed in the coding the client prefers, or null when
+        /// it should go out as it is (ADR 295). `accept` is the request's
+        /// `Accept-Encoding`. **The highest `q` wins and zstd wins a tie**
+        /// (`negotiateResponse`); a zstd that cannot answer (every compressor
+        /// out, a body over its ceiling, the frame no smaller) falls to gzip
+        /// when the client takes it, so choosing the better coding never makes
+        /// an answer worse than the one gzip alone would have given.
+        pub fn encode(self: *const Self, arena: std.mem.Allocator, body: []const u8, accept: ?[]const u8) ?Encoded {
+            return self.encodeAt(arena, body, accept, bulkhead.executorIndex());
+        }
+
+        /// `encode` for a caller that knows which executor thread it is on
+        /// (`gzipAt` explains why one exists).
+        pub fn encodeAt(self: *const Self, arena: std.mem.Allocator, body: []const u8, accept: ?[]const u8, hint: ?usize) ?Encoded {
+            const have_zstd = with_zstd and self.zstd_slots != null and body.len <= zstdCeiling(self.options);
+            switch (negotiateResponse(accept, have_zstd)) {
+                .identity => return null,
+                .gzip => {},
+                .zstd => {
+                    if (with_zstd) if (self.zstdAt(arena, body, hint)) |bytes| return .{ .bytes = bytes, .coding = .zstd };
+                    if (!acceptsGzip(accept)) return null;
+                },
+            }
+            const bytes = self.gzipAt(arena, body, hint) orelse return null;
+            return .{ .bytes = bytes, .coding = .gzip };
+        }
+
+        /// `body` as one zstd frame in the arena, or null when no compressor
+        /// is free or the frame is no smaller. The destination is half the
+        /// body plus 64, as gzip's is: a body that compresses worse than that
+        /// is sent as it is (`NoRoom`), which is also the answer for text that
+        /// zstd cannot shrink.
+        fn zstdAt(self: *const Self, arena: std.mem.Allocator, body: []const u8, hint: ?usize) ?[]const u8 {
+            // A copy of the pool's two slices and a mapping: borrowing writes
+            // the flags they point at and not this struct, which is why the
+            // App can lend the pool as const.
+            var pool = self.zstd_slots orelse return null;
+            const c = pool.borrow(hint orelse 0) orelse return null;
+            defer pool.give(c);
+            const dst = arena.alloc(u8, body.len / 2 + 64) catch return null;
+            const out = c.compress(dst, body) catch return null;
+            if (out.len >= body.len) return null;
+            return out;
+        }
     };
 }
+
+/// What `Pool.encode` produced and what to call it on the wire.
+pub const Encoded = struct {
+    bytes: []const u8,
+    coding: enum { gzip, zstd },
+
+    /// The `Content-Encoding` value.
+    pub fn name(self: Encoded) []const u8 {
+        return @tagName(self.coding);
+    }
+};
 
 /// Gzip `bytes` once, outside any request, into memory from `gpa` that the
 /// caller owns: what a static file is given at load (ADR 009). Null when
@@ -402,25 +528,49 @@ pub fn acceptsGzip(header: ?[]const u8) bool {
     return quality(header orelse return false, "gzip") > 0;
 }
 
+/// The coding a computed response is answered in (ADR 295).
+pub const Response = enum { identity, gzip, zstd };
+
+/// Which coding a response is compressed in, by the client's `q`: the higher
+/// wins, **zstd wins a tie** (a browser's `gzip, deflate, br, zstd` weighs
+/// both at 1, and zstd is smaller than libdeflate's default in a fifth of the
+/// time on a megabyte, `bench/result/zstd.md`), and a coding at `q=0`, or one
+/// the client did not name and no `*` covers, is never chosen: `zstd;q=0` is
+/// how a client that cannot decode it says so. `have_zstd` is whether the
+/// build and the body allow it at all. Pure and allocation-free, for the same
+/// reason `negotiate` is.
+pub fn negotiateResponse(header: ?[]const u8, have_zstd: bool) Response {
+    const value = header orelse return .identity;
+    const q_zstd: u16 = if (have_zstd) quality(value, "zstd") else 0;
+    const q_gzip: u16 = quality(value, "gzip");
+    if (q_zstd == 0 and q_gzip == 0) return .identity;
+    return if (q_zstd >= q_gzip) .zstd else .gzip;
+}
+
 /// A content coding a held or precompressed file can be answered in
 /// (ADR 273). Identity is the file as it was read.
-pub const Coding = enum { identity, gzip, br };
+pub const Coding = enum { identity, gzip, br, zstd };
 
 /// Which of the codings a file has the client prefers, by `q`.
 ///
-/// Higher `q` wins, `br` wins a tie (a browser sending `gzip, deflate, br`
-/// gave both the same weight and brotli is the smaller), and a coding at
+/// Higher `q` wins, `br` beats `zstd` beats `gzip` on a tie (a browser
+/// sending `gzip, deflate, br, zstd` gave all three the same weight), and a coding at
 /// `q=0`, or one the client did not name and no `*` covers, is never chosen:
 /// `br;q=0` is how a client that cannot decode it says so. A client that sent
 /// no header, or named neither coding the file has, gets the identity form
 /// (RFC 9110 section 12.5.3). Pure and allocation-free, so the static path
 /// calls it per request at no cost on the allocation budget.
-pub fn negotiate(header: ?[]const u8, have_br: bool, have_gzip: bool) Coding {
+pub fn negotiate(header: ?[]const u8, have_br: bool, have_zstd: bool, have_gzip: bool) Coding {
     const value = header orelse return .identity;
     const q_br: u16 = if (have_br) quality(value, "br") else 0;
+    const q_zstd: u16 = if (have_zstd) quality(value, "zstd") else 0;
     const q_gzip: u16 = if (have_gzip) quality(value, "gzip") else 0;
-    if (q_br == 0 and q_gzip == 0) return .identity;
-    return if (q_br >= q_gzip) .br else .gzip;
+    if (q_br == 0 and q_zstd == 0 and q_gzip == 0) return .identity;
+    // br, then zstd, then gzip on a tie: a browser's `gzip, deflate, br, zstd`
+    // weighs all three at 1, brotli is the smallest, zstd decodes fastest
+    // (ADR 295).
+    if (q_br >= q_zstd and q_br >= q_gzip) return .br;
+    return if (q_zstd >= q_gzip) .zstd else .gzip;
 }
 
 /// The weight an `Accept-Encoding` value gives the coding `name`, in
@@ -1042,7 +1192,7 @@ test "Accept-Encoding is read, not searched for the word gzip" {
 test "negotiating a coding takes the client's highest q, brotli on a tie, and never a refused one" {
     const both = struct {
         fn pick(h: ?[]const u8) Coding {
-            return negotiate(h, true, true);
+            return negotiate(h, true, false, true);
         }
     }.pick;
     try testing.expectEqual(Coding.br, both("gzip, deflate, br"));
@@ -1059,9 +1209,61 @@ test "negotiating a coding takes the client's highest q, brotli on a tie, and ne
     try testing.expectEqual(Coding.gzip, both("*, br;q=0"));
     try testing.expectEqual(Coding.identity, both("*;q=0"));
     // Only what the file has can be chosen.
-    try testing.expectEqual(Coding.gzip, negotiate("br, gzip", false, true));
-    try testing.expectEqual(Coding.br, negotiate("br, gzip", true, false));
-    try testing.expectEqual(Coding.identity, negotiate("br", false, true));
+    try testing.expectEqual(Coding.gzip, negotiate("br, gzip", false, false, true));
+    try testing.expectEqual(Coding.br, negotiate("br, gzip", true, false, false));
+    try testing.expectEqual(Coding.identity, negotiate("br", false, false, true));
+}
+
+test "a file with a zstd form is answered br, then zstd, then gzip on a tie, and by q otherwise" {
+    const all = struct {
+        fn pick(h: ?[]const u8) Coding {
+            return negotiate(h, true, true, true);
+        }
+    }.pick;
+    // What every current browser sends: all four at 1.
+    try testing.expectEqual(Coding.br, all("gzip, deflate, br, zstd"));
+    try testing.expectEqual(Coding.zstd, all("gzip, deflate, zstd"));
+    try testing.expectEqual(Coding.zstd, all("gzip, zstd"));
+    try testing.expectEqual(Coding.gzip, all("gzip, deflate"));
+    try testing.expectEqual(Coding.zstd, all("zstd"));
+    // By q, and a refused one is never chosen.
+    try testing.expectEqual(Coding.gzip, all("zstd;q=0.5, gzip;q=0.9"));
+    try testing.expectEqual(Coding.zstd, all("zstd;q=0.9, gzip;q=0.5, br;q=0.1"));
+    try testing.expectEqual(Coding.zstd, all("br;q=0, zstd, gzip"));
+    try testing.expectEqual(Coding.gzip, all("zstd;q=0, gzip"));
+    try testing.expectEqual(Coding.gzip, all("br;q=0, zstd;q=0, gzip"));
+    try testing.expectEqual(Coding.identity, all("zstd;q=0"));
+    try testing.expectEqual(Coding.identity, all("br;q=0, zstd;q=0, gzip;q=0"));
+    // `*` is every coding the client did not name, and a named one outranks it.
+    try testing.expectEqual(Coding.br, all("*"));
+    try testing.expectEqual(Coding.zstd, all("*, br;q=0"));
+    try testing.expectEqual(Coding.gzip, all("*, br;q=0, zstd;q=0"));
+    // Only what the file has can be chosen.
+    try testing.expectEqual(Coding.zstd, negotiate("gzip, deflate, br, zstd", false, true, true));
+    try testing.expectEqual(Coding.gzip, negotiate("gzip, deflate, br, zstd", false, false, true));
+    try testing.expectEqual(Coding.identity, negotiate("zstd", true, false, true));
+}
+
+test "a response is compressed in the highest q, zstd on a tie, and never in a refused coding" {
+    // A browser, curl, a gzip-only client, a client that refuses zstd.
+    try testing.expectEqual(Response.zstd, negotiateResponse("gzip, deflate, br, zstd", true));
+    try testing.expectEqual(Response.zstd, negotiateResponse("zstd, gzip", true));
+    try testing.expectEqual(Response.zstd, negotiateResponse("zstd", true));
+    try testing.expectEqual(Response.gzip, negotiateResponse("gzip, deflate, br", true));
+    try testing.expectEqual(Response.gzip, negotiateResponse("zstd;q=0, gzip", true));
+    try testing.expectEqual(Response.identity, negotiateResponse("zstd;q=0", true));
+    try testing.expectEqual(Response.gzip, negotiateResponse("zstd;q=0.5, gzip;q=0.8", true));
+    try testing.expectEqual(Response.zstd, negotiateResponse("zstd;q=0.8, gzip;q=0.5", true));
+    // `*` is a yes unless zstd is named.
+    try testing.expectEqual(Response.zstd, negotiateResponse("*", true));
+    try testing.expectEqual(Response.gzip, negotiateResponse("*, zstd;q=0", true));
+    try testing.expectEqual(Response.identity, negotiateResponse("*;q=0", true));
+    try testing.expectEqual(Response.identity, negotiateResponse(null, true));
+    try testing.expectEqual(Response.identity, negotiateResponse("identity", true));
+    // A build or body that cannot answer zstd is the gzip rule untouched.
+    try testing.expectEqual(Response.gzip, negotiateResponse("gzip, deflate, br, zstd", false));
+    try testing.expectEqual(Response.identity, negotiateResponse("zstd", false));
+    try testing.expectEqual(Response.gzip, negotiateResponse("*", false));
 }
 
 test "the types worth gzipping are named, and the rest are not" {
@@ -1236,4 +1438,179 @@ fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
         break :blk final;
     };
     return &built;
+}
+
+// ---- zstd (ADR 295) ----
+
+/// A frame decoded, for the pool tests that run in every build.
+fn unzstd(gpa: std.mem.Allocator, frame: []const u8) ![]u8 {
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Decompressor.contextSize());
+    defer gpa.free(memory);
+    var decoder = try zstd.Decompressor.init(memory, .{});
+    return decoder.decode(gpa, frame, 1 << 20);
+}
+
+test "a pool answers zstd to a client that names it, gzip to one that does not, and each decodes to the body" {
+    if (!zstd_linked) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pool = try PoolWith(.std, true).init(gpa, 2, .{});
+    defer pool.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const browser = pool.encodeAt(a, long_json, "gzip, deflate, br, zstd", 0).?;
+    try testing.expectEqualStrings("zstd", browser.name());
+    try testing.expect(browser.bytes.len < long_json.len / 4);
+    const back = try unzstd(gpa, browser.bytes);
+    defer gpa.free(back);
+    try testing.expectEqualStrings(long_json, back);
+
+    const curl = pool.encodeAt(a, long_json, "gzip, deflate, br", 0).?;
+    try testing.expectEqualStrings("gzip", curl.name());
+    const plain = try inflated(gpa, curl.bytes);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings(long_json, plain);
+
+    // A refusal is final, however the other coding is weighed.
+    try testing.expectEqualStrings("gzip", pool.encodeAt(a, long_json, "zstd;q=0, gzip", 0).?.name());
+    try testing.expect(pool.encodeAt(a, long_json, "zstd;q=0", 0) == null);
+    try testing.expectEqualStrings("gzip", pool.encodeAt(a, long_json, "zstd;q=0.2, gzip;q=0.9", 0).?.name());
+    try testing.expectEqualStrings("zstd", pool.encodeAt(a, long_json, "*", 0).?.name());
+    try testing.expectEqualStrings("gzip", pool.encodeAt(a, long_json, "*, zstd;q=0", 0).?.name());
+    try testing.expect(pool.encodeAt(a, long_json, null, 0) == null);
+}
+
+test "zstd falls to gzip when its compressors are out, the body is over its ceiling, or the pool is not offering it" {
+    if (!zstd_linked) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every compressor out: the client that takes gzip still gets it, and one
+    // that takes only zstd gets the body as it is.
+    var pool = try PoolWith(.std, true).init(gpa, 1, .{});
+    defer pool.deinit(gpa);
+    var zpool = pool.zstd_slots.?;
+    const held = zpool.borrow(0).?;
+    try testing.expectEqualStrings("gzip", pool.encodeAt(a, long_json, "zstd, gzip", 0).?.name());
+    try testing.expect(pool.encodeAt(a, long_json, "zstd", 0) == null);
+    zpool.give(held);
+    try testing.expectEqualStrings("zstd", pool.encodeAt(a, long_json, "zstd, gzip", 0).?.name());
+
+    // Over the ceiling zstd was sized for (`max_bytes`): gzip answers.
+    var small = try PoolWith(.std, true).init(gpa, 1, .{ .max_bytes = 2000 });
+    defer small.deinit(gpa);
+    try testing.expect(long_json.len > 2000);
+    try testing.expectEqualStrings("gzip", small.encodeAt(a, long_json, "zstd, gzip", 0).?.name());
+    try testing.expectEqualStrings("zstd", small.encodeAt(a, long_json[0..1999], "zstd, gzip", 0).?.name());
+
+    // `zstd = false` holds no zstd at all.
+    var gzip_only = try PoolWith(.std, true).init(gpa, 1, .{ .zstd = false });
+    defer gzip_only.deinit(gpa);
+    try testing.expect(!gzip_only.offersZstd());
+    try testing.expectEqualStrings("gzip", gzip_only.encodeAt(a, long_json, "zstd, gzip", 0).?.name());
+    try testing.expect(gzip_only.encodeAt(a, long_json, "zstd", 0) == null);
+
+    // `max_bytes = 0` is no limit for gzip and a megabyte for zstd.
+    var unbounded = try PoolWith(.std, true).init(gpa, 1, .{ .max_bytes = 0 });
+    defer unbounded.deinit(gpa);
+    const big = try a.alloc(u8, (1 << 20) + 1);
+    for (big, 0..) |*b, i| b.* = "0123456789abcdef"[(i * 7 + i / 13) % 16];
+    try testing.expectEqualStrings("gzip", unbounded.encodeAt(a, big, "zstd, gzip", 0).?.name());
+}
+
+test "without zstd a pool is the gzip pool it always was" {
+    const gpa = testing.allocator;
+    var pool = try PoolWith(.std, false).init(gpa, 1, .{});
+    defer pool.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(!pool.offersZstd());
+    try testing.expectEqualStrings("gzip", pool.encodeAt(a, long_json, "gzip, deflate, br, zstd", 0).?.name());
+    try testing.expect(pool.encodeAt(a, long_json, "zstd", 0) == null);
+    try testing.expect(pool.encodeAt(a, long_json, "zstd;q=0", 0) == null);
+}
+
+test "a client that sends Accept-Encoding: zstd gets a zstd answer that decodes to the body" {
+    if (!zstd_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/x", sendLongJson);
+    try app.get("/strong", sendStrongTag);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    try client.setHeader("Accept-Encoding", "zstd");
+    const answer = try client.get(&app, "/x");
+    try testing.expectEqualStrings("zstd", answer.header("Content-Encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", answer.header("Vary").?);
+    try testing.expectEqualStrings(long_json, try answer.decoded(arena.allocator()));
+    var length: [20]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&length, "{d}", .{answer.body.len}), answer.header("Content-Length").?);
+    try testing.expect(answer.body.len < long_json.len / 4);
+
+    // The strong tag is weakened for any coding.
+    const tagged = try client.get(&app, "/strong");
+    try testing.expectEqualStrings("zstd", tagged.header("Content-Encoding").?);
+    try testing.expectEqualStrings("W/\"v1\"", tagged.header("ETag").?);
+}
+
+test "the browser's list, q-values and a refusal pick the coding negotiateResponse says, through the App" {
+    if (!zstd_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/x", sendLongJson);
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    const cases = [_]struct { accept: []const u8, coding: ?[]const u8 }{
+        .{ .accept = "gzip, deflate, br, zstd", .coding = "zstd" },
+        .{ .accept = "gzip, deflate, br", .coding = "gzip" },
+        .{ .accept = "zstd;q=0.5, gzip;q=0.9", .coding = "gzip" },
+        .{ .accept = "zstd;q=0.9, gzip;q=0.5", .coding = "zstd" },
+        .{ .accept = "zstd;q=0, gzip", .coding = "gzip" },
+        .{ .accept = "zstd;q=0", .coding = null },
+        .{ .accept = "*", .coding = "zstd" },
+        .{ .accept = "*, zstd;q=0", .coding = "gzip" },
+        .{ .accept = "identity", .coding = null },
+    };
+    for (cases) |case| {
+        try client.setHeader("Accept-Encoding", case.accept);
+        const answer = try client.get(&app, "/x");
+        if (case.coding) |coding| {
+            try testing.expectEqualStrings(coding, answer.header("Content-Encoding").?);
+        } else {
+            try testing.expect(answer.header("Content-Encoding") == null);
+            try testing.expectEqualStrings(long_json, answer.body);
+        }
+        try testing.expectEqualStrings("Accept-Encoding", answer.header("Vary").?);
+    }
+}
+
+test "a build without zstd answers gzip exactly as before to a client that also names zstd" {
+    if (zstd_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/x", sendLongJson);
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    try client.setHeader("Accept-Encoding", "gzip, deflate, br, zstd");
+    try testing.expectEqualStrings("gzip", (try client.get(&app, "/x")).header("Content-Encoding").?);
+    try client.setHeader("Accept-Encoding", "zstd");
+    const only = try client.get(&app, "/x");
+    try testing.expect(only.header("Content-Encoding") == null);
+    try testing.expectEqualStrings(long_json, only.body);
 }

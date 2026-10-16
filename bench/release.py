@@ -87,6 +87,7 @@ MODULES = [
     ("cache", "one `put` and one `get` of a flat value", 1000, 5000),
     ("jwt", "an RS256 token verified, its claims read", 20, 100),
     ("proto", "a 20-record logs request decoded into structs and written back", 200, 1000),
+    ("zstd", "a 4 KB JSON body compressed at level 3 and decoded back", 2000, 10000),
     ("fetch", "a GET on a pooled keep-alive connection to an upstream in the process", 1000, 5000),
     ("fetch_ws", "a 100-byte text message sent on an open WebSocket to an upstream in the process, and its echo received", 1000, 5000),
     ("job", "a job pushed onto `job.Memory`, claimed, run and marked done", 2000, 10000),
@@ -176,10 +177,14 @@ def build(ref, commit, work):
         with contextlib.suppress(FileNotFoundError):
             os.remove(os.path.join(bin_dir, f"nilo-release-{name}"))
     print(f"  {ref}: {' '.join(names)}", file=sys.stderr)
-    zig_build(harness, names, tree)
+    # `-Dzstd` only for a ref that has the flag: one that predates it would
+    # refuse the option and take every program with it (ADR 295).
+    with open(os.path.join(tree, "build.zig")) as f:
+        extra = ["-Dzstd"] if '"zstd",' in f.read() else []
+    zig_build(harness, names + extra, tree)
     for name in names:
         path = os.path.join(bin_dir, f"nilo-release-{name}")
-        built[name] = path if os.path.exists(path) else {"error": zig_build(harness, [name], tree)}
+        built[name] = path if os.path.exists(path) else {"error": zig_build(harness, [name] + extra, tree)}
     return built
 
 

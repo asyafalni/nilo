@@ -116,8 +116,19 @@ const Str = core.Str;
 /// [ADR 292](../docs/adr/292-a-fetch-build-can-read-a-gzip-answer.md)).
 /// A constant, so everything under it is analysed only when it is true and
 /// a build without the flag links no flate for a call that dials out.
-pub const reads_gzip = @import("fetch_config").gzip;
-const gunzip = @import("gzip.zig");
+pub const reads_gzip = decode.reads_gzip;
+/// Whether this build reads a zstd answer (`-Dfetch_zstd`,
+/// [ADR 295](../docs/adr/295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)),
+/// by the same rule: a build without the flag links no libzstd for a call
+/// that dials out.
+pub const reads_zstd = decode.reads_zstd;
+/// Whether it reads either, which is what decides whether an `Exchange`
+/// holds a decoder and a call advertises more than `identity`.
+const reads_any = reads_gzip or reads_zstd;
+/// The `Accept-Encoding` value a call sends in this build, best coding first:
+/// `identity` without either flag, `zstd, gzip, identity` with both.
+pub const accepted_encodings = decode.advertised;
+const decode = @import("decode.zig");
 
 /// How a struct of params is encoded; internal, so that the module root names
 /// only what the reference lists.
@@ -156,6 +167,8 @@ pub const Retry = retry.Retry;
 pub const encode = @import("encode.zig");
 pub const Coding = encode.Coding;
 pub const gzip = encode.gzip;
+/// zstd as a `Coding`, from `nilo_zstd`: naming it links libzstd (ADR 295).
+pub const zstd = encode.zstd;
 
 /// The header a request's id travels under (ADR 158). nilo's own spelling,
 /// the one `Ctx.requestId` reads on the way in and the logger writes on the
@@ -414,10 +427,12 @@ pub const Client = struct {
         /// that sized an allocation from `content-length` has to hear about
         /// that rather than be handed a buffer with a tail of nothing in it.
         BodyTooShort,
-        /// The answer said `Content-Encoding: gzip` and its bytes do not
-        /// decode: not gzip at all, a corrupt block, a checksum or a length
-        /// the footer disagrees with, or a body that ended inside the stream.
-        /// Only in a build with `-Dfetch_gzip` (ADR 292).
+        /// The answer said `Content-Encoding: gzip` or `zstd` and its bytes
+        /// do not decode: not that coding at all, a corrupt block, a checksum
+        /// or a length the footer disagrees with, a frame that asks for more
+        /// window than a decoder must give, or a body that ended inside the
+        /// stream. Only in a build with `-Dfetch_gzip` or `-Dfetch_zstd`
+        /// (ADR 292, ADR 295).
         BodyEncodingInvalid,
         /// A call was made before `listen()` ran. A Fitting is finished at
         /// startup like any other service; a unit test that calls a handler
@@ -840,7 +855,7 @@ pub const Client = struct {
             .route_left_ms = core.timeLeftOf(c),
             .stall_ms = call.stall_ms,
             .redirects = .{ .follow = &redirect_buffer },
-            .gzip = reads_gzip,
+            .decode = reads_any,
             // A target's standing headers are written for its own origin
             // and stay there (ADR 183).
             .origin_only = standing.headers,
@@ -1112,11 +1127,12 @@ pub const Exchange = struct {
     /// whether reading the rest of it is cheaper than a new connection. Null
     /// is a body of unknown length, which counts as too much.
     announced: ?u64 = null,
-    /// The decoder of a gzip answer, from `begin` until `end`; null for any
-    /// other. One pointer, and **no field at all** in a build without
-    /// `-Dfetch_gzip`: the state is on the heap because by ADR 062 anything
-    /// on this struct is held per inbound connection (ADR 292).
-    unzip: if (reads_gzip) ?*gunzip.Reading else void = if (reads_gzip) null else {},
+    /// The decoder of a gzip or zstd answer, from `begin` until `end`; null
+    /// for any other. One pointer, and **no field at all** in a build without
+    /// `-Dfetch_gzip` or `-Dfetch_zstd`: the state is on the heap because by
+    /// ADR 062 anything on this struct is held per inbound connection
+    /// (ADR 292, ADR 295).
+    unzip: if (reads_any) ?*decode.Reading else void = if (reads_any) null else {},
     permit: bool = false,
     open: bool = false,
     /// Whether the attempt in hand is on a connection taken out of the pool,
@@ -1219,15 +1235,17 @@ pub const Exchange = struct {
         /// `Call.tls`, for a caller that drives an `Exchange`. A followed
         /// redirect to another origin is `.verified` again (ADR 290).
         tls: Client.Tls = .verified,
-        /// Read a gzip answer: advertise it, and decode it for `take`,
-        /// `readInto`, `pipe`, `stream` and `reader` alike, so what is read is
-        /// the body and `Head.content_length` is the length on the wire. The
-        /// calls on `Client` set it; a caller driving an `Exchange` that
-        /// wants the bytes as the server stored them (an object store) leaves
-        /// it out and gets identity, as before. **Has no effect in a build
-        /// without `-Dfetch_gzip`** (`reads_gzip`), where a gzip answer is
-        /// `error.HttpContentEncodingUnsupported` (ADR 292).
-        gzip: bool = false,
+        /// Read a compressed answer: advertise the codings this build reads
+        /// (gzip with `-Dfetch_gzip`, zstd with `-Dfetch_zstd`), and decode an
+        /// answer under one for `take`, `readInto`, `pipe`, `stream` and
+        /// `reader` alike, so what is read is the body and
+        /// `Head.content_length` is the length on the wire. The calls on
+        /// `Client` set it; a caller driving an `Exchange` that wants the
+        /// bytes as the server stored them (an object store) leaves it out
+        /// and gets identity, as before. **Has no effect in a build that
+        /// reads neither**, where a compressed answer is
+        /// `error.HttpContentEncodingUnsupported` (ADR 292, ADR 295).
+        decode: bool = false,
     };
 
     /// What a 3xx with a `Location` means to a call. See `Begin.redirects`.
@@ -1734,12 +1752,12 @@ pub const Exchange = struct {
         self.inner = self.res.reader(opts.transfer_buffer);
         self.tap.vtable = &tap_vtable;
         self.reader = if (self.stall_ms != 0) &self.tap else self.inner;
-        if (comptime reads_gzip) if (opts.gzip) if (gunzip.coding(self.res.head.content_encoding)) |how| {
+        if (comptime reads_any) if (opts.decode) if (decode.coding(self.res.head.content_encoding)) |how| {
             // The decoder reads what the clocks watch, so a stall is still
             // seen, and everything that reads `reader` after this reads the
             // body (ADR 292). `announced` stays the length on the wire: it is
             // what `end` weighs a drain against.
-            const reading = try gunzip.Reading.open(self.client.inner.allocator, self.reader.?, how);
+            const reading = try decode.Reading.open(self.client.inner.allocator, self.reader.?, how);
             self.unzip = reading;
             self.reader = reading.reader();
         };
@@ -1766,9 +1784,10 @@ pub const Exchange = struct {
                 // 954,208-byte one (`bench/result/fetch.md`), so only a Debug
                 // build says how to read the answer. The reference says it for
                 // the rest (ADR 292).
-                if (builtin.mode == .debug and !reads_gzip and err == error.HttpContentEncodingUnsupported) {
+                if (builtin.mode == .debug and !reads_any and err == error.HttpContentEncodingUnsupported) {
                     std.log.warn("nilo_fetch: an answer came under a Content-Encoding this build does not read; " ++
-                        "pass .fetch_gzip = true to b.dependency(\"nilo\", ...) (-Dfetch_gzip) to read gzip (ADR 292)", .{});
+                        "pass .fetch_gzip = true or .fetch_zstd = true to b.dependency(\"nilo\", ...) " ++
+                        "(-Dfetch_gzip, -Dfetch_zstd) to read gzip or zstd (ADR 292, ADR 295)", .{});
                 }
                 return self.blame(err);
             };
@@ -2113,7 +2132,7 @@ pub const Exchange = struct {
                 .content_type = slot(opts.content_type, given.content_type),
                 .user_agent = slot(opts.user_agent, given.user_agent),
                 .connection = slot(null, given.connection),
-                .accept_encoding = if (given.accept_encoding) .omit else .{ .override = if (reads_gzip and opts.gzip) "gzip, identity" else "identity" },
+                .accept_encoding = if (given.accept_encoding) .omit else .{ .override = if (reads_any and opts.decode) decode.advertised else "identity" },
             },
         }) catch |err| {
             // `request` never took it, so nobody else will give it back.
@@ -2162,8 +2181,11 @@ pub const Exchange = struct {
         // that gzips regardless of `identity` is the case this is for, and
         // a caller's own `accept-encoding: gzip` line is then answered with
         // the body and not an error (ADR 292).
-        if (comptime reads_gzip) {
-            if (opts.gzip) self.req.accept_encoding[@backingInt(std.http.ContentEncoding.gzip)] = true;
+        if (comptime reads_any) {
+            if (opts.decode) {
+                if (comptime reads_gzip) self.req.accept_encoding[@backingInt(std.http.ContentEncoding.gzip)] = true;
+                if (comptime reads_zstd) self.req.accept_encoding[@backingInt(std.http.ContentEncoding.zstd)] = true;
+            }
         }
 
         // **The body decides, not the method**
@@ -2928,9 +2950,9 @@ pub const Exchange = struct {
         }
     }
 
-    /// Whether the body being read is a gzip answer being decoded.
+    /// Whether the body being read is a compressed answer being decoded.
     fn decoding(self: *const Exchange) bool {
-        if (comptime !reads_gzip) return false;
+        if (comptime !reads_any) return false;
         return self.unzip != null;
     }
 
@@ -2939,9 +2961,12 @@ pub const Exchange = struct {
     /// that failed because the connection did is the clocks' to name
     /// (ADR 292).
     fn fail(self: *Exchange, err: anytype) Client.Error {
-        if (comptime reads_gzip) {
+        if (comptime reads_any) {
             if (self.unzip) |reading| {
-                if (std.mem.eql(u8, @errorName(err), "ReadFailed") and reading.undecodable()) return error.BodyEncodingInvalid;
+                if (std.mem.eql(u8, @errorName(err), "ReadFailed")) {
+                    if (reading.undecodable()) return error.BodyEncodingInvalid;
+                    if (reading.outOfMemory()) return error.OutOfMemory;
+                }
             }
         }
         return self.blame(err);
@@ -3132,7 +3157,7 @@ pub const Exchange = struct {
                 }
                 // The wire, never the decoded side: a leftover of a gzip
                 // answer is dropped bytes, not bytes to inflate (ADR 292).
-                const r = if (comptime reads_gzip) (if (self.unzip) |reading| reading.source else self.reader orelse return) else self.reader orelse return;
+                const r = if (comptime reads_any) (if (self.unzip) |reading| reading.source else self.reader orelse return) else self.reader orelse return;
                 _ = r.discardRemaining() catch {
                     conn.closing = true;
                 };
@@ -3267,7 +3292,7 @@ pub const Exchange = struct {
         }
         // After the drain above, which reads the wire through the decoder's
         // source (ADR 292).
-        if (comptime reads_gzip) if (self.unzip) |reading| {
+        if (comptime reads_any) if (self.unzip) |reading| {
             reading.close();
             self.unzip = null;
         };

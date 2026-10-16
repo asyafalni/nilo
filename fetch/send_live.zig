@@ -11,6 +11,7 @@ const fetch = @import("fetch.zig");
 const testing = std.testing;
 const Canned = fetch.testing.Canned;
 const Reply = fetch.testing.Reply;
+const zstd = @import("nilo_zstd");
 
 fn withIo(comptime body: fn (std.Io) anyerror!void) !void {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -284,6 +285,273 @@ test "an upload on a method that frames no body, or with a body of its own, is r
             try testing.expectError(error.InvalidUpload, ex.beginUpload(&client, &scope, &up, .{ .method = .GET, .url = "http://127.0.0.1:1/" }, null));
             try testing.expectError(error.InvalidUpload, ex.beginUpload(&client, &scope, &up, .{ .method = .POST, .url = "http://127.0.0.1:1/", .body = .{ .slice = "x" } }, null));
             try testing.expectError(error.InvalidUpload, ex.begin(&client, .{ .method = .POST, .url = "http://127.0.0.1:1/", .body = .{ .upload = &up } }));
+        }
+    }.run);
+}
+
+// ---- the second coding: zstd (ADR 295) ----
+
+test "a body sent zstd arrives zstd, as long as its frame, and decodes to the original" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const plain = try inventory(testing.allocator);
+            defer testing.allocator.free(plain);
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), plain, .{ .encoding = fetch.zstd });
+
+            try testing.expectEqual(std.http.Status.ok, res.status);
+            try testing.expectEqualStrings("zstd", res.sent_encoding.?);
+            try testing.expectEqualStrings("zstd", canned.requestEncoding().?);
+            const wire = canned.requestBody();
+            try testing.expect(wire.len < plain.len / 4);
+            try testing.expectEqual(wire.len, contentLength(canned.request()).?);
+            const back = try canned.requestBodyDecoded(testing.allocator);
+            defer testing.allocator.free(back);
+            try testing.expectEqualStrings(plain, back);
+            // The frame says how large it decodes to, so a server can read it
+            // in one call (ADR 295).
+            const frame = try zstd.Frame.parse(wire);
+            try testing.expectEqual(@as(?u64, plain.len), frame.content_size);
+        }
+    }.run);
+}
+
+test "a zstd body at each level decodes, and the same client keeps one compressor for all of them" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var client = try started(io);
+            defer client.deinit();
+            const plain = try inventory(testing.allocator);
+            defer testing.allocator.free(plain);
+
+            const codings = [_]fetch.Coding{
+                fetch.zstd.with(.{ .level = .fastest }),
+                fetch.zstd,
+                fetch.zstd.with(.{ .level = .best }),
+                fetch.zstd.with(.{ .level = .{ .exact = 12 } }),
+                fetch.zstd.with(.{ .level = .{ .exact = -5 } }),
+            };
+            for (codings) |coding| {
+                var canned = try Canned.open(io);
+                defer canned.close();
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                var scope: core.Run = .init(testing.allocator);
+                defer scope.deinit();
+                var buf: [64]u8 = undefined;
+                const res = try client.post(&scope, try canned.url(&buf), plain, .{ .encoding = coding });
+                try testing.expectEqualStrings("zstd", res.sent_encoding.?);
+                const back = try canned.requestBodyDecoded(testing.allocator);
+                defer testing.allocator.free(back);
+                try testing.expectEqualStrings(plain, back);
+            }
+            // One context was made and kept, not one a call.
+            try testing.expect(client.stash.slot.load(.monotonic) != null);
+        }
+    }.run);
+}
+
+test "a zstd body under the coding's threshold goes out as it is, and says so" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), "{\"small\":true}", .{ .encoding = fetch.zstd });
+            try testing.expect(res.sent_encoding == null);
+            try testing.expect(canned.requestEncoding() == null);
+            try testing.expectEqualStrings("{\"small\":true}", canned.requestBody());
+        }
+    }.run);
+}
+
+test "a body that zstd cannot shrink goes out as it is" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var noise: [900]u8 = undefined;
+            var prng = std.Random.DefaultPrng.init(11);
+            prng.random().bytes(&noise);
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), &noise, .{ .encoding = fetch.zstd.with(.{ .min_bytes = 1 }) });
+            try testing.expect(res.sent_encoding == null);
+            try testing.expect(canned.requestEncoding() == null);
+            try testing.expectEqualSlices(u8, &noise, canned.requestBody());
+        }
+    }.run);
+}
+
+test "a server that reads gzip and not zstd is sent the body again, plain, once" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            const script = [_]Reply{
+                .{ .status = "415 Unsupported Media Type", .headers = "Accept-Encoding: gzip, identity\r\n", .body = "no zstd here" },
+                .{ .body = "taken" },
+            };
+            var served = try io.concurrent(Canned.serveScript, .{ &canned, &script, 2 });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const plain = try inventory(testing.allocator);
+            defer testing.allocator.free(plain);
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), plain, .{ .encoding = fetch.zstd });
+
+            try testing.expectEqual(std.http.Status.ok, res.status);
+            try testing.expectEqualStrings("taken", res.body.view());
+            // Plain and not gzip: falling back to a second compressor would
+            // link it into every program that sends zstd (ADR 295).
+            try testing.expect(res.sent_encoding == null);
+            try testing.expectEqual(@as(usize, 2), canned.tried.count);
+            const first = canned.headOfTry(0);
+            const second = canned.headOfTry(1);
+            try testing.expect(std.ascii.findIgnoreCase(first, "content-encoding: zstd") != null);
+            try testing.expect(std.ascii.findIgnoreCase(second, "content-encoding") == null);
+            try testing.expect(contentLength(first).? < plain.len / 4);
+            try testing.expectEqual(plain.len, contentLength(second).?);
+        }
+    }.run);
+}
+
+test "a 415 that lists zstd is about something else and is not sent again" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            const script = [_]Reply{
+                .{ .status = "415 Unsupported Media Type", .headers = "Accept-Encoding: zstd, gzip, identity\r\n" },
+            };
+            var served = try io.concurrent(Canned.serveScript, .{ &canned, &script, 1 });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const plain = try inventory(testing.allocator);
+            defer testing.allocator.free(plain);
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), plain, .{ .encoding = fetch.zstd });
+            try testing.expectEqual(std.http.Status.unsupported_media_type, res.status);
+            try testing.expectEqual(@as(usize, 1), canned.tried.count);
+            try testing.expectEqualStrings("zstd", res.sent_encoding.?);
+        }
+    }.run);
+}
+
+test "a client that sends gzip and then zstd swaps its kept compressor, and both bodies decode" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var client = try started(io);
+            defer client.deinit();
+            const plain = try inventory(testing.allocator);
+            defer testing.allocator.free(plain);
+
+            for ([_]fetch.Coding{ fetch.gzip, fetch.zstd, fetch.gzip }) |coding| {
+                var canned = try Canned.open(io);
+                defer canned.close();
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                var scope: core.Run = .init(testing.allocator);
+                defer scope.deinit();
+                var buf: [64]u8 = undefined;
+                _ = try client.post(&scope, try canned.url(&buf), plain, .{ .encoding = coding });
+                try testing.expectEqualStrings(coding.name, canned.requestEncoding().?);
+                const back = try canned.requestBodyDecoded(testing.allocator);
+                defer testing.allocator.free(back);
+                try testing.expectEqualStrings(plain, back);
+            }
+        }
+    }.run);
+}
+
+test "a zstd chunked body can be decoded up to each flush, and to the end" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveUpload, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io);
+            defer client.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            var up: fetch.Exchange.Upload = .{};
+            defer up.deinit();
+            try ex.beginUpload(&client, &scope, &up, .{ .method = .POST, .url = try canned.url(&buf), .timeout_ms = 0 }, fetch.zstd);
+
+            const line1 = "{\"t\":1,\"stream\":\"stdout\"}\n";
+            const line2 = "{\"t\":2,\"stream\":\"stderr\"}\n";
+            try up.writer().writeAll(line1);
+            try up.writer().flush();
+            try waitForChunks(io, &canned, 1);
+
+            // What has arrived is a zstd frame cut at a flush, and a decoder
+            // gets the first line out of it without waiting for the rest.
+            {
+                const z = zstd;
+                const seen = canned.uploadSeen();
+                const need = try z.StreamDecoder.sizeFrom(seen[0..@min(seen.len, z.frame_header_max)], .{});
+                const mem = try testing.allocator.alignedAlloc(u8, z.workspace_alignment, need);
+                defer testing.allocator.free(mem);
+                var in: std.Io.Reader = .fixed(seen);
+                var decoder = try z.StreamDecoder.init(mem, &in, &.{}, .{});
+                var got: [line1.len]u8 = undefined;
+                try decoder.reader.readSliceAll(&got);
+                try testing.expectEqualStrings(line1, &got);
+            }
+
+            try up.writer().writeAll(line2);
+            const head = try up.end();
+            try testing.expectEqual(std.http.Status.ok, head.status);
+
+            try testing.expectEqualStrings("zstd", canned.requestEncoding().?);
+            const all = try fetch.testing.inflateZstd(testing.allocator, canned.uploadSeen());
+            defer testing.allocator.free(all);
+            try testing.expectEqualStrings(line1 ++ line2, all);
         }
     }.run);
 }

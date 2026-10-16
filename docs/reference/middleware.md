@@ -264,13 +264,13 @@ try app.with(nilo.bodyEncodings(.{"snappy"})).post("/api/v1/write", remoteWrite)
 try app.with(nilo.bodyEncodings(.{ "snappy", "zstd" })).with(nilo.maxBody(8 << 20)).post("/ingest", ingest);
 ```
 
-nilo decodes `gzip` and answers any other `Content-Encoding` on a request with a body with a 415, before any route matches ([ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)). A route under this middleware gets a body under one of the codings it names as they arrived, through `c.body()` or `c.bodyStream()`, with the value in `c.header("content-encoding")`. Names are compared whole and ignoring case, so `"gzip, snappy"` names a stacked body and is not `"snappy"`. Several `bodyEncodings` in one route's chain read the union of what they name.
+nilo decodes `gzip` (and `zstd` in a build with `-Dzstd`, [ADR 295](../adr/295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)) and answers any other `Content-Encoding` on a request with a body with a 415, before any route matches ([ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)). A route under this middleware gets a body under one of the codings it names as they arrived, through `c.body()` or `c.bodyStream()`, with the value in `c.header("content-encoding")`. Names are compared whole and ignoring case, so `"gzip, snappy"` names a stacked body and is not `"snappy"`. Several `bodyEncodings` in one route's chain read the union of what they name.
 
 **`max_body`, or the route's `maxBody`, applies to the bytes that arrived.** What they decode to is the handler's to bound.
 
-**A coding the chain does not name is a 415 carrying `Accept-Encoding`** (`identity, gzip`, then the names), as RFC 9110 §15.5.16 asks. A route outside any such chain is refused by the same bytes as ever. A coding on a request with no body is ignored, as everywhere.
+**A coding the chain does not name is a 415 carrying `Accept-Encoding`** (`identity, gzip`, then `zstd` in a build that decodes it, then the names), as RFC 9110 §15.5.16 asks. A route outside any such chain is refused by the same bytes as ever. A coding on a request with no body is ignored, as everywhere.
 
-**`"gzip"` in the list passes gzip through undecoded** for a route that stores or forwards it. Left out, gzip is inflated as on every route. `"identity"` and an empty name are compile errors, as is an empty list.
+**`"gzip"` in the list passes gzip through undecoded** for a route that stores or forwards it. Left out, gzip is inflated as on every route. `"zstd"` is the same in a build with `-Dzstd`, and in one without it is a coding like `"snappy"`: the bytes as they arrived either way. `"identity"` and an empty name are compile errors, as is an empty list.
 
 **`c.json`, `c.form` and a typed `body: T` answer a 415 for a body that arrived under a coding the route reads itself**, because they parse and compressed bytes are not what they parse; a type that carries `nilo_decode` is handed the bytes. The check is at run time and not while compiling because a chain is settled at `listen()`, where a global `use` can add it to a route whose signature was written without it ([ADR 283](../adr/283-a-route-can-read-a-content-encoding-itself.md)).
 

@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://ziglang.org/"><img alt="Zig 0.17" src="https://img.shields.io/badge/zig-0.17-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-3b82f6?style=flat-square"></a>
-  <a href="./docs/reference/"><img alt="12 modules" src="https://img.shields.io/badge/modules-12-8957e5?style=flat-square"></a>
+  <a href="./docs/reference/"><img alt="13 modules" src="https://img.shields.io/badge/modules-13-8957e5?style=flat-square"></a>
   <a href="./refusals/README.md"><img alt="620 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-620-e05d44?style=flat-square"></a>
   <a href="./docs/adr/"><img alt="283 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-283-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
@@ -29,7 +29,7 @@
 
 ---
 
-Zig gives you a fast compiler and leaves the rest to you: routing, settings, password hashing, tables, Postgres. **nilo is that rest: an HTTP framework for Zig, and the toolkit it is built from**, twelve small modules you import one at a time.
+Zig gives you a fast compiler and leaves the rest to you: routing, settings, password hashing, tables, Postgres. **nilo is that rest: an HTTP framework for Zig, and the toolkit it is built from**, thirteen small modules you import one at a time.
 
 Every module runs on the same idea. **A plain function is a route. A plain struct is a table.** nilo reads your types while the program compiles, so there is nothing to annotate and nothing to keep in sync.
 
@@ -323,6 +323,8 @@ A build that serves plain HTTP fetches one dependency, [zio](https://github.com/
 | `.http2 = true` | HTTP/2 beside HTTP/1.1 on every listener, every route on either, and gRPC on top. With `.tls` too, a browser is offered it by ALPN ([guide](./docs/guide/deploying.md#http2-for-a-browser)) |
 | `.libdeflate = true` | libdeflate's compressor in place of the standard library's, for gzip ([guide](./docs/guide/responses.md#compression)) |
 | `.fetch_gzip = true` | `nilo_fetch` reads a gzip answer, counting `max_body` on the decoded bytes ([guide](./docs/guide/fetch.md#compressed-responses)) |
+| `.zstd = true` | libzstd 1.5.7 behind `nilo_zstd`, and `fetch.zstd` to send a zstd body ([guide](./docs/guide/zstd.md)) |
+| `.fetch_zstd = true` | `nilo_fetch` reads a zstd answer beside gzip, counting `max_body` on the decoded bytes; it implies `.zstd` ([guide](./docs/guide/fetch.md#compressed-responses)) |
 
 ## 🚫 What it won't do
 

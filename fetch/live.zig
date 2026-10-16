@@ -1243,12 +1243,9 @@ test "the body is asked for uncompressed, so what comes back is the body" {
             // fails in `zig build test` rather than only in `smoke-tls`.
             // A build with `-Dfetch_gzip` says it reads gzip, and reads it
             // (ADR 292, `gzip_live.zig`).
-            if (fetch.reads_gzip) {
-                try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: gzip, identity") != null);
-            } else {
-                try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: identity") != null);
-                try testing.expect(std.mem.indexOf(u8, head, "gzip") == null);
-            }
+            try testing.expect(std.mem.indexOf(u8, head, "accept-encoding: " ++ fetch.accepted_encodings) != null);
+            if (!fetch.reads_gzip) try testing.expect(std.mem.indexOf(u8, head, "gzip") == null);
+            if (!fetch.reads_zstd) try testing.expect(std.mem.indexOf(u8, head, "zstd") == null);
         }
     }.run);
 }
@@ -1256,7 +1253,7 @@ test "the body is asked for uncompressed, so what comes back is the body" {
 test "a gzip answer is an error naming the unsupported encoding in a build that does not read it" {
     // The build a dependent gets by default (ADR 292). `gzip_live.zig` is the
     // same scenario in a build that reads it.
-    if (fetch.reads_gzip) return error.SkipZigTest;
+    if (fetch.reads_gzip or fetch.reads_zstd) return error.SkipZigTest;
     try withIo(struct {
         fn run(io: std.Io) !void {
             var wire: [4 << 10]u8 = undefined;

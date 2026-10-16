@@ -15,6 +15,7 @@ One file an area, each carrying what was run, the machine, the commit, the numbe
 | [`cache.md`](./result/cache.md) | the cache |
 | [`job.md`](./result/job.md) | the queue |
 | [`proto.md`](./result/proto.md) | protobuf, against a decoder written by hand |
+| [`zstd.md`](./result/zstd.md) | zstd next to gzip: time, bytes, contexts, stack and binary size |
 | [`build.md`](./result/build.md) | waiting on the build itself |
 | [`releases.md`](./result/releases.md) | each release against the one before it, every module |
 
@@ -47,6 +48,9 @@ zig build bench-cache-hitrate  # what fraction of lookups it answers, against th
 zig build bench-compress       # what gzipping a JSON answer costs at each level, in µs and bytes; -Dlibdeflate for the other backend
 zig build bench-compress-stack # the stack one gzip writes below its caller, per backend, in the -Doptimize asked for
 zig build bench-compress-scale # gzip on 1 to 16 pinned threads, a shared pool against a compressor each thread owns: ns, instructions and cache misses a body; `-- <dataset.json> --gap-ns 20000`
+zig build bench-zstd           # zstd against gzip on the same bodies (µs, bytes, contexts, decoders); -Dlibdeflate for the other gzip; files after -- are bodies too
+zig build bench-zstd-stack     # the stack one zstd call writes below its caller, in the -Doptimize asked for
+zig build size-zstd            # four programs whose stripped sizes price libzstd's encoder and decoder
 zig build bench-sql            # what a prepared statement is worth: SQLite always, Postgres if reachable
 zig build bench-job            # what a claim and a push cost on job.Memory, SQLite, and Postgres if reachable
 zig build bench-proto          # protobuf decode and encode, against a decoder written by hand; pin it with taskset

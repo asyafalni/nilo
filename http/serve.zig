@@ -30,6 +30,7 @@ const metrics_mod = @import("metrics.zig");
 const failurebody = @import("failurebody.zig");
 const framing_mod = @import("framing.zig");
 const bodyencodings = @import("bodyencodings.zig");
+const zstdbody = @import("zstdbody.zig");
 const h2 = @import("h2.zig");
 const json = @import("json.zig");
 const trace_mod = @import("trace.zig");
@@ -539,6 +540,7 @@ pub noinline fn serveRequest(
         ._session_fallbacks = &self.session_fallbacks,
         ._session_plain = self.session_plain_name,
         ._compressors = if (self.compressors) |*p| p else null,
+        ._decoders = if (zstdbody.enabled) (if (self.decoders) |*p| p else null) else {},
         ._params = &.{},
         ._services = &self.services,
         // Stopping: this one still gets answered — a request already on
@@ -947,11 +949,14 @@ pub fn hit(
 const RESPONSE_400 = http1.staticResponse(400, failure_content_type, staticFailure(400, "malformed request"), .close);
 const RESPONSE_431 = http1.staticResponse(431, failure_content_type, staticFailure(431, "head too long"), .close);
 /// Sent when a body arrives under a `Content-Encoding` nilo cannot decode,
-/// which is all of them but `identity` and `gzip` (ADR 089). The
+/// which is all of them but `identity`, `gzip` and, in a build with `-Dzstd`, `zstd` (ADR 089, ADR 295). The
 /// message names the header, because the mistake is one line of client
 /// configuration and the alternative — a 400 about malformed JSON — sends
 /// the reader to the body.
-const RESPONSE_415 = http1.staticResponse(415, failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), .close);
+const RESPONSE_415 = http1.staticResponse(415, failure_content_type, staticFailure(415, "this server decodes Content-Encoding: " ++ decoded_codings ++ " and nothing else — send the body as identity or " ++ decoded_codings), .close);
+/// What a 415 says the server decodes: gzip, and zstd in a build that reads
+/// it (ADR 295).
+const decoded_codings = if (zstdbody.enabled) "gzip or zstd" else "gzip";
 /// Sent when a request head started arriving and then stopped (ADR 022).
 /// Not when a keep-alive connection simply sat idle: that client has not
 /// asked for anything, and a status answering nothing is noise a proxy has
@@ -1263,10 +1268,14 @@ fn serveSpilledFile(
     var coding: compress_mod.Coding = if (c.header("Range") != null)
         .identity
     else
-        compress_mod.negotiate(headerValue(c, "Accept-Encoding"), on_disk.br != null, on_disk.gzip != null);
+        compress_mod.negotiate(headerValue(c, "Accept-Encoding"), on_disk.br != null, on_disk.zstd != null, on_disk.gzip != null);
     var chosen: ?bulkhead.File = null;
     if (coding != .identity) {
-        const sibling = if (coding == .br) on_disk.br.? else on_disk.gzip.?;
+        const sibling = switch (coding) {
+            .br => on_disk.br.?,
+            .zstd => on_disk.zstd.?,
+            else => on_disk.gzip.?,
+        };
         chosen = on_disk.dir.openFileNoFollow(sibling.path) catch |err| switch (err) {
             // Gone since the walk: the plain file answers, as it would have
             // had the sibling never been there.
@@ -1317,6 +1326,10 @@ fn serveSpilledFile(
             return err;
         },
         .br => c.setStaticHeader("Content-Encoding", "br") catch |err| {
+            open.close();
+            return err;
+        },
+        .zstd => c.setStaticHeader("Content-Encoding", "zstd") catch |err| {
             open.close();
             return err;
         },
@@ -1371,7 +1384,7 @@ fn serveHeldFile(c: *Ctx, file: *const static_mod.File) anyerror!void {
     const coding: compress_mod.Coding = if (wants_part)
         .identity
     else
-        compress_mod.negotiate(headerValue(c, "Accept-Encoding"), held.br != null, held.gzip != null);
+        compress_mod.negotiate(headerValue(c, "Accept-Encoding"), held.br != null, held.zstd != null, held.gzip != null);
     const sending = file.representation(coding);
 
     // Everything here belongs to the loaded file, which outlives every
@@ -1393,6 +1406,7 @@ fn serveHeldFile(c: *Ctx, file: *const static_mod.File) anyerror!void {
         .identity => {},
         .gzip => try c.setStaticHeader("Content-Encoding", "gzip"),
         .br => try c.setStaticHeader("Content-Encoding", "br"),
+        .zstd => try c.setStaticHeader("Content-Encoding", "zstd"),
     }
 
     // The ETag was computed when the file was read, so a repeat visitor

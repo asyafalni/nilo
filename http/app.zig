@@ -36,6 +36,7 @@ const failurebody = @import("failurebody.zig");
 const connect = @import("connect.zig");
 const rpc_mod = @import("rpc.zig");
 const compress_mod = @import("compress.zig");
+const zstdbody = @import("zstdbody.zig");
 const trace_mod = @import("trace.zig");
 
 /// Say so if the program was built in a mode its log level does not match.
@@ -195,6 +196,11 @@ pub const App = struct {
     /// set just before the chains are resolved. 0 means one per core, which
     /// is what `start(io)` and a test that resolves the chains by hand get.
     compress_slots: u8 = 0,
+    /// The zstd decoders for a request body under `Content-Encoding: zstd`,
+    /// one per thread, built at `resolveChains` beside the compressors and
+    /// sized by the same thread count (ADR 295). Absent from a build that
+    /// does not read zstd.
+    decoders: if (zstdbody.enabled) ?zstdbody.Pool else void = if (zstdbody.enabled) null else {},
     /// What `trace()` set up: the rings, the exporter and its client. Null on
     /// every App that never asked, and then a request pays one compare
     /// (ADR 247). On the heap, because it is a service and a service is
@@ -379,6 +385,7 @@ pub const App = struct {
         if (self.metrics_table) |*t| t.free(self.gpa);
         self.exposed.deinit(self.gpa);
         if (self.compressors) |*p| p.deinit(self.gpa);
+        if (zstdbody.enabled) if (self.decoders) |*p| p.deinit(self.gpa);
         for (self.static_sets.items) |*s| s.deinit();
         self.static_sets.deinit(self.gpa);
         self.static_chains.deinit(self.gpa);
@@ -1939,6 +1946,7 @@ pub const App = struct {
             .max_body = self.limits.max_body,
             .max_requests = self.max_requests_per_h2_connection,
             .ceiling = self.grpcBodyCeiling(),
+            .decoders = if (zstdbody.enabled) (if (self.decoders) |*p| p else null) else {},
             .body_limit = Adapter.bodyLimit,
             .routes = Adapter.routes,
             .runs_inline = Adapter.runsInline,

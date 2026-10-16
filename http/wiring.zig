@@ -19,6 +19,7 @@ const follow_mod = @import("follow.zig");
 const proxies_mod = @import("proxies.zig");
 const openapi = @import("openapi.zig");
 const compress_mod = @import("compress.zig");
+const zstdbody = @import("zstdbody.zig");
 const bulkhead = @import("bulkhead.zig");
 const log_mod = @import("log.zig");
 
@@ -258,6 +259,7 @@ pub fn resolveChains(self: *App) !void {
     }
     try sizeMetrics(self);
     try sizeCompressors(self);
+    if (zstdbody.enabled) try sizeDecoders(self);
     if (self.trace_hooks) |hooks| try hooks.size(self);
     self.chains_shape.store(shapeOf(self), .release);
 }
@@ -334,6 +336,25 @@ pub fn sizeCompressors(self: *App) !void {
         self.compressors = null;
     }
     self.compressors = try compress_mod.Pool.init(self.gpa, count, options);
+}
+
+/// Give a build that reads zstd its decoders, one per thread, for the reason
+/// the compressors are sized here (ADR 295, ADR 211): the thread count is
+/// `listen()`'s to say, and a request body under `Content-Encoding: zstd`
+/// borrows a slot for the length of one decode. Once; a pool already the
+/// right size is kept, because the test client resolves the chains before
+/// every request.
+pub fn sizeDecoders(self: *App) !void {
+    const count: usize = if (self.compress_slots > 0)
+        self.compress_slots
+    else
+        bulkhead.threadCount(bulkhead.Options{});
+    if (self.decoders) |*pool| {
+        if (pool.items.len == count) return;
+        pool.deinit(self.gpa);
+        self.decoders = null;
+    }
+    self.decoders = try zstdbody.Pool.init(self.gpa, count, .{ .window_log_max = zstdbody.window_log_max });
 }
 
 /// Give the counters their memory and their labels, here rather than at

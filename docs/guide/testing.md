@@ -132,8 +132,8 @@ The jar follows the rules of a browser that a test can be wrong about: a cookie 
 | `answer.body` | the bytes after the head, still chunk-framed if it was a stream |
 | `answer.text(&buf)` | the body as a client sees it, framing undone |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
-| `answer.decoded(arena)` | the body, inflated when the answer is gzipped |
-| `answer.json(T, arena)` | the body read back as a value (inflated first when gzipped) |
+| `answer.decoded(arena)` | the body, inflated when the answer is gzipped, decoded when it is zstd (a `-Dzstd` build) |
+| `answer.json(T, arena)` | the body read back as a value (inflated or decoded first when compressed) |
 | `answer.raw` | everything, exactly as it went on the wire |
 | `answer.head` | the status line and headers |
 | `answer.chunked` | whether it arrived in chunks |
@@ -166,6 +166,8 @@ const answer = try wired.sendRequest(.{
 try testing.expectEqualStrings("gzip", answer.header("Content-Encoding").?);
 const text = try answer.decoded(arena);   // .body and .bytes stay the compressed bytes
 ```
+
+In a build with `-Dzstd`, `nilo.testing.zstd(arena, json)` is the same for `Content-Encoding: zstd`; without the flag it is a compile error that names it.
 
 A client can be reused for as many requests as you like. Each one gets a fresh arena, exactly as a real connection does between requests.
 

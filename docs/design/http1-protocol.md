@@ -4,7 +4,7 @@
 
 **Guide:** [Requests](../guide/requests.md), [Forms](../guide/forms.md) · **Reference:** [Reading](../reference/ctx.md#reading), [`listen` options](../reference/app.md#listen-options)
 
-The code is `http/http1.zig` (`parseHead`, `parseRequestLine`, `finish`, `Encoding`), `http/ctx.zig` (`aboutToReadBody`, the gzip inflate inside `body`), `http/static.zig` (`etagMatchesStrong`) and `http/bulkhead.zig` (`read_buffer`).
+The code is `http/http1.zig` (`parseHead`, `parseRequestLine`, `finish`, `Encoding`), `http/ctx.zig` (`aboutToReadBody`, the gzip and zstd decode inside `body`), `http/zstdbody.zig` (the zstd decode, only in a build with `-Dzstd`), `http/static.zig` (`etagMatchesStrong`) and `http/bulkhead.zig` (`read_buffer`).
 
 ## Overview
 
@@ -23,7 +23,7 @@ The code is `http/http1.zig` (`parseHead`, `parseRequestLine`, `finish`, `Encodi
         ├─► Content-Length / Transfer-Encoding disagree, repeat, or          } error.BadHeader,
         │   frame both ways ─────────────────────────────────────────────── } already a 400
         ├─► HTTP/1.1 with no Host, or two of them ────────────────────────── }
-        └─► Content-Encoding other than identity or gzip on a body ──────── 415
+        └─► Content-Encoding other than identity or gzip (or zstd, -Dzstd) ─ 415
         │
         ▼
   Ctx.body() ──► gzip? inflate once into the arena, bounded by max_body
@@ -41,9 +41,9 @@ Each check runs at the first point that has all the information it needs, not wh
 6. **`Expect: 100-continue` is answered when nilo commits to reading the body, not when the header is parsed.** A request rejected before that point (a body too large, a 404, a 405, a handler that never reads the body) gets its final status and the client never sends the body. Nothing is sent for HTTP/1.0, for a request already answered, or for `Content-Length: 0`. [ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)
 7. **`If-Range` uses the strong comparison, never the `If-None-Match` one.** `etagMatchesStrong` rejects a `W/` tag and `*`, and treats an empty ETag as matching nothing. A resumed download appends bytes to a prefix it already has, and "close enough" is the one answer that corrupts it. [ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)
 8. **A multipart part that names its file only with `filename*` is a 400 naming the part, not a text field with the wrong value.** nilo still does not decode RFC 6266's encoded form; it just stops binding the part wrongly without a word. [ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)
-9. **A body with `Content-Encoding: gzip` is decompressed once into the request arena; any coding other than gzip or `identity` is a 415 naming the header.** The length declared in the gzip trailer sizes one exact allocation, and it is checked against `max_body` before anything is decompressed, so a small compressed body cannot grow past the limit an uncompressed one has. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
+9. **A body with `Content-Encoding: gzip` (or `zstd`, in a build with `-Dzstd`) is decompressed once into the request arena; any coding other than those or `identity` is a 415 naming the header.** The length declared in the gzip trailer sizes one exact allocation, and it is checked against `max_body` before anything is decompressed, so a small compressed body cannot grow past the limit an uncompressed one has. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
 10. **`Content-Encoding` on a request without a body is ignored.** Rejecting it would turn an ordinary GET into a 415 over a header that has no effect, the opposite of what rule 1 is for. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
-11. **`c.bodyStream()` decodes gzip as it is read, on a window taken from the request arena for that request alone, bounded on decoded bytes by its `max_bytes`; any other coding is its own 415**, except on a route that reads the coding itself. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
+11. **`c.bodyStream()` decodes gzip (and zstd, in a build that reads it, on a decoder sized by the frame) as it is read, on a window taken from the request arena for that request alone, bounded on decoded bytes by its `max_bytes`; any other coding is its own 415**, except on a route that reads the coding itself. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
 12. **A route can say it reads a `Content-Encoding` itself, and gets the bytes as they arrived.** `nilo.bodyEncodings(.{"snappy"})` names the codings; the refusal in rule 9 is held back until the route is matched, only for an App that uses it, and every other route is refused by the same bytes. A coding it did not name is a 415 with `Accept-Encoding`. The compressed length is held to `max_body`; what it decodes to is the handler's. [ADR 283](../adr/283-a-route-can-read-a-content-encoding-itself.md)
 13. **`read_buffer` defaults to 16 KiB, and it is both the connection's read buffer and the size limit for a request head.** A head that does not fit is a 431. A server that wants the old size passes `.read_buffer = 8 * 1024`. [ADR 196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)
 14. **A second parser reads the heads the fuzzer generates, and every difference with it must be explained in writing.** `zig build fuzz-llhttp -Dllhttp` gives each head to nilo and to llhttp. If nilo accepts what llhttp rejects, or the two frame a head differently, the run fails unless the case is listed in `decided` with the RFC section behind it. llhttp is linked only into that program and is fetched only with the flag. [ADR 231](../adr/231-a-second-parser-reads-what-the-first-one-reads.md)

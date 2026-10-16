@@ -9,6 +9,10 @@ server's sixteen threads serves some of them, so every compressor in the
 pool has been used by the end.
 
     python3 bench/compress_rss.py ./zig-out/bin/nilo-bench-compress-server
+    python3 bench/compress_rss.py ./zig-out/bin/nilo-bench-compress-server zstd   # a -Dzstd build (ADR 295)
+
+The optional second argument is the coding the load asks for (`gzip`, the
+default, or `zstd`); the "gzip load" row is then named for it.
 
 Prints Rss, AnonHugePages and Private_Dirty in bytes at each point, and in
 a libdeflate build the Rss of the pool's own mapping: the one area the
@@ -64,8 +68,8 @@ def pool_rss(pid):
     return per[0][1]
 
 
-def drive(gzip):
-    headers = {"Accept-Encoding": "gzip"} if gzip else {}
+def drive(coding):
+    headers = {"Accept-Encoding": coding} if coding else {}
     errors = []
 
     def one():
@@ -76,7 +80,7 @@ def drive(gzip):
                 r = conn.getresponse()
                 body = r.read()
                 coded = r.getheader("Content-Encoding")
-                if (coded == "gzip") != gzip or not body:
+                if coded != coding or not body:
                     errors.append(f"Content-Encoding {coded!r}, {len(body)} bytes")
                     return
             conn.close()
@@ -106,22 +110,23 @@ def wait_up():
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
+    coding = sys.argv[2] if len(sys.argv) == 3 else "gzip"
     server = subprocess.Popen([sys.argv[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_up()
         time.sleep(0.5)
         points = [("idle", rollup(server.pid), pool_rss(server.pid))]
-        drive(gzip=False)
+        drive(None)
         points.append(("plain load", rollup(server.pid), pool_rss(server.pid)))
-        drive(gzip=True)
-        points.append(("gzip load", rollup(server.pid), pool_rss(server.pid)))
+        drive(coding)
+        points.append((f"{coding} load", rollup(server.pid), pool_rss(server.pid)))
         print(f"{'point':<12} {'Rss':>12} {'AnonHugePages':>14} {'Private_Dirty':>14} {'pool Rss':>10}")
         for name, f, pool in points:
             shown = "-" if pool is None else f"{pool:,}"
             print(f"{name:<12} {f['Rss']:>12,} {f.get('AnonHugePages', 0):>14,} {f['Private_Dirty']:>14,} {shown:>10}")
-        print(f"gzip - plain {points[2][1]['Rss'] - points[1][1]['Rss']:>12,}")
+        print(f"{coding} - plain {points[2][1]['Rss'] - points[1][1]['Rss']:>12,}")
     finally:
         server.terminate()
         server.wait()

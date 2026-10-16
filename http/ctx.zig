@@ -15,6 +15,7 @@ const compress_mod = @import("compress.zig");
 const convert = @import("convert.zig");
 const cookie_mod = @import("cookie.zig");
 const encoded = @import("encoded.zig");
+const zstdbody = @import("zstdbody.zig");
 const field_mod = @import("field.zig");
 const framing_mod = @import("framing.zig");
 const http1 = @import("http1.zig");
@@ -134,6 +135,11 @@ pub const Held = union(enum) {
     file: sendfile_mod.Held,
 };
 
+/// The codings a 415 for a body names as the ones the server decodes (ADR 089,
+/// ADR 295): gzip, and zstd in a build that reads it.
+const decoded_codings = if (zstdbody.enabled) "gzip or zstd" else "gzip";
+const sendable_codings = decoded_codings;
+
 pub const Ctx = struct {
     /// What a nilo compile error calls this type, which is the name the
     /// reader's own import line gives it (ADR 074).
@@ -240,6 +246,11 @@ pub const Ctx = struct {
     /// test driving a handler by hand. A pointer to the App's, eight bytes
     /// on the Ctx (ADR 211).
     _compressors: ?*const compress_mod.Pool = null,
+    /// The zstd decoders the App holds, one per executor thread, for a body
+    /// under `Content-Encoding: zstd` (ADR 295). Absent from a build that
+    /// does not read zstd, so its Ctx is the size it was; null on a test that
+    /// drives a handler by hand, which takes a context from the arena.
+    _decoders: if (zstdbody.enabled) ?*zstdbody.Pool else void = if (zstdbody.enabled) null else {},
     _params: []const router.Param,
     /// The route that matched, or null when none did. A pointer into the
     /// App's own table rather than a copy of anything on it — eight bytes on
@@ -1515,12 +1526,34 @@ pub const Ctx = struct {
                 self._body_refused = true;
                 return fail.status(
                     415,
-                    "this server decodes Content-Encoding: gzip and nothing else, and this route does not read the one it was sent; " ++
-                        "send the body as identity or gzip",
+                    "this server decodes Content-Encoding: " ++ decoded_codings ++ " and nothing else, and this route does not read the one it was sent; " ++
+                        "send the body as identity or " ++ sendable_codings,
                     .{},
                 );
             }
-            if (self._request.content_encoding == .gzip and !self._body_as_sent) {
+            if (zstdbody.enabled and self._request.content_encoding == .zstd and !self._body_as_sent and received.len > 0) {
+                // The same terms as gzip's below: the ceiling is checked
+                // against the size the frame announces before a byte is
+                // decoded, and a frame that announces none is decoded into
+                // at most `max_body + 1` bytes (ADR 295). A body of no bytes
+                // under the header is an empty body.
+                received = zstdbody.decode(self._arena, self._decoders, received, self._limits.max_body) catch |err| {
+                    self._body = &.{};
+                    self._body_refused = true;
+                    switch (err) {
+                        error.BodyTooLarge, error.OutOfMemory => |e| return e,
+                        error.BadEncodedBody => return fail.badRequest(
+                            "the request body is not a zstd frame this server could decode — " ++
+                                "it arrived under Content-Encoding: zstd",
+                            .{},
+                        ),
+                    }
+                };
+            }
+            // A body of no bytes under the header is an empty body, as it is
+            // for zstd above and for `c.bodyStream()`: there is no member to
+            // be wrong about (ADR 089).
+            if (self._request.content_encoding == .gzip and !self._body_as_sent and received.len > 0) {
                 received = encoded.inflate(self._arena, received, self._limits.max_body) catch |err| {
                     // Nothing is held as the body, and the wire has been
                     // read to its end, which is what a non-null `_body`
@@ -1618,7 +1651,7 @@ pub const Ctx = struct {
         // named it (ADR 283) and gets the bytes as they came.
         if (self._request.content_encoding == .other and !self._body_as_sent) return fail.status(
             415,
-            "this route reads its body as a stream, which decodes Content-Encoding: gzip and nothing else — send it as identity or gzip",
+            "this route reads its body as a stream, which decodes Content-Encoding: " ++ decoded_codings ++ " and nothing else — send it as identity or " ++ sendable_codings,
             .{},
         );
 
@@ -1645,6 +1678,8 @@ pub const Ctx = struct {
         // to decode, and a request without the header pays for none of it.
         if (self._request.content_encoding == .gzip and !self._body_as_sent and self.announcesBody())
             try incoming.decodeGzip(self._arena);
+        if (zstdbody.enabled and self._request.content_encoding == .zstd and !self._body_as_sent and self.announcesBody())
+            try incoming.decodeZstd(self._arena, options);
         return incoming;
     }
 
@@ -2422,12 +2457,11 @@ pub const Ctx = struct {
         }
         try self.setStaticHeader("Vary", "Accept-Encoding");
         const accept = if (self.header("Accept-Encoding")) |h| h.view() else null;
-        if (!compress_mod.acceptsGzip(accept)) return null;
 
-        const smaller = pool.gzip(self._arena, response_body) orelse return null;
+        const packed_body = pool.encode(self._arena, response_body, accept) orelse return null;
         try self.weakenETag();
-        try self.setStaticHeader("Content-Encoding", "gzip");
-        return smaller;
+        try self.setStaticHeader("Content-Encoding", packed_body.name());
+        return packed_body.bytes;
     }
 
     /// A strong `ETag` promises the same bytes, and the gzipped body and the

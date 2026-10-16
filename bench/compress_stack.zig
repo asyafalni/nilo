@@ -12,7 +12,8 @@
 //! zig build bench-compress-stack -Dlibdeflate -Doptimize=ReleaseSafe
 //! ```
 //!
-//! Without `-Dlibdeflate` only the standard library's row is printed. Built
+//! Without `-Dlibdeflate` only the standard library's row is printed, and
+//! `-Dzstd` adds zstd's (ADR 295). Built
 //! in the mode asked for, unlike `bench-compress`, because the question is
 //! what each mode costs; the C is `ReleaseFast` in all of them.
 
@@ -74,6 +75,35 @@ fn measure(comptime which: compress.Backend, gpa: std.mem.Allocator, bodies: []c
     }
 }
 
+/// The same through `Pool.encodeAt` asking for zstd, which is the whole path a
+/// zstd answer takes below `Ctx.send`: the choice, the borrow, the frame
+/// (ADR 295). A body over the zstd ceiling goes to gzip, so the pool is sized
+/// for the largest body here.
+fn measureZstd(gpa: std.mem.Allocator, bodies: []const []const u8) !void {
+    const Pool = compress.PoolWith(.std, true);
+    const call = struct {
+        noinline fn zstd(pool: *const Pool, arena: std.mem.Allocator, body: []const u8) usize {
+            const made = pool.encodeAt(arena, body, "zstd", 0) orelse unreachable;
+            std.debug.assert(made.coding == .zstd);
+            return made.bytes.len;
+        }
+    }.zstd;
+    for ([_]compress.Level{ .fastest, .default, .best }) |level| {
+        var pool = try Pool.init(gpa, 1, .{ .level = level, .max_bytes = 4 << 20 });
+        defer pool.deinit(gpa);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const top = @frameAddress();
+        for (bodies) |body| {
+            const from = paint(top);
+            const n = call(&pool, arena.allocator(), body);
+            const used = deepest(top, from);
+            std.debug.print("{s:<11} {s:<8} {d:>9} B in  {d:>8} B out  {d:>6} B of stack\n", .{ "zstd", @tagName(level), body.len, n, used });
+            _ = arena.reset(.retain_capacity);
+        }
+    }
+}
+
 fn run(gpa: std.mem.Allocator) void {
     const bodies = [_][]const u8{
         text(gpa, 40) catch unreachable,
@@ -83,6 +113,7 @@ fn run(gpa: std.mem.Allocator) void {
     std.debug.print("mode {s}\n", .{@tagName(builtin.mode)});
     measure(.std, gpa, &bodies) catch |e| std.debug.panic("{s}", .{@errorName(e)});
     if (compress.libdeflate_linked) measure(.libdeflate, gpa, &bodies) catch |e| std.debug.panic("{s}", .{@errorName(e)});
+    if (compress.zstd_linked) measureZstd(gpa, &bodies) catch |e| std.debug.panic("{s}", .{@errorName(e)});
 }
 
 pub fn main() !void {

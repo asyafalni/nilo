@@ -42,6 +42,7 @@ Start here to understand a part of nilo. Each page links into [`docs/adr/`](../a
 - [The in-process cache](cache.md): `nilo_cache`.
 - [JWT verification](jwt.md): `nilo_jwt`.
 - [Protobuf](proto.md): `nilo_proto`.
+- [zstd](zstd.md): `nilo_zstd`.
 - [Outbound calls](fetch.md): `nilo_fetch`.
 - [Jobs](job.md): `nilo_job`.
 - [Object storage](s3.md): `nilo_s3`.

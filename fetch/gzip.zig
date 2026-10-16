@@ -1,7 +1,7 @@
 //! The reading side of a gzip answer, for the builds that asked for it
 //! ([ADR 292](../docs/adr/292-a-fetch-build-can-read-a-gzip-answer.md)).
 //!
-//! Nothing here is reached unless `fetch.zig` names `Reading` under its
+//! Nothing here is reached unless `decode.zig` names `Gunzip` under its
 //! `reads_gzip` constant, and that constant is `-Dfetch_gzip`. So a program
 //! that did not pass the flag links no flate, holds no window and allocates
 //! nothing for a decoder, and this file is analysed only as far as its imports.
@@ -14,24 +14,12 @@
 //! gzip` and given back by `Exchange.end`. The stack of a call grows by one
 //! pointer, and an answer that is not gzip pays nothing at all.
 //!
-//! **A second coding is a case here and nowhere else.** `Coding` is the list,
-//! `Reading.open` is the one switch on it, and `fetch.zig` asks only for
-//! `coding` and a `Reading`. zstd is not built (`docs/decided.md`).
+//! **A second coding is a case in `decode.zig`**, and zstd is the second
+//! (`zstd_read.zig`).
 
 const std = @import("std");
 const flate = std.compress.flate;
-
-/// The codings this build reads. Only gzip: `deflate` is ambiguous on the
-/// wire (zlib-wrapped by the RFC, raw by habit) and nobody sends it.
-pub const Coding = enum { gzip };
-
-/// What the answer's `Content-Encoding` is, when this build reads it.
-pub fn coding(encoding: std.http.ContentEncoding) ?Coding {
-    return switch (encoding) {
-        .gzip => .gzip,
-        else => null,
-    };
-}
+const decode = @import("decode.zig");
 
 /// The bytes asked of the connection at a time. flate asserts its input holds
 /// ten bytes and the body reader keeps no buffer of its own for the
@@ -41,22 +29,18 @@ const input_len = 4096;
 
 /// One answer being decoded. Address sensitive (the readers find it by
 /// `@fieldParentPtr`), so it is made on the heap and never moved.
-pub const Reading = struct {
+pub const Gunzip = struct {
+    /// First, so that the front of the allocation is the `Reading` the
+    /// caller holds. Its `out` is the decoded body as the caller reads it:
+    /// flate's own reader seen through a CRC-32 and a byte count, because
+    /// `std.compress.flate` reads the gzip footer and compares nothing in it.
+    /// Unbuffered, so every byte flows through `decoded` once.
+    head: decode.Reading,
     gpa: std.mem.Allocator,
-    /// The body as the connection delivers it, compressed: `tap` under a
-    /// `stall_ms`, std's own reader otherwise. `Exchange.finish` drains this
-    /// one and never the decoded side, so a bomb is not decoded to be thrown
-    /// away.
-    source: *std.Io.Reader,
     /// A buffered face for `source`, which flate needs and which the body
     /// reader (empty buffer, bytes straight from the socket) is not.
     input: std.Io.Reader,
     flate: flate.Decompress,
-    /// The decoded body as the caller reads it: flate's own reader seen
-    /// through a CRC-32 and a byte count, because `std.compress.flate` reads
-    /// the gzip footer and compares nothing in it. Unbuffered, so every byte
-    /// flows through `decoded` once.
-    out: std.Io.Reader,
     crc: std.hash.Crc32,
     count: u32,
     /// The stream ended and its footer is not what was decoded.
@@ -64,44 +48,53 @@ pub const Reading = struct {
     input_buffer: [input_len]u8,
     window: [flate.max_window_len]u8,
 
-    /// Nothing is read from `source` until the first read of `reader()`.
-    pub fn open(gpa: std.mem.Allocator, source: *std.Io.Reader, how: Coding) error{OutOfMemory}!*Reading {
-        const self = try gpa.create(Reading);
+    /// Nothing is read from `source` until the first read of the result's
+    /// `reader()`.
+    pub fn open(gpa: std.mem.Allocator, source: *std.Io.Reader) error{OutOfMemory}!*decode.Reading {
+        const self = try gpa.create(Gunzip);
         self.gpa = gpa;
-        self.source = source;
+        self.head = .{
+            .source = source,
+            .out = .{ .vtable = &.{ .stream = decoded }, .buffer = &.{}, .seek = 0, .end = 0 },
+            .vtable = &reading_vtable,
+        };
         self.input = .{ .vtable = &.{ .stream = pass }, .buffer = &self.input_buffer, .seek = 0, .end = 0 };
-        self.flate = .init(&self.input, switch (how) {
-            .gzip => .gzip,
-        }, &self.window);
-        self.out = .{ .vtable = &.{ .stream = decoded }, .buffer = &.{}, .seek = 0, .end = 0 };
+        self.flate = .init(&self.input, .gzip, &self.window);
         self.crc = .init();
         self.count = 0;
         self.mismatch = false;
-        return self;
+        return &self.head;
     }
 
-    pub fn close(self: *Reading) void {
+    const reading_vtable: decode.Reading.VTable = .{
+        .close = close,
+        .undecodable = undecodable,
+        .outOfMemory = outOfMemory,
+    };
+
+    fn close(head: *decode.Reading) void {
+        const self: *Gunzip = @fieldParentPtr("head", head);
         self.gpa.destroy(self);
     }
 
-    /// The decoded body.
-    pub fn reader(self: *Reading) *std.Io.Reader {
-        return &self.out;
-    }
-
-    /// Whether the last `ReadFailed` of `reader()` was the bytes and not the
-    /// connection: a header that is not gzip, a block that does not decode, a
-    /// checksum or a length that disagrees with the footer, a body that ends
-    /// before the stream does. A failure of the connection is the same error
-    /// flate gets from `source`, and it is the caller's to blame on a clock.
-    pub fn undecodable(self: *const Reading) bool {
+    /// A header that is not gzip, a block that does not decode, a checksum
+    /// or a length that disagrees with the footer, a body that ends before
+    /// the stream does. A failure of the connection is the same error flate
+    /// gets from `source`.
+    fn undecodable(head: *const decode.Reading) bool {
+        const self: *const Gunzip = @fieldParentPtr("head", head);
         if (self.mismatch) return true;
         const err = self.flate.err orelse return false;
         return err != error.ReadFailed;
     }
 
+    fn outOfMemory(_: *const decode.Reading) bool {
+        return false;
+    }
+
     fn decoded(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Reading = @alignCast(@fieldParentPtr("out", r));
+        const head: *decode.Reading = @alignCast(@fieldParentPtr("out", r));
+        const self: *Gunzip = @fieldParentPtr("head", head);
         var hashed: std.Io.Writer.Hashed(std.hash.Crc32) = .initHasher(w, self.crc, &.{});
         defer self.crc = hashed.hasher;
         const n = self.flate.reader.stream(&hashed.writer, limit) catch |err| {
@@ -121,8 +114,8 @@ pub const Reading = struct {
     }
 
     fn pass(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Reading = @alignCast(@fieldParentPtr("input", r));
-        return self.source.stream(w, limit);
+        const self: *Gunzip = @alignCast(@fieldParentPtr("input", r));
+        return self.head.source.stream(w, limit);
     }
 };
 
@@ -150,7 +143,7 @@ test "a gzip stream reads back as what it was" {
     try std.testing.expect(packed_bytes.len < plain.len / 10);
 
     var source: std.Io.Reader = .fixed(packed_bytes);
-    const reading = try Reading.open(gpa, &source, .gzip);
+    const reading = try decode.Reading.open(gpa, &source, .gzip);
     defer reading.close();
     const got = try reading.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(got);
@@ -160,7 +153,7 @@ test "a gzip stream reads back as what it was" {
 test "bytes that are not gzip are undecodable and a dead connection is not" {
     const gpa = std.testing.allocator;
     var source: std.Io.Reader = .fixed("this is not gzip at all, not at all");
-    const reading = try Reading.open(gpa, &source, .gzip);
+    const reading = try decode.Reading.open(gpa, &source, .gzip);
     defer reading.close();
     try std.testing.expectError(error.ReadFailed, reading.reader().allocRemaining(gpa, .unlimited));
     try std.testing.expect(reading.undecodable());
@@ -176,7 +169,7 @@ test "a footer that disagrees with the body is undecodable" {
         packed_bytes[packed_bytes.len - from_end] ^= 0x01;
 
         var source: std.Io.Reader = .fixed(packed_bytes);
-        const reading = try Reading.open(gpa, &source, .gzip);
+        const reading = try decode.Reading.open(gpa, &source, .gzip);
         defer reading.close();
         try std.testing.expectError(error.ReadFailed, reading.reader().allocRemaining(gpa, .unlimited));
         try std.testing.expect(reading.undecodable());

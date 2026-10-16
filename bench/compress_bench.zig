@@ -8,7 +8,9 @@
 //!
 //! `-Dlibdeflate` times libdeflate through the same `Pool` (ADR 248); the
 //! two builds' tables side by side are the comparison, on the same machine
-//! the same afternoon.
+//! the same afternoon. `-Dzstd` adds a row per coding: the same `Pool` asked
+//! for `Accept-Encoding: zstd` at its three levels (1, 3 and 6), which is a
+//! zstd answer as `app.compress` builds one (ADR 295).
 //!
 //! Always `ReleaseFast`: a Debug deflate is a different program. No server
 //! and no socket, because the number wanted is the compressor's alone: the
@@ -32,6 +34,10 @@
 
 const std = @import("std");
 const nilo = @import("nilo_http");
+
+/// The codings this build can be asked for, as the `Accept-Encoding` that
+/// asks for each.
+const codings: []const []const u8 = if (nilo.compress.zstd_enabled) &.{ "gzip", "zstd" } else &.{"gzip"};
 
 const Item = struct {
     id: u32,
@@ -91,11 +97,11 @@ pub fn main() !void {
     const rounds = 2000;
 
     const print = std.debug.print;
-    print("{s:>6} {s:>8} {s:>9} {s:>9} {s:>7} {s:>9}\n", .{ "items", "level", "in B", "out B", "ratio", "us/body" });
+    print("{s:>6} {s:>5} {s:>8} {s:>9} {s:>9} {s:>7} {s:>9}\n", .{ "items", "coding", "level", "in B", "out B", "ratio", "us/body" });
 
     for (shapes) |shape| {
         const plain = try body(arena, shape.count, shape.m);
-        for (levels) |level| {
+        for (levels) |level| for (codings) |coding| {
             var pool = try nilo.compress.Pool.init(gpa, 1, .{ .level = level });
             defer pool.deinit(gpa);
 
@@ -108,33 +114,34 @@ pub fn main() !void {
             // Warm, then time.
             var squeezed_len: usize = 0;
             for (0..100) |_| {
-                squeezed_len = pool.gzip(request_arena.allocator(), plain).?.len;
+                squeezed_len = pool.encodeAt(request_arena.allocator(), plain, coding, 0).?.bytes.len;
                 _ = request_arena.reset(.retain_capacity);
             }
             const started = monotonicNanos();
             for (0..rounds) |_| {
-                _ = pool.gzip(request_arena.allocator(), plain).?;
+                _ = pool.encodeAt(request_arena.allocator(), plain, coding, 0).?;
                 _ = request_arena.reset(.retain_capacity);
             }
             const ns = monotonicNanos() - started;
-            print("{d:>6} {s:>8} {d:>9} {d:>9} {d:>6.1}% {d:>9.1}\n", .{
+            print("{d:>6} {s:>5} {s:>8} {d:>9} {d:>9} {d:>6.1}% {d:>9.1}\n", .{
                 shape.count,
+                coding,
                 @tagName(level),
                 plain.len,
                 squeezed_len,
                 @as(f64, @floatFromInt(squeezed_len)) * 100.0 / @as(f64, @floatFromInt(plain.len)),
                 @as(f64, @floatFromInt(ns)) / @as(f64, rounds) / 1000.0,
             });
-        }
+        };
     }
 
     print("\nwhat one body holds the thread for, by size\n", .{});
-    print("{s:>8} {s:>9} {s:>8} {s:>9} {s:>7} {s:>10} {s:>8}\n", .{ "items", "in B", "level", "out B", "ratio", "ms/body", "MB/s" });
+    print("{s:>8} {s:>9} {s:>5} {s:>8} {s:>9} {s:>7} {s:>10} {s:>8}\n", .{ "items", "in B", "coding", "level", "out B", "ratio", "ms/body", "MB/s" });
     const sweep = [_]usize{ 250, 1_000, 6_000, 24_000, 120_000 };
     for (sweep) |count| {
         const plain = try body(arena, count, 5);
-        for ([_]nilo.compress.Level{ .fastest, .default }) |level| {
-            var pool = try nilo.compress.Pool.init(gpa, 1, .{ .level = level });
+        for ([_]nilo.compress.Level{ .fastest, .default }) |level| for (codings) |coding| {
+            var pool = try nilo.compress.Pool.init(gpa, 1, .{ .level = level, .max_bytes = 32 << 20 });
             defer pool.deinit(gpa);
             var request_arena = std.heap.ArenaAllocator.init(gpa);
             defer request_arena.deinit();
@@ -142,24 +149,25 @@ pub fn main() !void {
             // Enough rounds for about a quarter of a second, and never fewer
             // than five, so the large ones are not a single reading.
             var squeezed_len: usize = 0;
-            _ = pool.gzip(request_arena.allocator(), plain).?;
+            _ = pool.encodeAt(request_arena.allocator(), plain, coding, 0).?;
             _ = request_arena.reset(.retain_capacity);
             const rounds_here: usize = @max(5, @min(2000, 40_000_000 / plain.len));
             const started = monotonicNanos();
             for (0..rounds_here) |_| {
-                squeezed_len = pool.gzip(request_arena.allocator(), plain).?.len;
+                squeezed_len = pool.encodeAt(request_arena.allocator(), plain, coding, 0).?.bytes.len;
                 _ = request_arena.reset(.retain_capacity);
             }
             const ns = @as(f64, @floatFromInt(monotonicNanos() - started)) / @as(f64, @floatFromInt(rounds_here));
-            print("{d:>8} {d:>9} {s:>8} {d:>9} {d:>6.1}% {d:>10.3} {d:>8.1}\n", .{
+            print("{d:>8} {d:>9} {s:>5} {s:>8} {d:>9} {d:>6.1}% {d:>10.3} {d:>8.1}\n", .{
                 count,
                 plain.len,
+                coding,
                 @tagName(level),
                 squeezed_len,
                 @as(f64, @floatFromInt(squeezed_len)) * 100.0 / @as(f64, @floatFromInt(plain.len)),
                 ns / 1_000_000.0,
                 @as(f64, @floatFromInt(plain.len)) / ns * 1000.0,
             });
-        }
+        };
     }
 }

@@ -1109,6 +1109,8 @@ test {
     _ = @import("follow.zig");
     _ = @import("lease.zig");
     _ = @import("encoded.zig");
+    _ = @import("zstdbody.zig");
+    _ = @import("zstd_request.zig");
     _ = @import("router.zig");
     _ = @import("url.zig");
     _ = @import("proxies.zig");

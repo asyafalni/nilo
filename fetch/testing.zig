@@ -221,6 +221,29 @@ pub const Canned = struct {
         self.reply(status, out[packed_len..][0 .. line.len + headers.len], out[0..packed_len]);
     }
 
+    /// `replyGzip`'s counterpart for zstd (ADR 295): `plain` as one zstd
+    /// frame under `Content-Encoding: zstd`, written into `out` the same way
+    /// (the frame first, where a test can damage it, then the headers), with
+    /// the frame's length claimed. The context libzstd compresses on is made
+    /// and freed here from the page allocator, since a test helper has no
+    /// allocator of its own and a frame is a few kilobytes at most.
+    /// Needs a build with `.zstd = true`, which this repository's tests are.
+    pub fn replyZstd(self: *Canned, out: []u8, status: []const u8, headers: []const u8, plain: []const u8) !void {
+        const z = @import("nilo_zstd");
+        const gpa = std.heap.page_allocator;
+        const options: z.EncodeOptions = .{};
+        const mem = try gpa.alignedAlloc(u8, z.workspace_alignment, z.Compressor.contextSize(options, plain.len));
+        defer gpa.free(mem);
+        var compressor = try z.Compressor.init(mem, options, plain.len);
+        const line = "Content-Encoding: zstd\r\n";
+        if (out.len < line.len + headers.len) return error.NoSpaceLeft;
+        const frame = compressor.compress(out[0 .. out.len - line.len - headers.len], plain) catch return error.NoSpaceLeft;
+        const packed_len = frame.len;
+        @memcpy(out[packed_len..][0..line.len], line);
+        @memcpy(out[packed_len + line.len ..][0..headers.len], headers);
+        self.reply(status, out[packed_len..][0 .. line.len + headers.len], out[0..packed_len]);
+    }
+
     /// The request head that arrived, one line per header and `\n` between
     /// them, as it was on the wire. Empty until a `serve*` has read one.
     pub fn request(self: *const Canned) []const u8 {
@@ -241,13 +264,14 @@ pub const Canned = struct {
 
     /// The request body with its content coding undone, in memory from
     /// `gpa` that the caller frees: what a test compares with the bytes it
-    /// meant to send. `gzip` is the one coding there is; a body under none
-    /// comes back copied. `error.BodyTruncated` for one larger than the
+    /// meant to send. `gzip` and `zstd` are the codings there are; a body
+    /// under none comes back copied. `error.BodyTruncated` for one larger than the
     /// kilobyte kept, which would decode to nonsense.
     pub fn requestBodyDecoded(self: *const Canned, gpa: std.mem.Allocator) ![]u8 {
         if (self.body_claimed > self.body_seen_len) return error.BodyTruncated;
         const wire = self.requestBody();
         const coding = self.requestEncoding() orelse return gpa.dupe(u8, wire);
+        if (std.ascii.eqlIgnoreCase(coding, "zstd")) return inflateZstd(gpa, wire);
         if (!std.ascii.eqlIgnoreCase(coding, "gzip")) return error.UnknownCoding;
         return inflateGzip(gpa, wire);
     }
@@ -996,6 +1020,19 @@ pub fn inflateGzip(gpa: std.mem.Allocator, gzipped: []const u8) ![]u8 {
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var d: std.compress.flate.Decompress = .init(&in, .gzip, &window);
     return d.reader.allocRemaining(gpa, .unlimited);
+}
+
+/// `frame` (one or several zstd frames) decoded into memory from `gpa`, for a
+/// test that holds what a client sent. Sized from the frame's own header, so
+/// it serves a frame that announces its length and a stream that does not.
+pub fn inflateZstd(gpa: std.mem.Allocator, frame: []const u8) ![]u8 {
+    const z = @import("nilo_zstd");
+    const need = try z.StreamDecoder.sizeFrom(frame[0..@min(frame.len, z.frame_header_max)], .{});
+    const mem = try gpa.alignedAlloc(u8, z.workspace_alignment, need);
+    defer gpa.free(mem);
+    var in: std.Io.Reader = .fixed(frame);
+    var decoder = try z.StreamDecoder.init(mem, &in, &.{}, .{});
+    return decoder.reader.allocRemaining(gpa, .unlimited);
 }
 
 /// One step of what `Canned.serveWebSocket` plays at a client.

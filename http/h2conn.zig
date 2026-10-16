@@ -104,6 +104,7 @@ const hpack = @import("hpack.zig");
 const bulkhead = @import("bulkhead.zig");
 const fail = @import("fail.zig");
 const encoded = @import("encoded.zig");
+const zstdbody = @import("zstdbody.zig");
 const core = @import("nilo_core");
 const framing = @import("framing.zig");
 const grpc = @import("grpc.zig");
@@ -131,6 +132,10 @@ pub const Host = struct {
     /// does: what one connection's messages are bounded by together
     /// (`Conn.budget`, ADR 220).
     ceiling: usize,
+    /// The zstd decoders of the App behind this connection, for a message
+    /// under `grpc-encoding: zstd` (ADR 295). Absent from a build that does
+    /// not read zstd.
+    decoders: if (zstdbody.enabled) ?*zstdbody.Pool else void = if (zstdbody.enabled) null else {},
     /// What a request to this method and path is collected under: the
     /// route's `maxBody` where it has one, `max_body` where it has not. Read
     /// once the headers are in, before a byte of the body (ADR 156, ADR 220).
@@ -3081,6 +3086,7 @@ fn readMessage(s: *Stream) !?[]const u8 {
             return null;
         },
         .gzip => {},
+        .zstd => if (comptime zstdbody.enabled) return readZstdMessage(s, whole[grpc.prefix_len..]) else unreachable,
     }
     // The inflated copy is charged to the budget **before** it is
     // allocated, by the size the stream announces, and `inflate` is
@@ -3107,6 +3113,31 @@ fn readMessage(s: *Stream) !?[]const u8 {
     return encoded.inflate(a, whole[grpc.prefix_len..], announced) catch |err| switch (err) {
         error.BodyTooLarge => return refused(s, 8, "the message is larger than its route's body limit"),
         else => return refused(s, 13, "the message's gzip could not be read"),
+    };
+}
+
+/// A zstd message, decoded under the connection's budget as a gzip one is
+/// (ADR 220, ADR 295). **A frame that announces its size is charged by it**,
+/// exactly. One that does not (gRPC implementations that stream through an
+/// encoder write none) is charged the route's whole limit, because that is
+/// the most it may hold: the budget is the connection's memory, and a bomb
+/// cannot make it hold more than it counted.
+noinline fn readZstdMessage(s: *Stream, frame: []const u8) !?[]const u8 {
+    const a = s.arena.allocator();
+    const announced = zstdbody.announcedSize(frame, s.limit) catch |err| return switch (err) {
+        error.BodyTooLarge => refused(s, 8, "the message is larger than its route's body limit"),
+        else => refused(s, 13, "the message's zstd could not be read"),
+    };
+    s.inbox.reserve(announced orelse s.limit) catch |err| switch (err) {
+        error.BodyTooSlow => return refused(s, 4, "the call's deadline passed while it waited for room on this connection"),
+        error.EndOfStream => {
+            s.reset = true;
+            return null;
+        },
+    };
+    return zstdbody.decode(a, s.app.decoders, frame, s.limit) catch |err| switch (err) {
+        error.BodyTooLarge => return refused(s, 8, "the message is larger than its route's body limit"),
+        else => return refused(s, 13, "the message's zstd could not be read"),
     };
 }
 
@@ -3981,7 +4012,7 @@ test "a compressed message in an encoding this server does not read is UNIMPLEME
     const trailers = try got.trailers(1);
     try testing.expectEqualStrings("12", Answer.value(trailers, "grpc-status").?);
     // And says which it does read, so the client can send again in one.
-    try testing.expectEqualStrings("identity,gzip", Answer.value(trailers, "grpc-accept-encoding").?);
+    try testing.expectEqualStrings(if (zstdbody.enabled) "identity,gzip,zstd" else "identity,gzip", Answer.value(trailers, "grpc-accept-encoding").?);
 }
 
 /// `n` bytes of one message's DATA on `stream`, in frames of 16,000, the
@@ -5814,7 +5845,7 @@ test "a route that names a Content-Encoding reads it on HTTP/2 as on HTTP/1.1, a
     } });
     defer unlisted.deinit();
     try testing.expectEqual(@as(u16, 415), unlisted.status);
-    try testing.expectEqualStrings("identity, gzip, snappy", unlisted.header("accept-encoding").?);
+    try testing.expectEqualStrings(if (zstdbody.enabled) "identity, gzip, zstd, snappy" else "identity, gzip, snappy", unlisted.header("accept-encoding").?);
 
     var elsewhere = try h2test.roundTrip(&app, .{ .method = "POST", .path = "/size", .body = "abc", .fields = &.{
         .{ .name = "content-encoding", .value = "snappy" },

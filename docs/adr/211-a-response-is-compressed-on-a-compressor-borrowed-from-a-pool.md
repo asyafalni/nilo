@@ -121,6 +121,8 @@ in one mapping kept off huge pages, with no reset to hold, because it keeps
 no state between bodies. Every figure below is the standard library's;
 ADR 248 has libdeflate's.
 
+**A build with `-Dzstd` also answers zstd** ([ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)). Everything above holds for both codings; what changes is the choice and what the pool holds. The pool grows a `zstd.CompressorPool` of one per executor thread beside gzip's (`Pool.zstd_slots`; nothing at all without the flag, and `Options.zstd = false` builds none), each in one mapping kept off huge pages and sized for `max_bytes` (a megabyte where that is zero, since a context has to be sized for a length), so a body over it goes to gzip. `Pool.encode` takes the request's `Accept-Encoding` and answers the coding the client prefers: **the highest `q`, zstd on a tie** (`compress.negotiateResponse`; a browser's `gzip, deflate, br, zstd` weighs all at 1), `zstd;q=0` never, `*` a yes unless zstd is named. A zstd that cannot answer (no compressor free, the frame no smaller than the body) falls to gzip when the client takes it. The borrow rule, the destination of half the body plus 64, the weak ETag, the `Vary` and every left-alone case are the same for both. `Level` is `.fastest` 1, `.default` 3, `.best` 6 for zstd. Memory, time and stack are in ADR 295 and `bench/result/zstd.md`.
+
 **The roadmap's other two questions are answered by leaving both out.** A
 stream is written in pieces to the socket, so it has no whole body to
 compress into the arena and its compressor would be held across every
@@ -221,7 +223,7 @@ server that is merely busy. With the body whole and in the arena the
 borrow is bounded by CPU, the length is known, HEAD is free, and the
 answer is one write.
 
-**Brotli.** The arena scores bytes per response quadratically and its
+**Brotli (still).** The arena scores bytes per response quadratically and its
 clients advertise `br`, so an entry sending gzip sits behind one sending
 brotli whatever else it does. There is no brotli encoder in Zig's standard
 library and the only complete one is Google's C. That is a dependency
@@ -271,6 +273,7 @@ only to ask whether it carried a body, and the headers only to ask about
 
 ## Consequences
 
+- `http/compress.zig` (ADR 295): `Options.zstd`, `Level.zstdLevel`, `Pool.encode`/`encodeAt`/`offersZstd` and `PoolWith`, `negotiateResponse`; `Coding` gains `zstd`.
 - `http/compress.zig`: `Options`, `Level`, `Pool`, and the
   `acceptsGzip` and `compressible` that `static.zig` and `serve.zig` now
   import from here.

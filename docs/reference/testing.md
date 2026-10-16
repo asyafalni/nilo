@@ -28,8 +28,9 @@
 | `answer.setCookie(name)` | the whole `Set-Cookie` line that sets it |
 | `answer.text(&buf)` | the body with chunk framing removed, into a buffer you sized |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
-| `answer.decoded(arena)` | `bytes`, inflated when the answer says `Content-Encoding: gzip` (what `app.compress` sends). `bytes` and `text` stay the wire's bytes, so a test can assert the answer was compressed; another encoding is `error.UnsupportedEncoding` |
+| `answer.decoded(arena)` | `bytes`, inflated when the answer says `Content-Encoding: gzip` (what `app.compress` sends), or decoded when it says `zstd` in a build with `-Dzstd` (the decoder's 95,968 bytes come from `arena`). `bytes` and `text` stay the wire's bytes, so a test can assert the answer was compressed; another encoding is `error.UnsupportedEncoding` |
 | `testing.gzip(arena, bytes)` | `![]u8`: `bytes` as a gzip member, for a request sent with `Content-Encoding: gzip` set through `headers` |
+| `testing.zstd(arena, bytes)` | `![]u8`: `bytes` as one zstd frame with its size and checksum, for a request sent with `Content-Encoding: zstd`. **Only in a build with `-Dzstd`**, the build that reads the coding; in any other it is a compile error naming the flag ([ADR 295](../adr/295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)) |
 | `client.settle()` | waits for the work `nilo.spawn` started under a client; see [`nilo.spawn` under a client](#nilospawn-under-a-client) |
 | `answer.json(T, arena)` | `!T`: the body (inflated first when gzipped) parsed back into a value ([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)) |
 | `error.AnswerStale` | what the three above return once the client has sent a later request: `.body` borrows the client's single buffer while `.status` is a value, and without this error the two would silently disagree ([ADR 171](../adr/171-an-answer-knows-which-request-it-was.md)) |

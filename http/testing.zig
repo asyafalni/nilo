@@ -29,6 +29,7 @@ const std = @import("std");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const bulkhead = @import("bulkhead.zig");
+const compress_mod = @import("compress.zig");
 const fail = @import("fail.zig");
 const str_mod = @import("nilo_core");
 
@@ -262,17 +263,20 @@ pub const Answer = struct {
 
     /// The body as a client that sent `Accept-Encoding: gzip` reads it: `bytes`,
     /// inflated when the answer says `Content-Encoding: gzip` (what
-    /// `app.compress` and a precompressed static file send), and `bytes`
-    /// unchanged otherwise. Into memory the caller owns, like `bytes`.
+    /// `app.compress` and a precompressed static file send), decoded when it
+    /// says `zstd` in a build with `-Dzstd` (ADR 295), and `bytes` unchanged
+    /// otherwise. Into memory the caller owns, like `bytes`; a zstd answer
+    /// also takes the decoder's 95,968 bytes from it.
     ///
     /// `bytes` and `text` stay the wire's bytes on purpose: a test that asserts
     /// the answer *was* compressed reads them, and `header("Content-Encoding")`
     /// beside them. Another encoding is `error.UnsupportedEncoding`, not
-    /// guessed at.
+    /// guessed at, and so is `zstd` in a build that links no zstd.
     pub fn decoded(self: Answer, arena: std.mem.Allocator) ![]const u8 {
         const wire = try self.bytes(arena);
         const coding = self.header("Content-Encoding") orelse return wire;
         if (std.ascii.eqlIgnoreCase(coding, "identity")) return wire;
+        if (compress_mod.zstd_linked and std.ascii.eqlIgnoreCase(coding, "zstd")) return unzstd(arena, wire);
         if (!std.ascii.eqlIgnoreCase(coding, "gzip")) return error.UnsupportedEncoding;
         return @import("encoded.zig").inflate(arena, wire, max_decoded) catch error.BadEncodedBody;
     }
@@ -307,6 +311,17 @@ pub const Answer = struct {
     }
 };
 
+/// One zstd frame decoded into `arena`, bounded by `max_decoded` (ADR 295).
+fn unzstd(arena: std.mem.Allocator, wire: []const u8) ![]const u8 {
+    const libzstd = @import("nilo_zstd");
+    const memory = try arena.alignedAlloc(u8, libzstd.workspace_alignment, libzstd.Decompressor.contextSize());
+    var decoder = libzstd.Decompressor.init(memory, .{}) catch return error.BadEncodedBody;
+    return decoder.decode(arena, wire, max_decoded) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadEncodedBody,
+    };
+}
+
 /// The most `Answer.decoded` inflates, so a test of a runaway answer fails
 /// rather than fills memory.
 const max_decoded = 64 << 20;
@@ -332,6 +347,34 @@ pub fn gzip(arena: std.mem.Allocator, bytes: []const u8) ![]u8 {
     try compress.writer.writeAll(bytes);
     try compress.finish();
     return out.toOwnedSlice();
+}
+
+/// `bytes` as one zstd frame, for a request body sent under
+/// `Content-Encoding: zstd`, into `arena`: the counterpart of `gzip`.
+///
+/// ```zig
+/// const packed_body = try nilo.testing.zstd(arena, json);
+/// _ = try client.sendRequest(&app, .{ .method = "POST", .path = "/ingest", .body = packed_body,
+///     .headers = &.{.{ .name = "Content-Encoding", .value = "zstd" }} });
+/// ```
+///
+/// libzstd at its default level, with the content size and the checksum a
+/// real client writes, in a context from `arena` (a test may allocate; the
+/// server never does here, ADR 295). **Only in a build with `-Dzstd`**, the
+/// same build that reads the coding; in any other it is a compile error that
+/// names the flag, since a test could only send a body the server would
+/// answer 415.
+pub fn zstd(arena: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    if (comptime !@import("nilo_build").zstd) @compileError(
+        "nilo: testing.zstd needs a build that reads zstd.\n" ++
+            "  Pass `.zstd = true` to `b.dependency(\"nilo\", …)` (or `-Dzstd` in this repository), " ++
+            "or send the body with `testing.gzip`.",
+    );
+    const codec = @import("nilo_zstd");
+    const memory = try arena.alignedAlloc(u8, codec.workspace_alignment, codec.Compressor.contextSize(.{}, bytes.len));
+    var compressor = try codec.Compressor.init(memory, .{}, bytes.len);
+    const out = try arena.alloc(u8, codec.compressBound(bytes.len));
+    return compressor.compress(out, bytes);
 }
 
 /// A value rendered the way it goes over the wire, for a failure message

@@ -108,6 +108,7 @@ nav:
       - cache.md
       - jwt.md
       - proto.md
+      - zstd.md
       - id.md
   - Shipping it:
       - testing.md

@@ -23,6 +23,7 @@ const hpack = @import("hpack.zig");
 const h2 = @import("h2.zig");
 const bulkhead = @import("bulkhead.zig");
 const encoded = @import("encoded.zig");
+const zstd_read = @import("zstdbody.zig").enabled;
 const framing = @import("framing.zig");
 const codes = @import("code.zig");
 
@@ -200,6 +201,10 @@ pub const Envelope = union(enum) {
     identity,
     /// The message is gzip, which the connection inflates under its budget.
     gzip,
+    /// The message is zstd, decoded under the same budget. Only in a build
+    /// that reads zstd (ADR 295); in any other it is `unsupported`, as every
+    /// coding but gzip is.
+    zstd,
     /// Marked compressed in an encoding this server does not read, which is
     /// answered with `unsupportedEncoding`.
     unsupported,
@@ -219,6 +224,7 @@ pub fn envelope(body: []const u8, encoding: ?[]const u8) Envelope {
     const named = encoding orelse "identity";
     if (std.mem.eql(u8, named, "identity"))
         return .{ .refused = .{ .code = 13, .message = "the message is marked compressed and grpc-encoding names no compression" } };
+    if (zstd_read and std.mem.eql(u8, named, "zstd")) return .zstd;
     if (!std.mem.eql(u8, named, "gzip")) return .unsupported;
     return .gzip;
 }
@@ -227,7 +233,7 @@ pub fn envelope(body: []const u8, encoding: ?[]const u8) Envelope {
 /// encodings this server does read.
 pub fn unsupportedEncoding(a: std.mem.Allocator) ![]const u8 {
     return trailersOnlyWith(a, 12, .{ .ours = "the message is compressed with an encoding this server does not read" }, &.{
-        .{ .name = "grpc-accept-encoding", .value = "identity,gzip" },
+        .{ .name = "grpc-accept-encoding", .value = if (zstd_read) "identity,gzip,zstd" else "identity,gzip" },
     });
 }
 

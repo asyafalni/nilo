@@ -2,6 +2,7 @@
 
 **Status:** accepted
 **Topic:** [http1-protocol](../design/http1-protocol.md)
+**Extends:** [ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md) (the second coding, behind a flag)
 
 ## Context
 
@@ -14,6 +15,16 @@ Refusing every encoding once meant refusing gzip too. Decoding it was set aside 
 **A body under any `Content-Encoding` but `identity` or `gzip` is a 415 naming the header, unless the route's chain says it reads that coding itself. A body under `gzip` is inflated once into the arena, in place of the bytes that arrived, and nothing after that line knows how it was sent. `c.bodyStream()` decodes gzip as the body is read, on a window held in the arena.**
 
 **A route can read a coding itself** (`nilo.bodyEncodings(.{"snappy"})`, [ADR 283](./283-a-route-can-read-a-content-encoding-itself.md)): for an App that has one, the refusal below is held back until the route is matched, and a body under a coding the matched route names reaches `c.body()` and `c.bodyStream()` as it arrived (naming `"gzip"` passes gzip through undecoded on both). Every other route, and every App that has none, is refused as this ADR says.
+
+### zstd is the second coding, in a build that asked for it
+
+**In a build with `-Dzstd` (`.zstd = true`) a body under `Content-Encoding: zstd` is decoded as gzip is, and every sentence above that says "gzip" holds for it with the differences below. In a build without the flag nothing changes: `zstd` is a coding nilo does not read, a 415, and no zstd code is linked** ([ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)). The parser decides at compile time (`http1.Encoding` has `.zstd`, produced only by a build that reads it), so a route that names `"zstd"` in `bodyEncodings` gets the bytes as they arrived in either build, and the 415's `Accept-Encoding` lists `zstd` only where it is read.
+
+- **`c.body()`** decodes into one arena allocation of exactly the size the frame announces, checked against `max_body` before anything is allocated or decoded (`http/zstdbody.zig`). A frame carries its size in its header where gzip carries it in a trailer, so the check is cheaper and cannot be fooled by the last four bytes of a truncated stream. The context is not on the stack and not in the arena: it is a 95,968-byte slot of a `DecompressorPool` the App sizes to the thread count next to the compressors, borrowed for the one call, which parks nowhere. An App with no server under it takes one from the arena.
+- **A frame that announces no size** (a streaming encoder cannot: the OpenTelemetry Collector's is one) is decoded into at most `max_body + 1` bytes and the allocation is shrunk to what it used, so a bomb of a few kilobytes costs the ceiling and is a 413.
+- **A checksum the frame carries is verified, by libzstd, in both readers**: a flipped bit is a 400 where `std`'s decoders would pass it. A frame without one is accepted, because peers differ. Gzip's CRC is checked by nilo itself.
+- **`c.bodyStream()`** decodes on a `zstd.StreamDecoder` in the request arena, allocated on the first read, and only for a zstd body. **Its size is the frame's**, not a constant: 112 KB for a small announced frame, about 1.5 MB for a megabyte, and 8.9 MB for a frame that announces nothing and asks for RFC 9659's 8 MB window, which is the one place a peer chooses a number of bytes; `Options.zstd_window_log_max` (default 23) lets a route lower it, and a frame asking for more is a 400. Decoded bytes are counted against `max_bytes` as for gzip, a frame announcing more than `max_bytes` is refused before its context is allocated, and a bad frame is `BadEncodedBody` through `explain`. A body of no bytes is empty. The same on HTTP/2.
+- **gRPC** reads `grpc-encoding: zstd` under the same flag, charging the connection's budget by the frame's announced size, or by the route's whole limit for a frame that announces none (`grpc-accept-encoding` lists `zstd` in that build).
 
 ### Why 415 and not 400
 
@@ -37,7 +48,7 @@ In `finish`, at the blank line, rather than in the header arm that reads the val
 
 ### `c.bodyStream()` decodes gzip too
 
-A stream hands bytes out into the caller's buffer, which may be eight bytes, so the trick `c.body()` uses (the destination is the inflater's history) has no destination to reach back into. The decoder takes a window of its own, `std.compress.flate.Decompress` in the mode that keeps one, and **the window lives in the request arena, allocated when `bodyStream()` is called on a gzipped body and never otherwise**: 73,000 bytes or so in one allocation (the decoder's 3,384 bytes of tables, its 65,536-byte window and a 4,096-byte buffer for the wire bytes). ADR 062 is why it is not a local of the handler: a fiber keeps its stack at its high-water mark for the life of the connection, and the arena is reset when the request ends, so a connection that took one gzipped upload holds nothing for it afterwards. A request without a gzipped body pays eight bytes of the handler's `Body` (a pointer that stays null) and one compare.
+A stream hands bytes out into the caller's buffer, which may be eight bytes, so the trick `c.body()` uses (the destination is the inflater's history) has no destination to reach back into. The decoder takes a window of its own, `std.compress.flate.Decompress` in the mode that keeps one, and **the window lives in the request arena, allocated when `bodyStream()` is called on a gzipped body and never otherwise**: 73,000 bytes or so in one allocation (the decoder's 3,384 bytes of tables, its 65,536-byte window and a 4,096-byte buffer for the wire bytes). ADR 062 is why it is not a local of the handler: a fiber keeps its stack at its high-water mark for the life of the connection, and the arena is reset when the request ends, so a connection that took one gzipped upload holds nothing for it afterwards. A request without a gzipped body pays eight bytes of the handler's `Body` (a pointer that stays null) and one compare. A build with `-Dzstd` adds a second such pointer; one without it adds nothing.
 
 **The ceiling is counted on decoded bytes as they are produced**, not read off the trailer: a stream cannot size an allocation by it, and a trailer is the sender's word. The byte that crosses `max_bytes` is `error.BodyTooLarge` (a 413 through `statusFor`), so a bomb of a few kilobytes that inflates to gigabytes is stopped after `max_bytes + 1` bytes of work. The bytes on the wire are held to the same number, as for any body, which stops a stream of empty blocks that never decodes to anything. `incoming.seen()` and `size()` count the wire bytes; what the handler read is what it counted.
 

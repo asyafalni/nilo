@@ -26,7 +26,7 @@
 //! And every file gets an ETag computed once at load, so a repeat visitor
 //! gets a 304 with no body and no work.
 //!
-//! A `.br` or `.gz` the build wrote beside a file is held (or, over the
+//! A `.br`, `.zst` or `.gz` the build wrote beside a file is held (or, over the
 //! line, left on the disk) as that file's other form and served to a client
 //! that prefers it, under a tag of its own (ADR 273).
 //!
@@ -49,6 +49,12 @@ const accept_mod = @import("accept.zig");
 const compress_mod = @import("compress.zig");
 const bulkhead = @import("bulkhead.zig");
 const follow_mod = @import("follow.zig");
+
+/// zstd is served only by a build that asked for it (`-Dzstd`, ADR 295). In
+/// any other a `.zst` is an ordinary file, listed and served under its own
+/// name as it always was, and no frame is read.
+const zstd_served = compress_mod.zstd_enabled;
+const zstd = if (compress_mod.zstd_linked) @import("nilo_zstd") else struct {};
 
 pub const Options = struct {
     /// Served for a path ending in `/`. Empty turns that off.
@@ -135,6 +141,23 @@ pub const Options = struct {
     /// says how much it came to.
     compress: bool = true,
 
+    /// Also make a zstd copy of every file `compress` would gzip, once at
+    /// load, at level 12 (ADR 295). **Only in a build with `-Dzstd`**: without
+    /// it nothing reads this. A client that sends `Accept-Encoding: zstd` is
+    /// then answered from memory like one that sends `gzip`, in about 40% fewer
+    /// bytes than level 3 gives for four to five times the time, which is paid
+    /// before the socket is open (1 MB of JSON takes 4.8 ms; level 19 is 46
+    /// times that for 18% fewer bytes). **What it costs is a second compressed
+    /// copy of each file held for the life of the App**, charged against
+    /// `max_total_bytes` and said in the load line. A `.zst` the build wrote
+    /// replaces it, and `compress = false` turns it off with the gzip copy.
+    /// **The load needs a context for the length of one file** (1.3 MB up to
+    /// 64 KB, 13.1 MB from 1 MB up, because the copy's window is held to a
+    /// megabyte, `zstd_load_window_log`), freed before the next. Turn this off to keep the tree held as it was
+    /// before zstd, or the start under a tight memory limit: a program that
+    /// gets zstd from siblings only.
+    compress_zstd: bool = true,
+
     /// Serve every file from the disk, so editing one is visible on the next
     /// request without restarting the server. **For development.**
     ///
@@ -159,9 +182,10 @@ pub const Options = struct {
     /// adding one still needs a restart.
     reload: bool = false,
 
-    /// Serve a file a build already compressed: `app.js.br` or `app.js.gz`
-    /// beside `app.js` answers a client that accepts that coding, in place of
-    /// anything nilo would make (ADR 273).
+    /// Serve a file a build already compressed: `app.js.br`, `app.js.zst` or
+    /// `app.js.gz` beside `app.js` answers a client that accepts that coding,
+    /// in place of anything nilo would make (ADR 273, ADR 295). A `.zst` is a
+    /// sibling only in a build with `-Dzstd`.
     ///
     /// **On by default, and guarded where the others are not.** Caddy, nginx
     /// and tower-http trust a sibling blindly, and a `.br` left behind by the
@@ -169,11 +193,15 @@ pub const Options = struct {
     /// has changed. Here a `.gz` is checked against the plain file it sits
     /// beside (its trailer carries the CRC-32 and the length of what it
     /// compressed), a sibling not smaller than the file is ignored, and each
-    /// one ignored is said in one line at load. Brotli has no such trailer,
-    /// so a `.br` is held to the modification time alone: one older than its
-    /// file is ignored.
+    /// one ignored is said in one line at load. A `.zst` is held to the
+    /// strongest rule of the three: it is **decoded at load and used only if
+    /// it is exactly the file beside it**, whether or not its frame carries a
+    /// checksum (a held file only; a spilled one is read by no one at load and
+    /// takes the modification time rule). Brotli has no such trailer, so a
+    /// `.br` is held to the modification time alone: one older than its file
+    /// is ignored.
     ///
-    /// What it takes from the tree: a `X.br` or `X.gz` whose `X` is in the
+    /// What it takes from the tree: a `X.br`, `X.zst` or `X.gz` whose `X` is in the
     /// tree and is a type worth compressing (`compressible`) is a sibling,
     /// not a file, and **its own URL is a 404**. Its bytes are held once, as
     /// the coding of `X`; listing it as well would hold them twice. A tree
@@ -331,12 +359,21 @@ pub const File = struct {
         /// binary like `bytes` and not the Set's to free (ADR 273). Always
         /// false for one nilo compressed itself.
         gzip_borrowed: bool = false,
+        /// The same file as one zstd frame (ADR 295): the build's `app.js.zst`
+        /// once it decoded to exactly this file, or nilo's own copy at level
+        /// 12. Null in a build without `-Dzstd`.
+        zstd: ?[]const u8 = null,
+        /// The ETag of `zstd`, its own like the others.
+        zstd_etag: []const u8 = &.{},
+        /// `zstd` is a `.zst` out of an embedded tree, borrowed from the
+        /// binary and not the Set's to free.
+        zstd_borrowed: bool = false,
 
         /// Whether there is more than one representation to choose between,
         /// which is when `Vary: Accept-Encoding` is owed on every answer,
         /// the plain one and the 304 included.
         pub fn varies(self: Held) bool {
-            return self.gzip != null or self.br != null;
+            return self.gzip != null or self.br != null or self.zstd != null;
         }
     };
 
@@ -396,9 +433,10 @@ pub const File = struct {
         /// itself (ADR 098).
         br: ?Sibling = null,
         gzip: ?Sibling = null,
+        zstd: ?Sibling = null,
 
         pub fn varies(self: Spilled) bool {
-            return self.br != null or self.gzip != null;
+            return self.br != null or self.gzip != null or self.zstd != null;
         }
     };
 
@@ -430,6 +468,7 @@ pub const File = struct {
             .identity => {},
             .gzip => if (held.gzip) |g| return .{ .bytes = g, .etag = held.gzip_etag, .coding = .gzip },
             .br => if (held.br) |b| return .{ .bytes = b, .etag = held.br_etag, .coding = .br },
+            .zstd => if (held.zstd) |z| return .{ .bytes = z, .etag = held.zstd_etag, .coding = .zstd },
         }
         return self.identity();
     }
@@ -455,6 +494,8 @@ fn freeFile(gpa: std.mem.Allocator, f: File, owns_bytes: bool) void {
             // the binary's, borrowed exactly as `bytes` is.
             if (held.br) |p| if (owns_bytes) gpa.free(p);
             if (held.br_etag.len > 0) gpa.free(held.br_etag);
+            if (held.zstd) |p| if (!held.zstd_borrowed) gpa.free(p);
+            if (held.zstd_etag.len > 0) gpa.free(held.zstd_etag);
         },
         // The descriptor belongs to the Set, not to the file that borrowed
         // it, so there is nothing here but the names.
@@ -462,6 +503,7 @@ fn freeFile(gpa: std.mem.Allocator, f: File, owns_bytes: bool) void {
             gpa.free(on_disk.path);
             if (on_disk.br) |b| gpa.free(b.path);
             if (on_disk.gzip) |g| gpa.free(g.path);
+            if (on_disk.zstd) |z| gpa.free(z.path);
         },
     }
 }
@@ -757,6 +799,8 @@ pub fn fromMemory(gpa: std.mem.Allocator, entries: []const Entry) !Set {
         if (entry.bytes.len >= defaults.compress_min_bytes and compressible(entry.content_type)) {
             held.gzip = try gzipped(gpa, entry.bytes);
             if (held.gzip) |p| held.gzip_etag = try etagFor(gpa, p);
+            if (defaults.compress_zstd) held.zstd = try zstdCopy(gpa, entry.bytes);
+            if (held.zstd) |p| held.zstd_etag = try etagFor(gpa, p);
         }
     }
 
@@ -876,6 +920,7 @@ pub fn loadOn(
     var held_total: usize = 0;
     var packed_total: usize = 0;
     var sibling_total: usize = 0;
+    var zstd_total: usize = 0;
     var spilled_files: usize = 0;
 
     // `.reload` is the threshold set to zero and nothing else, so there is one
@@ -927,6 +972,14 @@ pub fn loadOn(
             errdefer if (br) |b| gpa.free(b.path);
             const gzip_sibling = try spilledSibling(gpa, found.items, f.gzip);
             errdefer if (gzip_sibling) |g| gpa.free(g.path);
+            // Never read, so held to the modification time as a `.br` is.
+            var zstd_at = f.zstd;
+            if (zstd_at) |at| if (found.items[at].mtime_ns < f.mtime_ns) {
+                try ignored.note(gpa, found.items[at].path, "older than the file beside it");
+                zstd_at = null;
+            };
+            const zstd_sibling = try spilledSibling(gpa, found.items, zstd_at);
+            errdefer if (zstd_sibling) |z| gpa.free(z.path);
 
             try files.append(gpa, .{
                 .url = try gpa.dupe(u8, url),
@@ -940,6 +993,7 @@ pub fn loadOn(
                     .mtime_ns = f.mtime_ns,
                     .br = br,
                     .gzip = gzip_sibling,
+                    .zstd = zstd_sibling,
                 } },
             });
             spilled_files += 1;
@@ -999,6 +1053,38 @@ pub fn loadOn(
             }
         }
 
+        // The build's `.zst` is decoded and compared with the file, so a frame
+        // that is stale, foreign, damaged or over the RFC's window is passed
+        // over whether or not it carries a checksum (ADR 295).
+        var zstd_bytes: ?[]const u8 = null;
+        errdefer if (zstd_bytes) |p| gpa.free(p);
+        if (f.zstd) |at| {
+            const sibling = try readHeld(gpa, io, dir, found.items[at].path, found.items[at].size +| 1);
+            if (try zstdMatches(gpa, sibling, bytes)) {
+                zstd_bytes = sibling;
+                held_total += sibling.len;
+                sibling_total += sibling.len;
+                try checkTotal(held_total, options.max_total_bytes, dir_path);
+            } else {
+                gpa.free(sibling);
+                try ignored.note(gpa, found.items[at].path, "it does not decode to the file beside it");
+            }
+        }
+        if (zstd_bytes == null and
+            zstd_served and
+            options.compress and
+            options.compress_zstd and
+            bytes.len >= options.compress_min_bytes and
+            compressible(content_type))
+        {
+            zstd_bytes = try zstdCopy(gpa, bytes);
+            if (zstd_bytes) |p| {
+                zstd_total += p.len;
+                held_total += p.len;
+                try checkTotal(held_total, options.max_total_bytes, dir_path);
+            }
+        }
+
         try files.append(gpa, .{
             .url = try gpa.dupe(u8, url),
             .content_type = content_type,
@@ -1010,6 +1096,8 @@ pub fn loadOn(
                 .gzip_etag = if (packed_bytes) |p| try etagFor(gpa, p) else &.{},
                 .br = br_bytes,
                 .br_etag = if (br_bytes) |p| try etagFor(gpa, p) else &.{},
+                .zstd = zstd_bytes,
+                .zstd_etag = if (zstd_bytes) |p| try etagFor(gpa, p) else &.{},
             } },
         });
     }
@@ -1055,13 +1143,14 @@ pub fn loadOn(
     // memory budget and the second one is not in that budget at all — it is
     // one descriptor each, and only while a response is being written.
     std.log.info(
-        "nilo: {s} {d} static file(s) ({d} bytes held{f}{f}) from \"{s}\" onto \"{s}\"{f}{s}",
+        "nilo: {s} {d} static file(s) ({d} bytes held{f}{f}{f}) from \"{s}\" onto \"{s}\"{f}{s}",
         .{
             if (reloading) "reloaded" else "loaded",
             set.files.len,
             held_total,
             GzipNote{ .bytes = packed_total },
             SiblingNote{ .bytes = sibling_total },
+            ZstdNote{ .bytes = zstd_total },
             dir_path,
             url_prefix,
             SpillNote{ .files = spilled_files, .over = options.max_file_bytes },
@@ -1185,8 +1274,9 @@ const Found = struct {
     /// For a plain file: the index in the same list of its forms.
     br: ?usize = null,
     gzip: ?usize = null,
+    zstd: ?usize = null,
 
-    const Role = enum { plain, br, gzip };
+    const Role = enum { plain, br, gzip, zstd };
 };
 
 fn lessByPath(_: void, a: Found, b: Found) bool {
@@ -1198,6 +1288,8 @@ fn lessByPath(_: void, a: Found, b: Found) bool {
 fn siblingOf(path: []const u8) ?struct { coding: compress_mod.Coding, base: []const u8 } {
     if (std.mem.endsWith(u8, path, ".br")) return .{ .coding = .br, .base = path[0 .. path.len - 3] };
     if (std.mem.endsWith(u8, path, ".gz")) return .{ .coding = .gzip, .base = path[0 .. path.len - 3] };
+    // In a build without zstd a `.zst` is a file like any other (ADR 295).
+    if (zstd_served and std.mem.endsWith(u8, path, ".zst")) return .{ .coding = .zstd, .base = path[0 .. path.len - 4] };
     return null;
 }
 
@@ -1220,7 +1312,7 @@ const Ignored = struct {
         if (self.count == 0) return;
         std.log.warn(
             "nilo: static directory \"{s}\" holds {d} precompressed file(s) that are not served: {s}{s}. " ++
-                "A .br or .gz beside its file is never served under its own name (ADR 273); " ++
+                "A .br, .zst or .gz beside its file is never served under its own name (ADR 273); " ++
                 "rebuild it, or pass .precompressed = false.",
             .{ dir_path, self.count, self.names.items, if (self.count > max_named_links) " and more" else "" },
         );
@@ -1238,7 +1330,11 @@ fn pairSiblings(gpa: std.mem.Allocator, found: []Found, ignored: *Ignored) !void
         const named = siblingOf(f.path) orelse continue;
         const base = baseIndex(found, named.base) orelse continue;
         if (!compressible(contentTypeFor(named.base))) continue;
-        f.role = if (named.coding == .br) .br else .gzip;
+        f.role = switch (named.coding) {
+            .br => .br,
+            .zstd => .zstd,
+            else => .gzip,
+        };
 
         const plain = &found[base];
         if (f.size == 0 or f.size >= plain.size) {
@@ -1259,6 +1355,7 @@ fn pairSiblings(gpa: std.mem.Allocator, found: []Found, ignored: *Ignored) !void
         switch (named.coding) {
             .br => plain.br = at,
             .gzip => plain.gzip = at,
+            .zstd => plain.zstd = at,
             .identity => unreachable,
         }
     }
@@ -1357,6 +1454,7 @@ pub const EmbedOptions = struct {
     spa_fallback: []const u8 = (Options{}).spa_fallback,
     spa_fallback_for: Options.Fallback = (Options{}).spa_fallback_for,
     compress: bool = (Options{}).compress,
+    compress_zstd: bool = (Options{}).compress_zstd,
     compress_min_bytes: usize = (Options{}).compress_min_bytes,
     precompressed: bool = (Options{}).precompressed,
 };
@@ -1416,9 +1514,12 @@ pub fn embed(
                 try ignored.note(gpa, entry.path, "not smaller than the file beside it");
             } else if (named.coding == .gzip and !gzipMatches(entry.bytes, files[base].bytes)) {
                 try ignored.note(gpa, entry.path, "its contents are not a gzip of the file beside it");
+            } else if (named.coding == .zstd and !try zstdMatches(gpa, entry.bytes, files[base].bytes)) {
+                try ignored.note(gpa, entry.path, "it does not decode to the file beside it");
             } else switch (named.coding) {
                 .br => forms[base].br = at,
                 .gzip => forms[base].gzip = at,
+                .zstd => forms[base].zstd = at,
                 .identity => unreachable,
             }
         }
@@ -1439,6 +1540,7 @@ pub fn embed(
 
     var carried_total: usize = 0;
     var packed_total: usize = 0;
+    var zstd_total: usize = 0;
     var next: usize = 0;
 
     for (files, forms) |entry, form| {
@@ -1481,6 +1583,22 @@ pub fn embed(
                 packed_total += p.len;
             }
         }
+        if (form.zstd) |at| {
+            held.zstd = files[at].bytes;
+            held.zstd_borrowed = true;
+            held.zstd_etag = try etagFor(gpa, files[at].bytes);
+        } else if (zstd_served and
+            options.compress and
+            options.compress_zstd and
+            entry.bytes.len >= options.compress_min_bytes and
+            compressible(file.content_type))
+        {
+            held.zstd = try zstdCopy(gpa, entry.bytes);
+            if (held.zstd) |p| {
+                held.zstd_etag = try etagFor(gpa, p);
+                zstd_total += p.len;
+            }
+        }
     }
 
     sortByUrl(set.files);
@@ -1514,8 +1632,8 @@ pub fn embed(
     // the binary carries and costs nothing more to serve, the second is what
     // this call allocated and is the only memory the Set adds.
     std.log.info(
-        "nilo: embedded {d} static file(s) ({d} bytes in the binary{f}) onto \"{s}\"",
-        .{ set.files.len, carried_total, EmbedGzipNote{ .bytes = packed_total }, url_prefix },
+        "nilo: embedded {d} static file(s) ({d} bytes in the binary{f}{f}) onto \"{s}\"",
+        .{ set.files.len, carried_total, EmbedGzipNote{ .bytes = packed_total }, ZstdNote{ .bytes = zstd_total }, url_prefix },
     );
     return set;
 }
@@ -1527,6 +1645,7 @@ const EmbeddedForms = struct {
     consumed: bool = false,
     br: ?usize = null,
     gzip: ?usize = null,
+    zstd: ?usize = null,
 };
 
 /// The URL that appears twice in a list sorted by URL, or null when every
@@ -1563,6 +1682,17 @@ const GzipNote = struct {
     pub fn format(self: GzipNote, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.bytes == 0) return;
         try w.print(", {d} of them gzipped copies", .{self.bytes});
+    }
+};
+
+/// The zstd copies nilo made, on `GzipNote`'s terms: absent when there were
+/// none, which is every tree in a build without `-Dzstd`.
+const ZstdNote = struct {
+    bytes: usize,
+
+    pub fn format(self: ZstdNote, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.bytes == 0) return;
+        try w.print(", {d} of them zstd copies", .{self.bytes});
     }
 };
 
@@ -1668,6 +1798,65 @@ fn gzipped(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?[]cons
     return compress_mod.gzipOnce(gpa, bytes);
 }
 
+/// The level of the zstd copy made at load: 12 takes 4.8 ms for 1 MB of JSON
+/// and writes 40% fewer bytes than level 3, where 19 takes 46 times as long
+/// for 18% fewer again (`bench/result/zstd.md`, ADR 295).
+pub const zstd_load_level = 12;
+
+/// The window of the zstd copy made at load: 2^20, a megabyte. A file up to
+/// that size gets the window it would have had anyway (libzstd shrinks the
+/// window to the input), and a larger one is held to it, so the context the
+/// copy takes is at most 13.1 MB where it was 50.8 MB for an 8 MB file, the
+/// default `max_file_bytes`, at every load and every reload a `follow` makes.
+/// The price is in the bytes held: 19% more on a 4 MB JSON file, kept for the
+/// life of the tree (`bench/result/zstd.md`, ADR 295).
+pub const zstd_load_window_log = 20;
+
+/// `bytes` as one zstd frame at `zstd_load_level`, or null when the frame is
+/// no smaller (a file that does not shrink is served as it is) or the build
+/// has no zstd. The context is allocated for the call and freed before it
+/// returns, as gzip's window is; the frame is sized to fit, because it is held
+/// for the life of the App.
+fn zstdCopy(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?[]const u8 {
+    if (!zstd_served) return null;
+    const options: zstd.EncodeOptions = .{ .level = zstd_load_level, .window_log = zstd_load_window_log };
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Compressor.contextSize(options, bytes.len));
+    defer gpa.free(memory);
+    var compressor = zstd.Compressor.init(memory, options, bytes.len) catch return null;
+    const out = try gpa.alloc(u8, bytes.len);
+    errdefer gpa.free(out);
+    const frame = compressor.compress(out, bytes) catch {
+        gpa.free(out);
+        return null;
+    };
+    if (frame.len >= bytes.len) {
+        gpa.free(out);
+        return null;
+    }
+    return try gpa.realloc(out, frame.len);
+}
+
+/// Whether `frame` decodes to exactly `plain` (ADR 295): the check a `.zst`
+/// sibling is held to, strictly stronger than the `.gz`'s trailer. libzstd
+/// verifies the frame's own checksum when it has one, and the bytes are then
+/// compared, so a frame without a checksum (the library's default, and most
+/// tools') is judged all the same. A frame that does not decode, asks for a
+/// window over the RFC's 8 MB, or decodes to anything else is not a form of the
+/// file. Load time only: it costs about 0.2 ms a megabyte and a decoder
+/// context of 95,968 bytes, freed on return.
+fn zstdMatches(gpa: std.mem.Allocator, frame: []const u8, plain: []const u8) error{OutOfMemory}!bool {
+    if (!zstd_served) return false;
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Decompressor.contextSize());
+    defer gpa.free(memory);
+    var decoder = zstd.Decompressor.init(memory, .{}) catch return false;
+    const decoded = decoder.decode(gpa, frame, plain.len) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer gpa.free(decoded);
+    return std.mem.eql(u8, decoded, plain);
+}
+
 /// A strong ETag: the contents hashed, so it changes exactly when the file
 /// does. Computed once at load, which is what makes 304s free.
 fn etagFor(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
@@ -1697,7 +1886,7 @@ fn etagForSpilled(gpa: std.mem.Allocator, mtime_ns: i96, size: u64) ![]const u8 
 
 /// The longest `spilledEtag` can write: two quotes, a dash, 24 hex digits of
 /// a u96 and 16 of a u64.
-pub const max_spilled_etag = 2 + 1 + 24 + 16 + 3;
+pub const max_spilled_etag = 2 + 1 + 24 + 16 + 4;
 
 /// The same tag, written into a caller's buffer instead of an allocation.
 ///
@@ -1735,6 +1924,7 @@ pub fn spilledEtagCoded(
         .identity => "",
         .gzip => "-gz",
         .br => "-br",
+        .zstd => "-zst",
     };
     return std.fmt.bufPrint(buf, "\"{x}-{x}{s}\"", .{ @as(u96, @bitCast(mtime_ns)), size, suffix }) catch unreachable;
 }
@@ -3260,4 +3450,271 @@ test "an embedded tree serves the forms it carries and frees only what it made" 
     const zipped = try client.send(&app, "GET /app.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n");
     try testing.expectEqualSlices(u8, gz, zipped.body);
     try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/app.js.br")).status);
+}
+
+// ---- a file a build compressed with zstd (ADR 295) ----
+
+/// `bytes` as a frame a build tool would write, with or without the content
+/// checksum (the library's own default has none, and most tools' differ).
+fn zstdFrame(gpa: std.mem.Allocator, bytes: []const u8, checksum: bool) ![]u8 {
+    const options: zstd.EncodeOptions = .{ .level = 3, .checksum = checksum };
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Compressor.contextSize(options, bytes.len));
+    defer gpa.free(memory);
+    var compressor = try zstd.Compressor.init(memory, options, bytes.len);
+    const out = try gpa.alloc(u8, zstd.compressBound(bytes.len));
+    defer gpa.free(out);
+    return gpa.dupe(u8, try compressor.compress(out, bytes));
+}
+
+fn inflatedZstd(gpa: std.mem.Allocator, frame: []const u8) ![]u8 {
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Decompressor.contextSize());
+    defer gpa.free(memory);
+    var decoder = try zstd.Decompressor.init(memory, .{});
+    return decoder.decode(gpa, frame, 1 << 20);
+}
+
+fn askJs(cl: *nilo_testing.Client, a: *App, extra: []const u8) !nilo_testing.Answer {
+    var buf: [256]u8 = undefined;
+    return cl.send(a, try std.fmt.bufPrint(&buf, "GET /app.js HTTP/1.1\r\nHost: t\r\n{s}\r\n", .{extra}));
+}
+
+test "a build's zstd is served to a client that names it, under its own tag, and never under its own name" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // No checksum: the frame is judged by decoding it, so most tools' output is used.
+    const frame = try zstdFrame(gpa, bundle_js, false);
+    defer gpa.free(frame);
+    var built = try bundleTree(gpa, true, true);
+    defer built.tree.deinit(gpa);
+    defer gpa.free(built.gz);
+    try built.tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.js.zst", .data = frame });
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStaticWith("/", built.tree.path, .{});
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    var plain_tag: [64]u8 = undefined;
+    var zst_tag: [64]u8 = undefined;
+    const plain = try askJs(&client, &app, "");
+    const plain_len = plain.header("ETag").?.len;
+    @memcpy(plain_tag[0..plain_len], plain.header("ETag").?);
+
+    // The build's own bytes, not nilo's copy.
+    const zst = try askJs(&client, &app, "Accept-Encoding: gzip, deflate, zstd\r\n");
+    try testing.expectEqualSlices(u8, frame, zst.body);
+    try testing.expectEqualStrings("zstd", zst.header("Content-Encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", zst.header("Vary").?);
+    var length: [20]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&length, "{d}", .{frame.len}), zst.header("Content-Length").?);
+    const zst_len = zst.header("ETag").?.len;
+    @memcpy(zst_tag[0..zst_len], zst.header("ETag").?);
+    try testing.expect(!std.mem.eql(u8, plain_tag[0..plain_len], zst_tag[0..zst_len]));
+
+    // br beats zstd beats gzip on a tie; q decides otherwise; a refusal is final.
+    try testing.expectEqualStrings("br", (try askJs(&client, &app, "Accept-Encoding: gzip, deflate, br, zstd\r\n")).header("Content-Encoding").?);
+    try testing.expectEqualStrings("gzip", (try askJs(&client, &app, "Accept-Encoding: zstd;q=0.4, gzip;q=0.8\r\n")).header("Content-Encoding").?);
+    try testing.expectEqualStrings("zstd", (try askJs(&client, &app, "Accept-Encoding: br;q=0, zstd, gzip\r\n")).header("Content-Encoding").?);
+    try testing.expectEqualStrings("gzip", (try askJs(&client, &app, "Accept-Encoding: br;q=0, zstd;q=0, gzip\r\n")).header("Content-Encoding").?);
+    const refused = try askJs(&client, &app, "Accept-Encoding: br;q=0, zstd;q=0, gzip;q=0\r\n");
+    try testing.expect(refused.header("Content-Encoding") == null);
+    try testing.expectEqualStrings(bundle_js, refused.body);
+
+    // Its own tag is a 304; the plain file's is not.
+    var request: [256]u8 = undefined;
+    const same = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "GET /app.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: zstd\r\nIf-None-Match: {s}\r\n\r\n",
+        .{zst_tag[0..zst_len]},
+    ));
+    try testing.expectEqual(@as(u16, 304), same.status);
+    const other = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "GET /app.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: zstd\r\nIf-None-Match: {s}\r\n\r\n",
+        .{plain_tag[0..plain_len]},
+    ));
+    try testing.expectEqual(@as(u16, 200), other.status);
+    try testing.expectEqualSlices(u8, frame, other.body);
+
+    // A range is an offset into the plain bytes.
+    const part = try askJs(&client, &app, "Accept-Encoding: zstd\r\nRange: bytes=0-9\r\n");
+    try testing.expectEqual(@as(u16, 206), part.status);
+    try testing.expectEqualStrings(bundle_js[0..10], part.body);
+    try testing.expect(part.header("Content-Encoding") == null);
+
+    // The sibling is the file's form and not a file.
+    try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/app.js.zst")).status);
+}
+
+test "nilo's own zstd copy decodes to the file, and a sibling or compress_zstd = false replaces or removes it" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tree = try TmpTree.init(gpa, &.{.{ "app.js", bundle_js }});
+    defer tree.deinit(gpa);
+
+    var set = try load(gpa, "/", tree.path, .{}, .reported);
+    defer set.deinit();
+    const held = set.find("/app.js").?.contents.held;
+    const copy = held.zstd.?;
+    try testing.expect(copy.len < bundle_js.len);
+    const back = try inflatedZstd(gpa, copy);
+    defer gpa.free(back);
+    try testing.expectEqualStrings(bundle_js, back);
+    // Level 12 at load against the 3 a response gets: not larger.
+    const quick = try zstdFrame(gpa, bundle_js, true);
+    defer gpa.free(quick);
+    try testing.expect(copy.len <= quick.len);
+    try testing.expect(!std.mem.eql(u8, held.zstd_etag, set.find("/app.js").?.etag));
+
+    var off = try load(gpa, "/", tree.path, .{ .compress_zstd = false }, .reported);
+    defer off.deinit();
+    try testing.expect(off.find("/app.js").?.contents.held.zstd == null);
+    try testing.expect(off.find("/app.js").?.contents.held.gzip != null);
+
+    var none = try load(gpa, "/", tree.path, .{ .compress = false }, .reported);
+    defer none.deinit();
+    try testing.expect(none.find("/app.js").?.contents.held.zstd == null);
+}
+
+test "the zstd copy of a file past a megabyte keeps a megabyte window, so its context stays bounded at max_file_bytes" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // At the default ceiling: 50.8 MB with the window the file would have
+    // had, 13.1 MB held to a megabyte.
+    const options: zstd.EncodeOptions = .{ .level = zstd_load_level, .window_log = zstd_load_window_log };
+    try testing.expect(zstd.Compressor.contextSize(options, (Options{}).max_file_bytes) < 14 * 1024 * 1024);
+
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    var n: usize = 0;
+    while (plain.items.len < 3 << 20) : (n += 1)
+        try plain.print(gpa, "{{\"id\":{d},\"name\":\"host-{d}\",\"state\":\"running\"}},", .{ n, n *% 7919 });
+    const copy = (try zstdCopy(gpa, plain.items)).?;
+    defer gpa.free(copy);
+    try testing.expect((try zstd.Frame.parse(copy)).window_size <= 1 << zstd_load_window_log);
+
+    const memory = try gpa.alignedAlloc(u8, zstd.workspace_alignment, zstd.Decompressor.contextSize());
+    defer gpa.free(memory);
+    var decoder = try zstd.Decompressor.init(memory, .{});
+    const back = try decoder.decode(gpa, copy, plain.items.len);
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, plain.items, back);
+}
+
+test "a zstd sibling that is stale, foreign, damaged or not smaller is passed over and still not a file" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const other = try zstdFrame(gpa, repeat("not the bundle at all, but compressible enough. ", 80), true);
+    defer gpa.free(other);
+    const good = try zstdFrame(gpa, bundle_js, true);
+    defer gpa.free(good);
+    // One flipped bit inside the blocks: the frame's checksum catches it.
+    const damaged = try gpa.dupe(u8, good);
+    defer gpa.free(damaged);
+    damaged[damaged.len / 2] ^= 0x10;
+
+    var tree = try TmpTree.init(gpa, &.{
+        .{ "foreign.js", bundle_js },
+        .{ "foreign.js.zst", other },
+        .{ "damaged.js", bundle_js },
+        .{ "damaged.js.zst", damaged },
+        .{ "big.js", bundle_js },
+        .{ "big.js.zst", bundle_js },
+        .{ "ok.js", bundle_js },
+        .{ "ok.js.zst", good },
+    });
+    defer tree.deinit(gpa);
+    var set = try load(gpa, "/", tree.path, .{ .compress_zstd = false }, .reported);
+    defer set.deinit();
+    for ([_][]const u8{ "/foreign.js", "/damaged.js", "/big.js" }) |url| {
+        try testing.expect(set.find(url).?.contents.held.zstd == null);
+    }
+    try testing.expectEqualSlices(u8, good, set.find("/ok.js").?.contents.held.zstd.?);
+    for ([_][]const u8{ "/foreign.js.zst", "/damaged.js.zst", "/big.js.zst", "/ok.js.zst" }) |url| {
+        try testing.expect(set.find(url) == null);
+    }
+}
+
+test "a spilled file takes its zstd sibling from the disk, and an older one is passed over" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const frame = try zstdFrame(gpa, bundle_js, true);
+    defer gpa.free(frame);
+    var tree = try TmpTree.init(gpa, &.{.{ "app.js", bundle_js }});
+    defer tree.deinit(gpa);
+    try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "app.js.zst", .data = frame });
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStaticWith("/", tree.path, .{ .max_file_bytes = 16 });
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    const zst = try askJs(&client, &app, "Accept-Encoding: gzip, deflate, br, zstd\r\n");
+    try testing.expectEqualSlices(u8, frame, zst.body);
+    try testing.expectEqualStrings("zstd", zst.header("Content-Encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", zst.header("Vary").?);
+    try testing.expect(std.mem.endsWith(u8, zst.header("ETag").?, "-zst\""));
+    try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/app.js.zst")).status);
+
+    const part = try askJs(&client, &app, "Accept-Encoding: zstd\r\nRange: bytes=0-9\r\n");
+    try testing.expectEqual(@as(u16, 206), part.status);
+    try testing.expect(part.header("Content-Encoding") == null);
+
+    // Gone since the walk: the plain file answers.
+    try tree.tmp.dir.deleteFile(std.testing.io, "app.js.zst");
+    const gone = try askJs(&client, &app, "Accept-Encoding: zstd\r\n");
+    try testing.expectEqual(@as(u16, 200), gone.status);
+    try testing.expectEqualStrings(bundle_js, gone.body);
+}
+
+test "an embedded tree serves a zstd form it carries, verified, and makes its own copy otherwise" {
+    if (!zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const frame = try zstdFrame(gpa, bundle_js, false);
+    defer gpa.free(frame);
+    const other = try zstdFrame(gpa, repeat("some other script entirely. ", 80), false);
+    defer gpa.free(other);
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.embedded("/", &.{
+        .{ .path = "app.js", .bytes = bundle_js },
+        .{ .path = "app.js.zst", .bytes = frame },
+        .{ .path = "other.js", .bytes = bundle_js },
+        .{ .path = "other.js.zst", .bytes = other },
+    });
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    const zst = try askJs(&client, &app, "Accept-Encoding: zstd\r\n");
+    try testing.expectEqualSlices(u8, frame, zst.body);
+    try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/app.js.zst")).status);
+    // The foreign frame is not used: nilo's own copy answers for `other.js`.
+    const mine = try client.send(&app, "GET /other.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: zstd\r\n\r\n");
+    try testing.expectEqualStrings("zstd", mine.header("Content-Encoding").?);
+    try testing.expect(!std.mem.eql(u8, other, mine.body));
+    const back = try inflatedZstd(gpa, mine.body);
+    defer gpa.free(back);
+    try testing.expectEqualStrings(bundle_js, back);
+}
+
+test "without zstd in the build a .zst beside a file is an ordinary file and no client is answered in it" {
+    if (zstd_served) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tree = try TmpTree.init(gpa, &.{
+        .{ "app.js", bundle_js },
+        .{ "app.js.zst", "not really a frame, so nothing reads it" },
+    });
+    defer tree.deinit(gpa);
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStaticWith("/", tree.path, .{});
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/app.js.zst")).status);
+    const asked = try askJs(&client, &app, "Accept-Encoding: zstd, gzip\r\n");
+    try testing.expectEqualStrings("gzip", asked.header("Content-Encoding").?);
 }

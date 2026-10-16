@@ -34,7 +34,8 @@ The path is relative to the working directory the server runs in. A directory th
 | `max_total_bytes` | the most one tree may hold in memory, gzipped copies included. Default 64 MB |
 | `dotfiles` | whether to load names starting with `.`. Off by default |
 | `compress` | gzip every file worth gzipping, once, at load. On by default |
-| `precompressed` | serve a `.br` or `.gz` the build wrote beside a file. On by default |
+| `compress_zstd` | in a build with `-Dzstd`, also make a zstd copy of every file `compress` gzips. On by default there |
+| `precompressed` | serve a `.br`, `.zst` or `.gz` the build wrote beside a file. On by default |
 | `compress_min_bytes` | files smaller than this are served as they are. Default 1 KB |
 
 Dotfiles are off because finding out on the first request that a `.env` or a `.git` ended up in the published directory is a bad way to learn it was there.
@@ -133,6 +134,8 @@ What to know:
 - **It costs the bytes it holds.** On a six-file, 1.4 MB front end the siblings were 273,497 bytes more than nilo's own gzip copy ([the run](../../bench/result/http.md#a-file-a-build-compressed-is-held-beside-the-file)); brotli was 17.7% smaller on the wire than nilo's gzip. The startup line counts them: `(2034416 bytes held, 333516 of them gzipped copies, 279412 of them precompressed files)`.
 - **A file over `max_file_bytes` takes its siblings from the disk**, the way it is served from the disk itself.
 
+**With zstd in the build, `app.js.zst` is a sibling too, and nilo makes its own zstd copy.** Pass `.zstd = true` to the dependency (`-Dzstd`; [ADR 295](../adr/295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)). A client that sends `Accept-Encoding: gzip, deflate, br, zstd` gets the `.br` if there is one, else the `.zst`, else the `.gz`: the highest `q`, then that order on a tie, and never one at `q=0`. A `.zst` is **decoded at load and used only if it is exactly the file beside it**, so a stale one, one for another file, a damaged one or one asking for a window over the 8 MB browsers accept is passed over with the same one warning ("it does not decode to the file beside it"), and a frame written without a content checksum (most build tools') is used all the same. A file with no `.zst` gets a copy nilo makes at load at level 12 (about 40% smaller than level 3, 5 ms for a megabyte of JSON), held beside the gzip copy (the load needs a context of at most 13 MB, because the copy's window is held to a megabyte, freed before the next file) and counted in the startup line (`, 83211 of them zstd copies`); `compress_zstd = false` keeps the tree as it was, and `compress = false` turns off both copies. It is a second compressed copy of each file in memory, about the gzip copy's size again. A file over `max_file_bytes` takes its `.zst` from the disk, held to the modification time as a `.br` is. In a build without the flag a `.zst` is an ordinary file, served under its own name.
+
 ## Range requests
 
 **A request for a byte range gets that range**, which is what a video being scrubbed and a download being resumed both ask for:
@@ -195,7 +198,7 @@ try app.embeddedWith("/", &.{
 
 You can write the `@embedFile` calls yourself, because the path is relative to the file it is written in and nilo cannot know where your `dist/` is. Most programs let `embedDir` write the list from a directory instead ([below](#a-vue-or-react-build-in-the-binary)).
 
-The options are `static`'s minus every one that is about a disk: `index`, `cache_control`, `cache_rules`, `spa_fallback`, `spa_fallback_for`, `compress`, `compress_min_bytes` and `precompressed`, with the same defaults. There is no `max_file_bytes`, because nothing here can be served from disk; no `max_total_bytes`, because the bytes are part of the binary whether or not they are served, so counting them would count memory that is not spent twice; no `dotfiles`, because you wrote every name; and no `reload`, because there is no disk.
+The options are `static`'s minus every one that is about a disk: `index`, `cache_control`, `cache_rules`, `spa_fallback`, `spa_fallback_for`, `compress`, `compress_min_bytes`, `compress_zstd` and `precompressed`, with the same defaults. There is no `max_file_bytes`, because nothing here can be served from disk; no `max_total_bytes`, because the bytes are part of the binary whether or not they are served, so counting them would count memory that is not spent twice; no `dotfiles`, because you wrote every name; and no `reload`, because there is no disk.
 
 Two mistakes a directory cannot make are refused at startup, in one line: a path listed twice (the second entry could never be reached) and a `spa_fallback` that names no entry. There is no `tryEmbedded`: the list was fixed when the program was compiled, so there is nothing the program can do about it at run time but stop.
 

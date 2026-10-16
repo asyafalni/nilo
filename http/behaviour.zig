@@ -5926,6 +5926,52 @@ test "a compressed answer costs one allocation, and it is the compressed body" {
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }
 
+test "a zstd answer costs one allocation too, and it is the compressed body" {
+    // Only a build with `-Dzstd` has the compressors (ADR 295); the others
+    // are held by the gzip test above, unchanged.
+    if (!@import("compress.zig").zstd_enabled) return error.SkipZigTest;
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/report", sendLongText);
+    try app.use(cors.permissive);
+    try app.compress(.{});
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [8192]u8 = undefined;
+
+    const request = "GET /report HTTP/1.1\r\nHost: example.dev\r\nUser-Agent: wrk\r\n" ++
+        "Accept: */*\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nConnection: keep-alive\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) []const u8 {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+            return out.buffered();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        _ = send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+
+    counting.reset();
+    const response = send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+    try testing.expect(std.mem.indexOf(u8, response, "Content-Encoding: zstd\r\n") != null);
+
+    // The compressed frame is written into one buffer of half the body, the
+    // pool slot's context is no allocation at all, and nothing is grown.
+    try testing.expectEqual(@as(usize, 1), counting.allocs);
+    try testing.expectEqual(@as(usize, 0), counting.resizes);
+}
+
 test "a number the application owns goes out on the page" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -9160,6 +9206,11 @@ test "a gzipped body that does not decode is a 400 that names the coding, and on
     // Answered, and the connection is still good for the next request: the
     // body was read whole before it was found wanting.
     try testing.expect(not_gzip.keep_alive);
+
+    // The header over no body at all is an empty body, as `bodyStream` and
+    // zstd read it: there is no member to be wrong about.
+    const empty = h.send(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, empty.response, "HTTP/1.1 200"));
 
     // Over `max_body` once inflated, by the stream's own account — refused
     // by the number, before a byte is inflated.

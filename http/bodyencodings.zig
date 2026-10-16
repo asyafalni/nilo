@@ -105,10 +105,24 @@ fn listOf(comptime names: anytype) []const []const u8 {
     }
 }
 
+/// Whether this build decodes a zstd request body itself.
+const zstd_read = @import("zstdbody.zig").enabled;
+
 fn passing(comptime list: []const []const u8) mw.Middleware {
     const names_gzip = comptime blk: {
         for (list) |name| {
             if (std.ascii.eqlIgnoreCase(name, "gzip") or std.ascii.eqlIgnoreCase(name, "x-gzip")) break :blk true;
+        }
+        break :blk false;
+    };
+
+    // In a build that reads zstd it is a coding the parser knows, so a route
+    // that names it is told to hand the bytes over as they came, the way a
+    // route naming "gzip" is (ADR 283, ADR 295). In one that does not, zstd
+    // is `.other` and takes that arm.
+    const names_zstd = comptime blk: {
+        for (list) |name| {
+            if (std.ascii.eqlIgnoreCase(name, "zstd")) break :blk true;
         }
         break :blk false;
     };
@@ -123,6 +137,7 @@ fn passing(comptime list: []const []const u8) mw.Middleware {
             switch (c._request.content_encoding) {
                 .identity => {},
                 .gzip => if (names_gzip) c.readBodyAsSent(),
+                .zstd => if (names_zstd) c.readBodyAsSent(),
                 .other => c.readBodyAsSent(),
             }
             return next.run(c);
@@ -153,17 +168,18 @@ pub fn chainHasAny(chain: []const mw.Middleware, passes: []const mw.Limited) boo
 }
 
 /// The `Accept-Encoding` a 415 from this chain carries: `identity` and `gzip`
-/// every route reads, then every coding a `bodyEncodings` in `chain` named,
+/// every route reads (and `zstd` in a build that reads it, ADR 295), then every coding a `bodyEncodings` in `chain` named,
 /// once each (RFC 9110 §12.5.3, §15.5.16). Built in `arena` for the one
 /// request that is refused, and not otherwise.
 pub fn accepted(arena: std.mem.Allocator, chain: []const mw.Middleware, passes: []const mw.Limited) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.writeAll("identity, gzip");
+    try out.writer.writeAll(if (zstd_read) "identity, gzip, zstd" else "identity, gzip");
     for (chain, 0..) |m, i| {
         for (passes) |l| {
             if (l.run != m) continue;
             names: for (l.encodings) |name| {
                 if (std.ascii.eqlIgnoreCase(name, "gzip") or std.ascii.eqlIgnoreCase(name, "x-gzip")) continue;
+                if (zstd_read and std.ascii.eqlIgnoreCase(name, "zstd")) continue;
                 // Once each, whichever layer said it first.
                 for (chain[0..i]) |earlier| for (passes) |e| {
                     if (e.run != earlier) continue;
@@ -259,7 +275,7 @@ test "a coding the route did not name is a 415 that says which ones it reads" {
     const refused = try client.send(&app, "POST /api/v1/write HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\n" ++
         "Content-Length: 3\r\n\r\nabc");
     try testing.expectEqual(@as(u16, 415), refused.status);
-    try testing.expectEqualStrings("identity, gzip, snappy", refused.header("Accept-Encoding").?);
+    try testing.expectEqualStrings(if (zstd_read) "identity, gzip, zstd, snappy" else "identity, gzip, snappy", refused.header("Accept-Encoding").?);
 
     // The connection is good for the next request: the body was discarded
     // rather than left in the stream.

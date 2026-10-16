@@ -25,6 +25,7 @@ const http1 = @import("http1.zig");
 const watchdog = @import("watchdog.zig");
 const framing = @import("framing.zig");
 const inbound = @import("inbound.zig");
+const zstdbody = @import("zstdbody.zig");
 
 pub const Options = struct {
     /// The most a body may be. A `Content-Length` past this is refused
@@ -36,6 +37,14 @@ pub const Options = struct {
     /// memory and time — and the default is a file upload's worth rather
     /// than an invitation.
     max_bytes: u64 = 64 * 1024 * 1024,
+    /// The largest window a zstd frame may ask for, as a power of two, for a
+    /// body under `Content-Encoding: zstd` (ADR 295). A frame that announces
+    /// its size holds a window of at most that size; one that does not holds
+    /// the window it asks for, up to this: 2^23, RFC 9659's 8 MB, is a 8.9 MB
+    /// decoder in the request arena, and a deployment that wants a peer to
+    /// choose less lowers it. A frame asking for more is a 400. Ignored in a
+    /// build without `-Dzstd`.
+    zstd_window_log_max: u5 = 23,
 };
 
 pub const Error = error{
@@ -157,6 +166,9 @@ pub const Body = struct {
     /// `Content-Encoding: gzip` (`decodeGzip`, ADR 089). Null otherwise, and
     /// the only thing a body that is not gzip carries of it.
     _gz: ?*Gzip = null,
+    /// The same for `Content-Encoding: zstd` (`decodeZstd`, ADR 295). Absent
+    /// from a build that does not read zstd.
+    _zs: if (zstdbody.enabled) ?*Zstd else void = if (zstdbody.enabled) null else {},
 
     /// The body as a buffered `std.Io.Reader`, for a parser that peeks, takes
     /// a line or refills as it goes: `std.json.Reader`, `takeDelimiter` over
@@ -270,6 +282,11 @@ pub const Body = struct {
             .too_large => return error.BodyTooLarge,
             .bad => return error.BadEncodedBody,
         };
+        if (zstdbody.enabled) if (self._zs) |z| switch (z.failed) {
+            .none => {},
+            .too_large => return error.BodyTooLarge,
+            .bad => return error.BadEncodedBody,
+        };
         return error.ReadFailed;
     }
 
@@ -288,6 +305,27 @@ pub const Body = struct {
         };
         g.dec = .init(&g.raw, .gzip, &g.window);
         self._gz = g;
+    }
+
+    /// Read the body through a zstd decoder, bounded on decoded bytes by
+    /// `max_bytes` (ADR 295). One arena allocation of a few KB for the layer
+    /// and, when the first bytes of the body have arrived, one for the
+    /// decoder's context, **sized from the frame's own header**: 112 KB for a
+    /// 4 KB frame, 1.5 MB for a megabyte, and 8.9 MB for a frame that
+    /// announces nothing and asks for the RFC's 8 MB window, which is the one
+    /// place a peer chooses a number of bytes and `options.zstd_window_log_max`
+    /// is what caps it. Made only for a body that arrived under zstd, and in
+    /// the arena and not on the stack for the reason gzip's is (ADR 062).
+    pub fn decodeZstd(self: *Body, arena: std.mem.Allocator, options: Options) std.mem.Allocator.Error!void {
+        if (comptime !zstdbody.enabled) unreachable;
+        const z = try arena.create(Zstd);
+        z.* = .{
+            .body = self,
+            .arena = arena,
+            .window_log_max = options.zstd_window_log_max,
+            .raw = .{ .vtable = &.{ .stream = Zstd.rawStream }, .buffer = &z.raw_buffer, .seek = 0, .end = 0 },
+        };
+        self._zs = z;
     }
 
     /// nilo's own: `Ctx.bodyStream` builds one of these.
@@ -410,6 +448,7 @@ pub const Body = struct {
         const token = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, token);
         if (self._gz) |g| return g.pull(self, w, limit);
+        if (zstdbody.enabled) if (self._zs) |z| return z.pull(self, w, limit);
         return self.pullWire(w, limit);
     }
 
@@ -439,6 +478,17 @@ pub const Body = struct {
                 error.WriteFailed => unreachable,
                 else => |e| e,
             };
+        }
+        if (zstdbody.enabled) {
+            if (self._zs) |z| {
+                // Decoded into the layer's own scratch and thrown away: a
+                // discarding writer has no room for the decoder to write into.
+                var sink: std.Io.Writer = .fixed(&z.scratch);
+                return z.pull(self, &sink, limit.min(.limited(z.scratch.len))) catch |err| switch (err) {
+                    error.WriteFailed => unreachable,
+                    else => |e| e,
+                };
+            }
         }
         const run = try self.runLength();
         if (run == 0) return error.EndOfStream;
@@ -536,6 +586,103 @@ pub const Gzip = struct {
         };
         self.failed = .bad;
         return error.ReadFailed;
+    }
+};
+
+/// A body under `Content-Encoding: zstd`, decoded as it is read (ADR 295),
+/// the counterpart of `Gzip`.
+///
+/// `zstd.StreamDecoder` over the de-framed wire bytes, counting what it
+/// decodes against `max_bytes`: a frame that decodes past it is
+/// `error.BodyTooLarge`, found as the byte that crosses it is produced, and a
+/// frame that **announces** a size over it is refused before its context is
+/// allocated or a byte is decoded. The bytes on the wire are held to
+/// `max_bytes` as for any body.
+///
+/// **The context is made on the first read, not at `decodeZstd`**, because
+/// its size is the frame's (`StreamDecoder.sizeFromSource`) and the frame's
+/// header has not necessarily arrived. A request that never reads pays the
+/// layer and nothing else. A body of no bytes under the header is an empty
+/// body, as `body()` reads it. Errors surface as `ReadFailed` and `explain`
+/// turns them back into `BodyTooLarge` and `BadEncodedBody`, the same two a
+/// gzip body ends in. libzstd verifies a checksum the frame carries.
+pub const Zstd = struct {
+    body: *Body,
+    arena: std.mem.Allocator,
+    window_log_max: u5,
+    /// The wire bytes, de-framed, for the decoder to read.
+    raw: std.Io.Reader,
+    dec: ?zstdbody.zstd.StreamDecoder = null,
+    failed: enum { none, too_large, bad } = .none,
+    raw_buffer: [4096]u8 = undefined,
+    /// Where `discardRest` decodes to.
+    scratch: [1024]u8 = undefined,
+
+    fn rawStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Zstd = @alignCast(@fieldParentPtr("raw", r));
+        return self.body.pullWire(w, limit);
+    }
+
+    /// Whether the wire itself failed (cut, slow, too large), which is what
+    /// `explain` says; anything else that fails a read is the frame's fault.
+    fn wireFailed(body: *const Body) bool {
+        return body._progress.state == .cut or body._progress.state == .broken;
+    }
+
+    /// Size and make the decoder from the first bytes of the frame. Returns
+    /// `EndOfStream` for a body with no bytes at all.
+    fn start(self: *Zstd, body: *Body) std.Io.Reader.StreamError!void {
+        const zs = zstdbody.zstd;
+        const options: zs.DecodeOptions = .{ .window_log_max = self.window_log_max };
+        _ = self.raw.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        const size = zs.StreamDecoder.sizeFromSource(&self.raw, options) catch {
+            if (!wireFailed(body)) self.failed = .bad;
+            return error.ReadFailed;
+        };
+        // The header is in the buffer now: `sizeFromSource` peeked it. A
+        // frame that says it decodes to more than the ceiling is refused
+        // here, before a context of its window is taken from the arena.
+        const head = self.raw.buffered();
+        const frame = zs.Frame.parse(head[0..@min(head.len, zs.frame_header_max)]) catch {
+            self.failed = .bad;
+            return error.ReadFailed;
+        };
+        const max = body._progress.max_bytes;
+        if (frame.content_size) |announced| if (announced > max) {
+            self.failed = .too_large;
+            return error.ReadFailed;
+        };
+        const memory = self.arena.alignedAlloc(u8, zs.workspace_alignment, size) catch return error.ReadFailed;
+        self.dec = zs.StreamDecoder.init(memory, &self.raw, &.{}, .{
+            .window_log_max = self.window_log_max,
+            .max_decoded = max,
+        }) catch {
+            self.failed = .bad;
+            return error.ReadFailed;
+        };
+    }
+
+    fn pull(self: *Zstd, body: *Body, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        self.body = body;
+        if (limit == .nothing) return 0;
+        if (self.dec == null) try self.start(body);
+        const d = &self.dec.?;
+        // A read that decoded nothing consumed input a block was waiting on;
+        // asking again is how the next one arrives.
+        while (true) {
+            const n = d.reader.stream(w, limit) catch |err| switch (err) {
+                error.WriteFailed => return error.WriteFailed,
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => {
+                    if (!wireFailed(body)) self.failed = if (d.err != null and d.err.? == error.BodyTooLarge) .too_large else .bad;
+                    return error.ReadFailed;
+                },
+            };
+            if (n > 0) return n;
+        }
     }
 };
 

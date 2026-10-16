@@ -8,7 +8,7 @@ Read the pages in order the first time, since each one assumes the ones above it
 
 ## Which page covers which module
 
-**nilo is a toolkit of twelve modules, not one library.** Which module a feature lives in is decided by one question: does it need the event loop? ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md), [ADR 061](../adr/061-a-fitting-borrows-the-loop.md))
+**nilo is a toolkit of thirteen modules, not one library.** Which module a feature lives in is decided by one question: does it need the event loop? ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md), [ADR 061](../adr/061-a-fitting-borrows-the-loop.md))
 
 | Module | What it is | Pages |
 |---|---|---|
@@ -22,6 +22,7 @@ Read the pages in order the first time, since each one assumes the ones above it
 | **`nilo_cache`** | an expiring cache in this process, holding no pointers | [A cache in this process](./cache.md), and the Space that [Idempotency keys](./idempotency.md) keeps its answers in |
 | **`nilo_jwt`** | checking somebody else's signed token: RS256, ES256, ES384, EdDSA and a JWKS | [Checking somebody else's token](./jwt.md) |
 | **`nilo_proto`** | protobuf messages as plain structs: OTLP, a gRPC method's message | [Protobuf messages](./proto.md) |
+| **`nilo_zstd`** | zstd in memory you provide: a body, a stream with a flush, a frame under a ceiling | [Compressing with zstd](./zstd.md) |
 | **`nilo_id`** | UUIDs, v4 and v7 | [Identifiers](./id.md) |
 | **`nilo_core`** | `Str`, the Scope and the clock the rest share | [the reference](../reference/core.md#scope) |
 
@@ -70,6 +71,7 @@ const nilo = @import("nilo_http");
 24. [Checking somebody else's token](./jwt.md): `nilo_jwt`. A JWT signed by an identity provider, verified in a safe order and read into a struct of yours; the signed-in user as a resolved value; and what a key rotation looks like.
 25. [Protobuf messages](./proto.md): `nilo_proto`. A message is the struct you wrote with its field numbers declared beside it, read and written with no generator and no `.proto` file; strings checked, unknown fields skipped, and the decoder within a few percent of one written by hand.
 26. [Identifiers](./id.md): `nilo_id`. A v7 for a key that sorts by creation time, what that order does and does not guarantee, and why the randomness is an argument.
+27. [Compressing with zstd](./zstd.md): `nilo_zstd`. A context is memory you hand over and a function sizes, so a server can keep one per thread and a request can take one from its arena; a frame is a claim checked before it is decoded, and a stream is counted against a ceiling.
 
 ## Shipping it
 

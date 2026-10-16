@@ -52,18 +52,27 @@ pub const ParseError = error{
     UnsupportedContentEncoding,
 };
 
-/// What a `Content-Encoding` header said, reduced to the three answers nilo
-/// has for it.
+/// What a `Content-Encoding` header said, reduced to the answers nilo has
+/// for it.
 pub const Encoding = enum {
     /// Sent as `identity`, or not sent: the bytes are the body.
     identity,
     /// `gzip`, or its old spelling `x-gzip`: inflated into the arena when the
     /// body is asked for.
     gzip,
-    /// Anything else — `br`, `deflate`, `zstd`, or two codings at once — and
-    /// refused with a 415 when there is a body under it.
+    /// `zstd`, in a build with `-Dzstd`: decoded into the arena when the body
+    /// is asked for, or as it is read (ADR 295). **A build without the flag
+    /// never produces it**: there `zstd` is `.other`, a 415 for a route that
+    /// does not read it itself (ADR 089, ADR 283).
+    zstd,
+    /// Anything else — `br`, `deflate`, two codings at once, and `zstd` in a
+    /// build that does not read it — and refused with a 415 when there is a
+    /// body under it.
     other,
 };
+
+/// Whether this build reads a zstd request body.
+const zstd_read = @import("nilo_build").zstd;
 
 /// Whether a build has a framing whose body the transport frames, which is
 /// what `Request.ends_with_stream` is for. A build without it has no such
@@ -1314,9 +1323,10 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
         },
         "content-encoding".len => {
             if (!std.ascii.eqlIgnoreCase(name, "content-encoding")) return;
-            // `identity` means "these are the bytes"; `gzip` is the one
-            // coding nilo inflates (ADR 089). Anything else — br, deflate,
-            // zstd, two codings stacked — would reach `c.json` as a
+            // `identity` means "these are the bytes"; `gzip` is the coding
+            // nilo inflates, and `zstd` the one a build with `-Dzstd` also
+            // decodes (ADR 089, ADR 295). Anything else — br, deflate,
+            // zstd in a build without the flag, two codings stacked — would reach `c.json` as a
             // compressed stream and be reported as a malformed body, which
             // is true of the bytes and useless to whoever sent them. The
             // refusal itself is `finish`'s, because whether there is a body
@@ -1326,6 +1336,8 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
                 .identity
             else if (std.ascii.eqlIgnoreCase(coding, "gzip") or std.ascii.eqlIgnoreCase(coding, "x-gzip"))
                 .gzip
+            else if (zstd_read and std.ascii.eqlIgnoreCase(coding, "zstd"))
+                .zstd
             else
                 .other;
         },

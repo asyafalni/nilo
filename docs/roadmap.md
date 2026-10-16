@@ -122,7 +122,7 @@ Streaming gRPC reuses `Stream.departed` and `Framing.presence` from ADR 287, so 
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · A gRPC listener answers unary calls only.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · Server reflection, which `grpcurl` wants, is not served yet; it is decided that it will be, as an option.
 - [P2](./todo.md#p2-a-real-cost-or-a-use-case-many-services-have) · `nilo_http` · Multipart, streamed: an upload holds the whole body in the arena, so a route raised to `maxBody(50 << 20)` holds up to 50 MB for each upload in flight.
-- [P3](./todo.md#p3-a-narrower-use-case-or-a-cost-not-yet-measured) · `nilo_http` · A stream is never compressed, and neither is an event stream; and gzip is the only coding.
+- [P3](./todo.md#p3-a-narrower-use-case-or-a-cost-not-yet-measured) · `nilo_http` · A stream is never compressed, and neither is an event stream.
 
 <!-- /gathered -->
 

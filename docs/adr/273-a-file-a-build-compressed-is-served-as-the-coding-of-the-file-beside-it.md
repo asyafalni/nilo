@@ -11,9 +11,10 @@ A front end's build writes `app.js.br` and `app.js.gz` beside `app.js`, and `app
 
 ## Decision
 
-**A `X.br` or `X.gz` in a tree, where `X` is also in the tree and is a type `compressible` accepts, is a form of `X`, not a file.** It is read at load beside `X` (or, for a spilled `X`, left on the disk beside it), served to a client that prefers it, and **its own URL is a 404**. `Options.precompressed` is on by default and `EmbedOptions` has it too.
+**A `X.br`, `X.zst` or `X.gz` in a tree, where `X` is also in the tree and is a type `compressible` accepts, is a form of `X`, not a file.** It is read at load beside `X` (or, for a spilled `X`, left on the disk beside it), served to a client that prefers it, and **its own URL is a 404**. `Options.precompressed` is on by default and `EmbedOptions` has it too.
 
-- **Choice.** `compress.negotiate` takes the highest `q` among the codings the file has: `br` beats `gzip` on a tie (a browser's `gzip, deflate, br` weighs both at 1 and brotli is the smaller), `br;q=0` and an unnamed coding without a covering `*` are never chosen, a named entry outranks `*`, and a client sending nothing gets the plain file. `acceptsGzip` is `quality("gzip") > 0`.
+- **Choice.** `compress.negotiate` takes the highest `q` among the codings the file has: `br` beats `zstd` beats `gzip` on a tie (a browser's `gzip, deflate, br, zstd` weighs all at 1; brotli is the smallest and zstd decodes fastest, ADR 295), `br;q=0` and an unnamed coding without a covering `*` are never chosen, a named entry outranks `*`, and a client sending nothing gets the plain file. `acceptsGzip` is `quality("gzip") > 0`.
+- **A `.zst` sibling is a sibling only in a build with `-Dzstd`** (in any other it is an ordinary file, listed and served under its own name as before) and **is held to the strongest check of the three**: it is decoded at load and used only if it is exactly the file beside it, with or without a content checksum in its frame ([ADR 295](./295-zstd-is-a-module-whose-contexts-are-the-callers-memory.md)). A spilled file's `.zst` is never read at load and takes the `.br` rule (older than the file is passed over). Nilo makes a zstd copy of its own at load at level 12 when the file has none (`Options.compress_zstd`, on by default in a build with the flag), as it makes the gzip copy.
 - **A `.gz` sibling replaces the gzip copy nilo would make**, so the gzip is not made twice. A `.br` alone leaves that copy in place, for a client that takes gzip and not brotli (Chrome sends no `br` over plain HTTP). `compress = false` turns off the copy and not the siblings.
 - **`Vary: Accept-Encoding` is on every answer for a file that has more than one form**: the plain one, the 304, the 416, a range, a HEAD. A file with one form (a PNG, a tiny file) carries none, as before, because it varies on nothing. Setting it on a directory's every file would fragment a cache's PNGs by a header they do not depend on.
 - **Every form has its own ETag.** A held form's is the hash of its bytes, like the gzip copy's. A spilled form's is its own modification time and size with the coding after them (`"1a2b-ff-br"`), so the plain file's and the sibling's cannot be equal even if they share a nanosecond and a length. A 304 compares against the form that would have gone out.
@@ -38,7 +39,9 @@ On. Caddy, nginx, tower-http and actix-files are opt-in because they trust the s
 
 **A decoder to verify a `.br`.** std has none, and a vendored one is a dependency for a check the mtime makes most of the time.
 
-**Making a brotli copy at startup for a tree that has none.** The encoder is the cost decided.md refuses; this feature is only for a file somebody else compressed.
+**Making a brotli copy at startup for a tree that has none.** The encoder is the cost decided.md refuses; this feature is only for a file somebody else compressed. (zstd has an encoder behind its flag, so it is made, ADR 295.)
+
+**Judging a `.zst` by its trailer, as a `.gz`'s.** The first draft of ADR 295 had `Frame.matches` (the frame announces the file's length, carries a checksum, and its XXH64 is the file's) and ignored a frame without a checksum. Decoding it at load is stronger (a damaged block under an intact trailer is caught) and accepts the frames most tools write, for 0.2 ms a megabyte.
 
 ## What it costs
 
